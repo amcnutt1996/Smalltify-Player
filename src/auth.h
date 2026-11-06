@@ -24,8 +24,17 @@ int auth_store_logged_in(AuthStore *s);
 /* Interactive PKCE login: opens browser, waits on the loopback redirect,
  * exchanges code, saves token. Blocks up to 5 min; returns early with -1
  * when *cancel becomes nonzero (cancel may be NULL). Safe to run on a
- * worker thread (GUI login screen does this). 0 ok. */
+ * worker thread (GUI login screen does this). 0 ok, else a negative
+ * AUTH_ERR_* saying why (auth_login_strerror words it for users). */
+enum {
+    AUTH_ERR_OTHER   = -1, /* includes cancel */
+    AUTH_ERR_PORT    = -2, /* the redirect port is taken */
+    AUTH_ERR_TIMEOUT = -3, /* no redirect in 5 min (e.g. a wrong client ID) */
+    AUTH_ERR_DENIED  = -4, /* the user (or Spotify) refused */
+    AUTH_ERR_TOKEN   = -5  /* the code exchange failed (network, client ID) */
+};
 int auth_store_login(AuthStore *s, const volatile int *cancel);
+const char *auth_login_strerror(int rc);
 
 /* Optional: receive the authorize URL (e.g. for a "copy link" fallback).
  * Called on the auth_store_login thread once the loopback listener is up,

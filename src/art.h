@@ -15,6 +15,8 @@ void       art_request(ArtLoader *a, const char *url);
 /* If new bytes arrived since *seq: copies pointer to an internal buffer that
  * stays valid until the next art_take call, returns 1. */
 int        art_take(ArtLoader *a, const unsigned char **data, size_t *len, uint64_t *seq);
+/* Ask the thread to stop without waiting (art_stop still joins). NULL-safe. */
+void       art_signal_stop(ArtLoader *a);
 void       art_stop(ArtLoader *a);
 
 #endif

@@ -27,6 +27,9 @@ void    poller_kick(Poller *p);
 void    poller_set_background(Poller *p, int background);
 /* Last error (SP_ERR_*) from fetching, SP_OK if fine. */
 int     poller_last_error(Poller *p);
+/* Ask the thread to stop without waiting (poller_stop still joins), so
+ * several workers can wind down at once. NULL-safe. */
+void    poller_signal_stop(Poller *p);
 void    poller_stop(Poller *p); /* joins thread, frees; NULL-safe */
 
 #endif

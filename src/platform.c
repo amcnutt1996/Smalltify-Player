@@ -418,6 +418,12 @@ int plat_quit_requested(void)
     return InterlockedCompareExchange(&g_quit, 0, 0) != 0;
 }
 
+int plat_stdin_is_tty(void)
+{
+    HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    return std_handle_ok(in) && GetFileType(in) == FILE_TYPE_CHAR;
+}
+
 uint64_t plat_now_ms(void)
 {
     return (uint64_t)GetTickCount64();
@@ -613,6 +619,8 @@ plat_proc *plat_proc_spawn_env(const char *const argv[], const char *const env[]
     wchar_t *envb = env ? merge_env_block(env) : NULL;
     plat_proc *p = calloc(1, sizeof *p);
     HANDLE rd = NULL, wr = NULL, nul = INVALID_HANDLE_VALUE;
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = NULL;
+    int attrs_init = 0;
     if (!cmd || !app || !p || (env && !envb))
         goto fail;
     size_t pos = 0;
@@ -639,18 +647,35 @@ plat_proc *plat_proc_spawn_env(const char *const argv[], const char *const env[]
         li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         SetInformationJobObject(p->job, JobObjectExtendedLimitInformation, &li, sizeof li);
     }
-    STARTUPINFOW si;
+    /* Inherit exactly these two handles: another inheritable handle (say a
+     * pipe end meant for a sibling child) would otherwise leak into the
+     * child and could keep a reader from ever seeing EOF. */
+    HANDLE inherit_list[2] = { nul, wr };
+    SIZE_T attr_len = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_len);
+    attrs = malloc(attr_len);
+    if (!attrs || !InitializeProcThreadAttributeList(attrs, 1, 0, &attr_len))
+        goto fail;
+    attrs_init = 1;
+    if (!UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit_list,
+                                   sizeof inherit_list, NULL, NULL))
+        goto fail;
+    STARTUPINFOEXW si;
     memset(&si, 0, sizeof si);
-    si.cb = sizeof si;
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = nul;
-    si.hStdOutput = wr;
-    si.hStdError = wr;
+    si.StartupInfo.cb = sizeof si;
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = nul;
+    si.StartupInfo.hStdOutput = wr;
+    si.StartupInfo.hStdError = wr;
+    si.lpAttributeList = attrs;
     PROCESS_INFORMATION pi;
     if (!CreateProcessW(app, cmd, NULL, NULL, TRUE,
-                        CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
-                        envb, NULL, &si, &pi))
+                        CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT |
+                            EXTENDED_STARTUPINFO_PRESENT,
+                        envb, NULL, &si.StartupInfo, &pi))
         goto fail;
+    DeleteProcThreadAttributeList(attrs);
+    free(attrs);
     if (p->job)
         AssignProcessToJobObject(p->job, pi.hProcess);
     ResumeThread(pi.hThread);
@@ -669,6 +694,8 @@ fail:
     if (wr) CloseHandle(wr);
     if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
     if (p && p->job) CloseHandle(p->job);
+    if (attrs_init) DeleteProcThreadAttributeList(attrs);
+    free(attrs);
     free(cmd);
     free(app);
     free(envb);
@@ -719,6 +746,26 @@ void plat_proc_kill(plat_proc *p)
     if (p->job)
         CloseHandle(p->job);
     free(p);
+}
+
+int plat_rename(const char *from, const char *to)
+{
+    wchar_t *a = to_wide(from), *b = to_wide(to);
+    int rc = a && b && MoveFileExW(a, b, 0) ? 0 : -1;
+    free(a);
+    free(b);
+    return rc;
+}
+
+void plat_hostname(char *out, size_t cap)
+{
+    wchar_t w[256];
+    DWORD n = sizeof w / sizeof w[0];
+    if (!cap)
+        return;
+    out[0] = '\0';
+    if (GetComputerNameExW(ComputerNamePhysicalDnsHostname, w, &n) && from_wide(w, out, cap) != 0)
+        out[0] = '\0';
 }
 
 /* System32's tar.exe, never one found through PATH or the current dir. */
@@ -1029,6 +1076,11 @@ int plat_quit_requested(void)
     return g_quit != 0;
 }
 
+int plat_stdin_is_tty(void)
+{
+    return isatty(0);
+}
+
 int plat_mkdir(const char *path)
 {
     if (mkdir(path, 0700) == 0)
@@ -1059,7 +1111,11 @@ int plat_write_file_atomic(const char *path, const void *data, size_t len)
     int n = snprintf(tmp, sizeof tmp, "%s.XXXXXX", path);
     if (n < 0 || (size_t)n >= sizeof tmp)
         return -1;
+#ifdef __linux__
+    int fd = mkostemp(tmp, O_CLOEXEC); /* 0600, close-on-exec from the start */
+#else
     int fd = mkstemp(tmp); /* creates with 0600 */
+#endif
     if (fd < 0)
         return -1;
     int ok = set_cloexec(fd) == 0 && fchmod(fd, 0600) == 0 &&
@@ -1332,13 +1388,16 @@ static int spawn_child(pid_t *pid, const char *const argv[], int search_path, in
     sigaddset(&defs, SIGINT);
     sigaddset(&defs, SIGTERM);
     sigaddset(&defs, SIGHUP);
-    short flags = POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF;
+    /* Own process group: a terminal's Ctrl-C or hangup reaches only us,
+     * and we stop the child gracefully (or the watchdog does). */
+    short flags = POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETPGROUP;
 #ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
     flags |= POSIX_SPAWN_CLOEXEC_DEFAULT; /* macOS: inherit only fds 0-2 */
 #endif
     rc = posix_spawnattr_setflags(&at, flags);
     if (!rc) rc = posix_spawnattr_setsigmask(&at, &none);
     if (!rc) rc = posix_spawnattr_setsigdefault(&at, &defs);
+    if (!rc) rc = posix_spawnattr_setpgroup(&at, 0);
     if (in_fd >= 0) {
         if (!rc) rc = posix_spawn_file_actions_adddup2(&fa, in_fd, 0);
     } else {
@@ -1384,6 +1443,7 @@ static int spawn_tied(pid_t *pid, const char *const argv[], int out_fd, char *co
         for (size_t i = 0; i < sizeof defs / sizeof defs[0]; i++)
             sigaction(defs[i], &dfl, NULL);
         sigprocmask(SIG_SETMASK, &none, NULL);
+        setpgid(0, 0); /* own process group, as spawn_child */
         int nul = open("/dev/null", O_RDONLY);
         if (nul < 0 || (nul != 0 && (dup2(nul, 0) < 0 || close(nul) != 0)) ||
             dup2(out_fd, 1) < 0 || dup2(out_fd, 2) < 0 ||
@@ -1602,6 +1662,23 @@ void plat_proc_kill(plat_proc *p)
     free(p);
 }
 
+int plat_rename(const char *from, const char *to)
+{
+    return rename(from, to) == 0 ? 0 : -1;
+}
+
+void plat_hostname(char *out, size_t cap)
+{
+    if (!cap)
+        return;
+    if (gethostname(out, cap) != 0)
+        out[0] = '\0';
+    out[cap - 1] = '\0';
+    char *dot = strchr(out, '.');
+    if (dot)
+        *dot = '\0';
+}
+
 static int tar_path(char *out, size_t cap)
 {
     /* Absolute path: plat_proc_spawn doesn't search PATH. Older non-merged
@@ -1670,7 +1747,11 @@ static void sock_setup(int fd)
 
 plat_sock plat_listen_loopback(int port)
 {
+#ifdef __linux__
+    int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0); /* no exec race */
+#else
     int s = socket(AF_INET, SOCK_STREAM, 0);
+#endif
     if (s < 0)
         return PLAT_SOCK_INVALID;
     sock_setup(s);
@@ -1694,7 +1775,11 @@ plat_sock plat_accept(plat_sock s, unsigned timeout_ms)
         return PLAT_SOCK_INVALID;
     int c;
     do
+#ifdef __linux__
+        c = accept4((int)s, NULL, NULL, SOCK_CLOEXEC);
+#else
         c = accept((int)s, NULL, NULL);
+#endif
     while (c < 0 && errno == EINTR);
     if (c < 0)
         return PLAT_SOCK_INVALID;

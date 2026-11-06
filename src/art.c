@@ -177,7 +177,7 @@ int art_take(ArtLoader *a, const unsigned char **data, size_t *len, uint64_t *se
     return got;
 }
 
-void art_stop(ArtLoader *a)
+void art_signal_stop(ArtLoader *a)
 {
     if (!a)
         return;
@@ -185,6 +185,13 @@ void art_stop(ArtLoader *a)
     a->quit = 1;
     plat_mutex_unlock(a->lock);
     plat_event_signal(a->wake);
+}
+
+void art_stop(ArtLoader *a)
+{
+    if (!a)
+        return;
+    art_signal_stop(a);
     plat_thread_join(a->thread);
     plat_event_free(a->wake);
     plat_mutex_free(a->lock);

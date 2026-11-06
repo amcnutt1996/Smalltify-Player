@@ -446,14 +446,14 @@ static CallbackResult handle_client(plat_sock c, const char *state, char *code, 
     return CB_CODE;
 }
 
-/* Wait for the redirect; 0 with code filled, -1 cancel/timeout/denied. */
+/* Wait for the redirect; 0 with code filled, else AUTH_ERR_*. */
 static int wait_for_code(plat_sock ls, const char *state, char *code, size_t cap,
                          const volatile int *cancel)
 {
     uint64_t deadline = plat_now_ms() + LOGIN_TIMEOUT_MS;
     while (plat_now_ms() < deadline) {
         if (cancel && *cancel)
-            return -1;
+            return AUTH_ERR_OTHER;
         plat_sock c = plat_accept(ls, CANCEL_POLL_MS);
         if (c == PLAT_SOCK_INVALID)
             continue;
@@ -462,10 +462,26 @@ static int wait_for_code(plat_sock ls, const char *state, char *code, size_t cap
         if (r == CB_CODE)
             return 0;
         if (r == CB_DENIED)
-            return -1;
+            return AUTH_ERR_DENIED;
     }
     fprintf(stderr, "auth: login timed out\n");
-    return -1;
+    return AUTH_ERR_TIMEOUT;
+}
+
+const char *auth_login_strerror(int rc)
+{
+    switch (rc) {
+    case AUTH_ERR_PORT:
+        return "Port 8888 is in use by another program.";
+    case AUTH_ERR_TIMEOUT:
+        return "Timed out. Check SPOTIFY_CLIENT_ID in .env.";
+    case AUTH_ERR_DENIED:
+        return "Access was denied in the browser.";
+    case AUTH_ERR_TOKEN:
+        return "Spotify did not accept the sign-in.";
+    default:
+        return "Sign-in failed. Please try again.";
+    }
 }
 
 int auth_store_login(AuthStore *s, const volatile int *cancel)
@@ -499,7 +515,7 @@ int auth_store_login(AuthStore *s, const volatile int *cancel)
     plat_sock ls = plat_listen_loopback(CFG_REDIRECT_PORT);
     if (ls == PLAT_SOCK_INVALID) {
         fprintf(stderr, "auth: cannot listen on 127.0.0.1:%d (port in use?)\n", CFG_REDIRECT_PORT);
-        return -1;
+        return AUTH_ERR_PORT;
     }
     if (s->on_url) {
         s->on_url(url, s->on_url_ud);
@@ -514,7 +530,7 @@ int auth_store_login(AuthStore *s, const volatile int *cancel)
     int rc = wait_for_code(ls, state, code, sizeof code, cancel);
     plat_close(ls);
     if (rc != 0)
-        return -1;
+        return rc;
 
     char ecode[3 * sizeof code], form[sizeof ecode + sizeof cid + sizeof redir + 160];
     if (http_urlencode(code, ecode, sizeof ecode) != 0)
@@ -525,7 +541,7 @@ int auth_store_login(AuthStore *s, const volatile int *cancel)
     Token t;
     memset(&t, 0, sizeof t);
     plat_mutex_lock(s->flight);
-    rc = token_request(s, form, &t) == 0 ? 0 : -1;
+    rc = token_request(s, form, &t) == 0 ? 0 : AUTH_ERR_TOKEN;
     if (rc == 0)
         store_token(s, &t);
     plat_mutex_unlock(s->flight);

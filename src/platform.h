@@ -57,6 +57,8 @@ int  plat_startup(int *argc, char ***argv);
  * may be NULL. Later calls only swap the callback: once a call returns, the
  * previous callback will not run again. 0 ok, -1 error. */
 int  plat_quit_watch(void (*on_quit)(void *ud), void *ud);
+/* 1 if stdin is a terminal (console). */
+int  plat_stdin_is_tty(void);
 /* 1 once a quit was requested through plat_quit_watch's signals. */
 int  plat_quit_requested(void);
 

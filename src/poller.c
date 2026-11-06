@@ -236,7 +236,7 @@ int poller_last_error(Poller *p)
  * it cannot be interrupted, so this waits for it: at most the curl total
  * timeout (15 s, http.c). A 401 refresh or 429 Retry-After inside http.c
  * retries once, so the rare worst case is one more request on top. */
-void poller_stop(Poller *p)
+void poller_signal_stop(Poller *p)
 {
     if (!p)
         return;
@@ -244,6 +244,13 @@ void poller_stop(Poller *p)
     p->stop = 1;
     plat_mutex_unlock(p->mu);
     plat_event_signal(p->ev);
+}
+
+void poller_stop(Poller *p)
+{
+    if (!p)
+        return;
+    poller_signal_stop(p);
     plat_thread_join(p->th);
     plat_event_free(p->ev);
     plat_mutex_free(p->mu);
