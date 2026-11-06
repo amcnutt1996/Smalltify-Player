@@ -6,9 +6,9 @@
 #include "config.h"
 #include "http.h"
 
-/* Scopes: playback read/modify, currently-playing, playlists, library,
- * plus "streaming" so the same token can log librespot in. */
-#define AUTH_SCOPES "streaming user-read-playback-state user-modify-playback-state " \
+/* Scopes: playback read/modify, currently-playing, playlists, library.
+ * No "streaming": librespot signs in on its own (see librespot.c). */
+#define AUTH_SCOPES "user-read-playback-state user-modify-playback-state " \
                     "user-read-currently-playing playlist-read-private " \
                     "playlist-read-collaborative user-library-read"
 

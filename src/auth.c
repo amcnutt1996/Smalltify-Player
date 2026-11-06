@@ -411,7 +411,7 @@ static CallbackResult handle_client(plat_sock c, const char *state, char *code, 
             break;
         len += (size_t)n;
         req[len] = '\0';
-        if (strstr(req, "\r\n\r\n") || strchr(req, '\n'))
+        if (strchr(req, '\n'))
             break; /* the request line is all we need */
     }
     req[len] = '\0';
