@@ -14,6 +14,7 @@
 
 #include "art.h"
 #include "auth.h"
+#include "browse.h"
 #include "http.h"
 #include "model.h"
 #include "platform.h"
@@ -91,35 +92,35 @@ static void ui_wake(void *ud)
     glfwPostEmptyEvent();
 }
 
-/* --- command worker: single-slot mailbox, latest command wins ----------- */
+/* --- command worker: playback commands, the queue, devices --------------- */
+/* Commands wait in a short FIFO. A playback command replaces one still
+ * waiting at its end (latest wins, so rapid clicks collapse into one), but
+ * queue adds are never replaced and keep their order. */
 typedef enum {
     CMD_PLAY, CMD_PAUSE, CMD_NEXT, CMD_PREV,
     CMD_SEEK, CMD_VOLUME, CMD_SHUFFLE, CMD_REPEAT,
-    CMD_PLAY_URI,  /* str = URI, arg = is_track */
-    CMD_PLAYLISTS, /* results land in CmdWorker.lib */
-    CMD_SEARCH,    /* str = query; results land in CmdWorker.lib */
-    CMD_DEVICES,   /* results land in CmdWorker.lib */
-    CMD_TRANSFER   /* str = device id; plays there, then refreshes devices */
+    CMD_PLAY_URI,  /* ctx and uri as in PlayTarget; arg = 1: ctx is Liked Songs */
+    CMD_QUEUE,     /* uri: add it to the queue */
+    CMD_DEVICES,   /* results land in CmdWorker.devs */
+    CMD_TRANSFER   /* uri = device id; plays there, then refreshes devices */
 } CmdKind;
 
 typedef struct {
     CmdKind kind;
     int     arg;
-    char    str[SP_NAME_LEN];
+    char    uri[SP_URI_LEN]; /* a track or episode, or a device id */
+    char    ctx[SP_URI_LEN];
 } Cmd;
 
-#define LIB_PLAYLISTS 50 /* first page of /me/playlists */
-#define LIB_RESULTS   20
+_Static_assert(SP_URI_LEN >= SP_ID_LEN, "a device id fits Cmd.uri");
 
-/* Library panel data, filled by the command worker. */
+#define CMD_FIFO 16
+
+/* Spotify Connect devices, filled by the command worker. */
 typedef struct {
-    Playlist pl[LIB_PLAYLISTS];
-    int      npl, pl_loaded;
-    Track    hits[LIB_RESULTS];
-    int      nhits, searched;
-    Device   devs[SP_MAX_DEVICES];
-    int      ndev, devs_loaded;
-} Library;
+    Device devs[SP_MAX_DEVICES];
+    int    ndev, loaded;
+} DeviceList;
 
 typedef struct {
     AuthStore   *auth;
@@ -128,16 +129,20 @@ typedef struct {
     plat_mutex  *mu;
     plat_event  *ev;
     plat_thread *th;
+    User         me;     /* worker thread only: names Liked Songs; fetched once */
     /* Guarded by mu. */
-    Cmd      slot;
-    int      has;
-    int      stop;
-    int      local;   /* our Soloist device is running and paired */
-    int      err;     /* result of the last command */
-    char     played_on[SP_NAME_LEN]; /* "" unless it played on another, inactive device */
-    uint64_t err_seq; /* bumped after every command */
-    Library  lib;     /* latest playlists/search results */
-    uint64_t lib_seq; /* bumped when lib changes */
+    Cmd        fifo[CMD_FIFO];
+    int        head, len;
+    int        stop;
+    int        local;    /* our Soloist device is running and paired */
+    int        me_stale; /* a new sign-in: look the account up again */
+    int        err;      /* result of the last command */
+    CmdKind    done;     /* which command that was */
+    uint64_t   done_at;  /* plat_now_ms() when it finished */
+    char       played_on[SP_NAME_LEN]; /* "" unless it played on another, inactive device */
+    uint64_t   err_seq;  /* bumped after every command */
+    DeviceList devs;     /* the latest device list */
+    uint64_t   devs_seq; /* bumped when devs changes */
 } CmdWorker;
 
 static int fetch_devices(CmdWorker *w, HttpClient *h)
@@ -148,26 +153,38 @@ static int fetch_devices(CmdWorker *w, HttpClient *h)
     if (rc != SP_OK)
         return rc;
     plat_mutex_lock(w->mu);
-    memcpy(w->lib.devs, devs, sizeof devs);
-    w->lib.ndev = n;
-    w->lib.devs_loaded = 1;
-    w->lib_seq++;
+    memcpy(w->devs.devs, devs, sizeof devs);
+    w->devs.ndev = n;
+    w->devs.loaded = 1;
+    w->devs_seq++;
     plat_mutex_unlock(w->mu);
     return rc;
 }
 
-/* Play (uri NULL = resume): on our own device when it is paired and
- * running and a uri was picked (or nothing else is active), else on the
- * active device, else on any available one (said in played_on). */
-static int play(CmdWorker *w, HttpClient *h, const char *uri, int is_track)
+/* Play c's URIs (none = resume): on our own device when it is paired and
+ * running and something was picked (or nothing else is active), else on
+ * the active device, else on any available one (said in played_on). */
+static int play(CmdWorker *w, HttpClient *h, const Cmd *c)
 {
     plat_mutex_lock(w->mu);
     int local = w->local;
+    if (w->me_stale) {
+        w->me_stale = 0;
+        w->me.id[0] = 0;
+    }
     plat_mutex_unlock(w->mu);
+    const char *ctx = c->ctx[0] ? c->ctx : NULL, *item = c->uri[0] ? c->uri : NULL;
+    int rc = SP_OK;
+    if (c->arg) { /* Liked Songs: its context names the account */
+        if (!w->me.id[0])
+            rc = sp_get_me(h, &w->me);
+        if (rc != SP_OK)
+            return rc;
+        ctx = w->me.liked_uri;
+    }
     Device on;
     int where = SP_ON_ACTIVE;
-    int rc = sp_play_smart(h, is_track ? NULL : uri, is_track ? uri : NULL,
-                           local ? w->name : NULL, local && uri, &on, &where);
+    rc = sp_play_smart(h, ctx, item, local ? w->name : NULL, local && (ctx || item), &on, &where);
     plat_mutex_lock(w->mu);
     snprintf(w->played_on, sizeof w->played_on, "%s",
              rc == SP_OK && where == SP_ON_OTHER ? on.name : "");
@@ -181,7 +198,8 @@ static int run_cmd(CmdWorker *w, HttpClient *h, const Cmd *c)
 
     switch (c->kind) {
     case CMD_PLAY:
-        return play(w, h, NULL, 0);
+    case CMD_PLAY_URI:
+        return play(w, h, c);
     case CMD_PAUSE:   return sp_pause(h);
     case CMD_NEXT:    return sp_next(h);
     case CMD_PREV:    return sp_prev(h);
@@ -189,39 +207,14 @@ static int run_cmd(CmdWorker *w, HttpClient *h, const Cmd *c)
     case CMD_VOLUME:  return sp_set_volume(h, c->arg);
     case CMD_SHUFFLE: return sp_set_shuffle(h, c->arg);
     case CMD_REPEAT:  return sp_set_repeat(h, (RepeatMode)c->arg);
-    case CMD_PLAY_URI:
-        return play(w, h, c->str, c->arg);
+    case CMD_QUEUE:   return sp_queue_add(h, c->uri);
     case CMD_DEVICES:
         return fetch_devices(w, h);
     case CMD_TRANSFER:
-        rc = sp_transfer(h, c->str, 1);
+        rc = sp_transfer(h, c->uri, 1);
         if (rc == SP_OK)
             fetch_devices(w, h); /* only refreshes the marker; its error is moot */
         return rc;
-    case CMD_PLAYLISTS:
-    case CMD_SEARCH: {
-        /* Fetched outside the lock: the UI thread reads lib every frame. */
-        static Playlist pl[LIB_PLAYLISTS]; /* worker-thread only; keeps the stack small */
-        static Track hits[LIB_RESULTS];
-        int n = 0;
-        rc = c->kind == CMD_PLAYLISTS ? sp_get_playlists(h, pl, LIB_PLAYLISTS, &n)
-                                      : sp_search_tracks(h, c->str, hits, LIB_RESULTS, &n);
-        if (rc != SP_OK)
-            return rc;
-        plat_mutex_lock(w->mu);
-        if (c->kind == CMD_PLAYLISTS) {
-            memcpy(w->lib.pl, pl, sizeof pl);
-            w->lib.npl = n;
-            w->lib.pl_loaded = 1;
-        } else {
-            memcpy(w->lib.hits, hits, sizeof hits);
-            w->lib.nhits = n;
-            w->lib.searched = 1;
-        }
-        w->lib_seq++;
-        plat_mutex_unlock(w->mu);
-        return rc;
-    }
     }
     return SP_ERR_OTHER;
 }
@@ -235,9 +228,12 @@ static void cmd_thread(void *arg)
 
     for (;;) {
         plat_mutex_lock(w->mu);
-        int stop = w->stop, has = w->has;
-        Cmd c = w->slot;
-        w->has = 0;
+        int stop = w->stop, has = w->len > 0;
+        Cmd c = w->fifo[w->head];
+        if (has) {
+            w->head = (w->head + 1) % CMD_FIFO;
+            w->len--;
+        }
         plat_mutex_unlock(w->mu);
         if (stop)
             break;
@@ -255,6 +251,8 @@ static void cmd_thread(void *arg)
         poller_kick(w->poller);
         plat_mutex_lock(w->mu);
         w->err = rc;
+        w->done = c.kind;
+        w->done_at = plat_now_ms();
         w->err_seq++;
         plat_mutex_unlock(w->mu);
         ui_wake(NULL);
@@ -302,20 +300,203 @@ static int cmd_start(CmdWorker *w, AuthStore *auth, Poller *poller, const char *
     return 0;
 }
 
-static void cmd_post_str(CmdWorker *w, CmdKind kind, int arg, const char *str)
+/* Line c up: it replaces a playback command still waiting at the end, else
+ * it waits its turn (a full FIFO keeps only the newest at its end). */
+static void cmd_send(CmdWorker *w, const Cmd *c)
 {
     plat_mutex_lock(w->mu);
-    w->slot.kind = kind;
-    w->slot.arg = arg;
-    snprintf(w->slot.str, sizeof w->slot.str, "%s", str);
-    w->has = 1;
+    Cmd *last = w->len ? &w->fifo[(w->head + w->len - 1) % CMD_FIFO] : NULL;
+    if (last && ((c->kind != CMD_QUEUE && last->kind != CMD_QUEUE) || w->len == CMD_FIFO))
+        *last = *c;
+    else
+        w->fifo[(w->head + w->len++) % CMD_FIFO] = *c;
     plat_mutex_unlock(w->mu);
     plat_event_signal(w->ev);
 }
 
+static void cmd_post_uri(CmdWorker *w, CmdKind kind, int arg, const char *uri, const char *ctx)
+{
+    Cmd c = { kind, arg, "", "" };
+    snprintf(c.uri, sizeof c.uri, "%s", uri ? uri : "");
+    snprintf(c.ctx, sizeof c.ctx, "%s", ctx ? ctx : "");
+    cmd_send(w, &c);
+}
+
 static void cmd_post(CmdWorker *w, CmdKind kind, int arg)
 {
-    cmd_post_str(w, kind, arg, "");
+    cmd_post_uri(w, kind, arg, NULL, NULL);
+}
+
+/* --- library worker: lists, search and the heart -------------------------- */
+/* A thread and HTTP connection of its own, so a list never waits behind a
+ * playback command, nor the other way round. Each kind of request has a
+ * slot keeping only the newest: a list page (its answer carries the
+ * request's seq, so the UI drops pages for screens it has left), "is this
+ * track saved?" and "save or remove it". */
+#define LIB_PAGE (BROWSE_GROUPS * SP_SEARCH_LIMIT) /* the most one request brings: a search of every kind */
+_Static_assert(LIB_PAGE >= SP_PAGE_MAX, "a list page fits LIB_PAGE");
+
+typedef struct {
+    uint64_t seq;
+    int      search;             /* sp_search(query, types), else sp_get_list(list, id) */
+    SpList   list;
+    unsigned types;
+    char     id[SP_URI_LEN];
+    char     query[SP_NAME_LEN];
+    SpPage   page;               /* where it starts */
+    int      cap;                /* at most LIB_PAGE */
+} LibReq;
+
+typedef struct {
+    AuthStore   *auth;
+    plat_mutex  *mu;
+    plat_event  *ev;
+    plat_thread *th;
+    /* Guarded by mu: the slots... */
+    int      stop;
+    LibReq   req;
+    int      has_req;
+    char     check[SP_URI_LEN];  /* is it saved? */
+    int      has_check;
+    char     save[SP_URI_LEN];   /* save (save_on) or remove it */
+    int      save_on, has_save;
+    uint64_t save_seq;
+    /* ...and the answers */
+    uint64_t res_seq;            /* the LibReq.seq the page answers, 0 = none */
+    int      res_rc, res_n;
+    SpPage   res_page;
+    Item     res[LIB_PAGE];
+    char     checked[SP_URI_LEN];
+    int      checked_saved, checked_rc;
+    uint64_t checked_gen;        /* bumped with every answer */
+    char     saved[SP_URI_LEN];
+    int      saved_on, saved_rc;
+    uint64_t saved_seq;          /* the save_seq it answers */
+} LibWorker;
+
+static void lib_thread(void *arg)
+{
+    LibWorker *w = arg;
+    HttpAuth ha = auth_store_http(w->auth);
+    HttpClient *http = http_client_new(&ha);
+    static Item page[LIB_PAGE]; /* worker-thread only; keeps the stack small */
+
+    for (;;) {
+        plat_mutex_lock(w->mu);
+        int stop = w->stop, save = w->has_save, list = !save && w->has_req;
+        int check = !save && !list && w->has_check, on = w->save_on;
+        uint64_t seq = w->save_seq;
+        LibReq r = w->req;
+        char uri[SP_URI_LEN];
+        memcpy(uri, save ? w->save : w->check, sizeof uri);
+        w->has_save &= !save;
+        w->has_req &= !list;
+        w->has_check &= !check;
+        plat_mutex_unlock(w->mu);
+        if (stop)
+            break;
+        const char *one = uri;
+        if (save) {
+            int rc = http ? sp_library_set(http, &one, 1, on) : SP_ERR_OTHER;
+            plat_mutex_lock(w->mu);
+            memcpy(w->saved, uri, sizeof w->saved);
+            w->saved_on = on;
+            w->saved_rc = rc;
+            w->saved_seq = seq;
+            plat_mutex_unlock(w->mu);
+        } else if (list) {
+            int n = 0, rc = SP_ERR_OTHER;
+            if (http)
+                rc = r.search ? sp_search(http, r.query, r.types, &r.page, page, r.cap, &n)
+                              : sp_get_list(http, r.list, r.id, &r.page, page, r.cap, &n);
+            plat_mutex_lock(w->mu);
+            w->res_seq = r.seq;
+            w->res_rc = rc;
+            w->res_n = rc == SP_OK ? n : 0;
+            w->res_page = r.page;
+            memcpy(w->res, page, (size_t)w->res_n * sizeof *page);
+            plat_mutex_unlock(w->mu);
+        } else if (check) {
+            int saved = 0, rc = http ? sp_library_contains(http, &one, 1, &saved) : SP_ERR_OTHER;
+            plat_mutex_lock(w->mu);
+            memcpy(w->checked, uri, sizeof w->checked);
+            w->checked_saved = saved;
+            w->checked_rc = rc;
+            w->checked_gen++;
+            plat_mutex_unlock(w->mu);
+        } else {
+            plat_event_wait(w->ev, IDLE_WAIT_MS);
+            continue;
+        }
+        ui_wake(NULL);
+    }
+    http_client_free(http);
+}
+
+/* Ask the worker to stop without waiting (lib_stop then joins). */
+static void lib_signal_stop(LibWorker *w)
+{
+    if (w->th) {
+        plat_mutex_lock(w->mu);
+        w->stop = 1;
+        plat_mutex_unlock(w->mu);
+        plat_event_signal(w->ev);
+    }
+}
+
+static void lib_stop(LibWorker *w)
+{
+    if (w->th) {
+        lib_signal_stop(w);
+        plat_thread_join(w->th);
+    }
+    plat_event_free(w->ev);
+    plat_mutex_free(w->mu);
+    memset(w, 0, sizeof *w);
+}
+
+static int lib_start(LibWorker *w, AuthStore *auth)
+{
+    memset(w, 0, sizeof *w);
+    w->auth = auth;
+    w->mu = plat_mutex_new();
+    w->ev = plat_event_new();
+    if (w->mu && w->ev)
+        w->th = plat_thread_start(lib_thread, w);
+    if (!w->th) {
+        lib_stop(w);
+        return -1;
+    }
+    return 0;
+}
+
+static void lib_post(LibWorker *w, const LibReq *r)
+{
+    plat_mutex_lock(w->mu);
+    w->req = *r;
+    w->has_req = 1;
+    plat_mutex_unlock(w->mu);
+    plat_event_signal(w->ev);
+}
+
+static void lib_post_check(LibWorker *w, const char *uri)
+{
+    plat_mutex_lock(w->mu);
+    snprintf(w->check, sizeof w->check, "%s", uri);
+    w->has_check = 1;
+    plat_mutex_unlock(w->mu);
+    plat_event_signal(w->ev);
+}
+
+static void lib_post_save(LibWorker *w, const char *uri, int on, uint64_t seq)
+{
+    plat_mutex_lock(w->mu);
+    snprintf(w->save, sizeof w->save, "%s", uri);
+    w->save_on = on;
+    w->save_seq = seq;
+    w->has_save = 1;
+    plat_mutex_unlock(w->mu);
+    plat_event_signal(w->ev);
 }
 
 /* --- device worker ------------------------------------------------------- */
@@ -521,11 +702,16 @@ typedef enum { PANEL_NONE, PANEL_LIBRARY, PANEL_DEVICES, PANEL_SETTINGS } Panel;
 /* Widget ids for the one widget that may hold the mouse. */
 enum {
     W_NONE, W_RELOAD, W_SIGNIN, W_CANCEL, W_OPEN_URL, W_OPEN_KEY, W_BACK, W_CHANGE_KEY,
-    W_RESTART, W_HINT_CLOSE,
-    W_PREV, W_PLAY, W_NEXT, W_SEEK, W_VOLUME, W_SHUFFLE, W_REPEAT, W_LOGOUT,
-    W_LIBRARY, W_LIB_BACK, W_DEVICES, W_DEV_REFRESH, W_SETTINGS,
+    W_RESTART, W_HINT_CLOSE, W_LATER,
+    W_PREV, W_PLAY, W_NEXT, W_SEEK, W_VOLUME, W_SHUFFLE, W_REPEAT, W_LOGOUT, W_HEART,
+    W_LIBRARY, W_LIB_BACK, W_LIB_PLAY, W_LIB_SIGNIN, W_DEVICES, W_DEV_REFRESH, W_SETTINGS,
     W_LIB_ROW /* + row index; rows of two panels never show together */
 };
+#define W_LIB_QUEUE (W_LIB_ROW + BROWSE_KEEP)   /* + row index: its +Queue */
+#define W_LIB_MORE  (W_LIB_QUEUE + BROWSE_KEEP) /* + search group: See all; + BROWSE_GROUPS: retry */
+
+#define ROW_GAP 6 /* between list rows */
+#define ROW_PAD 8 /* between a row's edge and its text */
 
 enum { PEND_PLAY = 1, PEND_SEEK = 2, PEND_SHUFFLE = 4, PEND_REPEAT = 8, PEND_VOLUME = 16 };
 
@@ -546,9 +732,33 @@ typedef struct {
     int   fl;    /* titles */
     float line;  /* pitch of one-line texts stacked under each other */
     float row;   /* list rows, text fields, most buttons */
+    float row2;  /* list rows with two lines of text */
     float bar;   /* bottom-bar buttons */
     float min_w; /* narrowest window: the bottom bar at BAR_MARGIN */
 } Metrics;
+
+/* One screen of the Library panel: the root (the search field and the
+ * sections), a list (of yours, or what a playlist, album, artist or show
+ * holds) or search results. */
+typedef enum { LV_ROOT, LV_LIST, LV_SEARCH } LevelKind;
+
+typedef struct {
+    LevelKind kind;
+    SpList    list;               /* LV_LIST */
+    unsigned  types;              /* LV_SEARCH: SP_SEARCH_* bits */
+    char      uri[SP_URI_LEN];    /* the playlist, album, artist or show listed */
+    char      title[SP_NAME_LEN + 16];
+    char      query[SP_NAME_LEN]; /* LV_SEARCH */
+    ItemList  items;              /* the root: none, it only shows page.total */
+    SpPage    page;               /* the next page: more, total, restricted */
+    int       loaded;             /* a page came */
+    int       err;                /* SP_ERR_* of the last request */
+    uint64_t  want;               /* the request in flight (LibReq.seq), 0 = none */
+    int       scroll;             /* first row shown */
+} Level;
+
+/* Screens deep: the root, search results, "See all", an artist, an album. */
+#define LIB_DEPTH 5
 
 typedef struct {
     Config     cfg;
@@ -575,6 +785,8 @@ typedef struct {
     int          login_done, login_rc;     /* guarded by mu */
     char         login_url[SIGNIN_URL_LEN]; /* guarded by mu */
     const char  *login_msg;
+    int          reauth;        /* the sign-in screen is over the running player */
+    int          consent_asked; /* the new permissions were asked for this run */
 
     /* Soloist, run from the player: always once paired, else only while
      * another device of the account is online so it can pick us */
@@ -607,6 +819,14 @@ typedef struct {
     char status[SP_NAME_LEN];
     char t_pos[16], t_dur[16];
     int  pos_sec; /* second shown in t_pos, -1 = reformat */
+    uint64_t note_until; /* "Added to queue" shows until then */
+
+    /* the heart by the title: is the playing track saved? */
+    char     heart_uri[SP_URI_LEN]; /* the track it is for, "" = none */
+    int      heart;                 /* 1 saved, 0 not, -1 unknown */
+    uint64_t heart_gen;             /* libw.checked_gen taken */
+    uint64_t like_sent, like_done;  /* saves asked for / answered (save_seq) */
+    int      like_err;              /* SP_ERR_* of a failed save */
 
     /* album art: decoded once per image, drawn from a texture */
     ArtLoader *art;
@@ -614,14 +834,18 @@ typedef struct {
     Texture2D  art_tex; /* id 0 = none */
 
     /* side panels over the player area (one at a time) */
-    Panel    panel;
-    int      lib_scroll;
-    int      lib_show_hits; /* list search results instead of playlists */
-    uint64_t lib_seq;
-    uint64_t dev_seq_noted; /* cmd.lib_seq last checked by note_other */
-    Library  lib;
-    char     query[SP_NAME_LEN];
-    char     key_input[sizeof(((Config *)0)->soloist_key)]; /* key screen; secret */
+    Panel      panel;
+    uint64_t   devs_seq;      /* cmd.devs_seq of devs */
+    uint64_t   dev_seq_noted; /* cmd.devs_seq last checked by note_other */
+    DeviceList devs;
+    /* the Library: a stack of screens, fed by the library worker */
+    LibWorker  libw;
+    Level      lv[LIB_DEPTH];
+    int        depth;         /* lv[depth] shows */
+    uint64_t   lib_req_seq;   /* the last LibReq.seq */
+    float      wheel;         /* mouse wheel turned short of a whole row */
+    char       query[SP_NAME_LEN];
+    char       key_input[sizeof(((Config *)0)->soloist_key)]; /* key screen; secret */
 } Ui;
 
 /* --- font and text ------------------------------------------------------- */
@@ -635,6 +859,7 @@ static Metrics metrics_for(int size)
     m.fl = font_sizes[size].title;
     m.line = (float)m.fs + 6;
     m.row = (float)m.fs + 18;
+    m.row2 = 2.0f * (float)m.fs + LINE_GAP + 16;
     m.bar = (float)m.fs + 10;
     return m;
 }
@@ -857,8 +1082,9 @@ static float para(const Ui *u, const char *src, float x, float y, float maxw, Co
     return text_h(u, buf);
 }
 
-/* A message in body text, wrapped to the window and centered line by line. */
-static void para_center(const Ui *u, const char *src, float y, Color c)
+/* A message in body text, wrapped to the window and centered line by line;
+ * returns its height. */
+static float para_center(const Ui *u, const char *src, float y, Color c)
 {
     char buf[512], line[512];
     wrap_words(u, src, (float)(u->w - 2 * PAD), buf, sizeof buf);
@@ -867,7 +1093,7 @@ static void para_center(const Ui *u, const char *src, float y, Color c)
         snprintf(line, sizeof line, "%.*s", (int)n, s);
         text_center(u, line, y, FS_S, c);
         if (!s[n])
-            return;
+            return text_h(u, buf);
         s += n + 1;
     }
 }
@@ -886,8 +1112,8 @@ static float btn_w(const Ui *u, const char *label, float minw)
     return w > minw ? w : minw;
 }
 
-/* Draws the button body; returns 1 on press-and-release inside r. */
-static int button(Ui *u, int id, Rectangle r, const char *label, int fs, int on)
+/* Press and release inside r, for widget id: 1 on the release. */
+static int clicked(Ui *u, int id, Rectangle r)
 {
     int hot = hovered(r);
     int click = 0;
@@ -898,6 +1124,14 @@ static int button(Ui *u, int id, Rectangle r, const char *label, int fs, int on)
         click = hot;
         u->redraw |= click;
     }
+    return click;
+}
+
+/* Draws the button body; returns 1 on press-and-release inside r. */
+static int button(Ui *u, int id, Rectangle r, const char *label, int fs, int on)
+{
+    int hot = hovered(r);
+    int click = clicked(u, id, r);
     Color bg = on ? C_ON : C_PANEL;
     if (u->active == id && hot)
         bg = C_PRESS;
@@ -1040,6 +1274,187 @@ static void icon(Icon k, Rectangle r, Color c)
     }
 }
 
+/* A heart in the middle of r: solid when saved, else its outline. */
+static void draw_heart(const Ui *u, Rectangle r, int saved, Color c)
+{
+    enum { N = 48 };
+    Vector2 p[N + 2];
+    float k = 0.7f * r.width / 32.0f, cx = r.x + r.width / 2.0f, cy = r.y + r.height / 2.0f;
+    /* x = 16 sin^3 t, y = 13 cos t - 5 cos 2t - 2 cos 3t - cos 4t (32 wide,
+     * its middle at y = -2.6), traced counter-clockwise on the screen like
+     * raylib's fans want, around its middle at (cx, cy). */
+    p[0] = (Vector2){ cx, cy };
+    for (int i = 0; i <= N; i++) {
+        float t = -2.0f * PI * (float)i / N, s = sinf(t);
+        float y = 13.0f * cosf(t) - 5.0f * cosf(2 * t) - 2.0f * cosf(3 * t) - cosf(4 * t);
+        p[i + 1] = (Vector2){ cx + k * 16.0f * s * s * s, cy - k * (y + 2.6f) };
+    }
+    if (saved)
+        DrawTriangleFan(p, N + 2, c);
+    else
+        DrawSplineLinear(p + 1, N + 1, fmaxf(1.5f, (float)u->m.fs / 8.0f), c);
+}
+
+/* --- Library panel: its stack of screens ---------------------------------- */
+/* The list a screen shows, as browse_play_target takes it: -1 for search. */
+static int lib_list_of(const Level *lv)
+{
+    return lv->kind == LV_LIST ? (int)lv->list : -1;
+}
+
+/* Ask the library worker for lv's next page (the root's: the Liked Songs
+ * total). One request per screen at a time; its seq matches the answer. */
+static void lib_request(Ui *u, Level *lv)
+{
+    LibReq r;
+    int room = BROWSE_KEEP - lv->items.n;
+    memset(&r, 0, sizeof r);
+    r.seq = ++u->lib_req_seq;
+    r.page = lv->page;
+    switch (lv->kind) {
+    case LV_ROOT:
+        r.list = SP_LIST_LIKED;
+        memset(&r.page, 0, sizeof r.page);
+        r.cap = 1;
+        break;
+    case LV_LIST:
+        r.list = lv->list;
+        snprintf(r.id, sizeof r.id, "%s", lv->uri);
+        r.cap = room < SP_PAGE_MAX ? room : SP_PAGE_MAX;
+        break;
+    case LV_SEARCH:
+        r.search = 1;
+        r.types = lv->types;
+        snprintf(r.query, sizeof r.query, "%s", lv->query);
+        /* Every kind: one page, each kind's "See all" has the rest. */
+        r.cap = lv->types == SP_SEARCH_ALL ? LIB_PAGE : room < SP_SEARCH_LIMIT ? room : SP_SEARCH_LIMIT;
+        break;
+    }
+    lv->want = r.seq;
+    lib_post(&u->libw, &r);
+}
+
+/* Start lv over from its first page. */
+static void lib_reload(Ui *u, Level *lv)
+{
+    browse_free(&lv->items);
+    memset(&lv->page, 0, sizeof lv->page);
+    lv->loaded = lv->scroll = 0;
+    lv->err = SP_OK;
+    lib_request(u, lv);
+}
+
+/* A new screen on top for the caller to fill and fetch; NULL when full. */
+static Level *lib_push(Ui *u, LevelKind kind, const char *title)
+{
+    if (u->depth + 1 >= LIB_DEPTH)
+        return NULL;
+    u->lv[u->depth].want = 0; /* a page on its way there is of no use now */
+    Level *lv = &u->lv[++u->depth];
+    memset(lv, 0, sizeof *lv);
+    lv->kind = kind;
+    snprintf(lv->title, sizeof lv->title, "%s", title);
+    u->wheel = 0.0f;
+    u->redraw = 1;
+    return lv;
+}
+
+/* Back one screen: the root fetches its Liked Songs total again, a list
+ * that never loaded tries again. */
+static void lib_pop(Ui *u)
+{
+    if (u->depth == 0)
+        return;
+    Level *lv = &u->lv[u->depth--];
+    browse_free(&lv->items);
+    memset(lv, 0, sizeof *lv);
+    Level *top = &u->lv[u->depth];
+    if (top->kind == LV_ROOT || !top->loaded)
+        lib_request(u, top);
+    u->wheel = 0.0f;
+    u->redraw = 1;
+}
+
+static void lib_reset(Ui *u)
+{
+    for (int i = 0; i < LIB_DEPTH; i++)
+        browse_free(&u->lv[i].items);
+    memset(u->lv, 0, sizeof u->lv);
+    u->depth = 0;
+    u->wheel = 0.0f;
+    u->query[0] = 0;
+}
+
+static void lib_open_list(Ui *u, SpList list, const char *title, const char *uri)
+{
+    Level *lv = lib_push(u, LV_LIST, title);
+    if (!lv)
+        return;
+    lv->list = list;
+    snprintf(lv->uri, sizeof lv->uri, "%s", uri);
+    lib_request(u, lv);
+}
+
+/* Search results of every kind (SP_SEARCH_ALL, grouped), or of one. */
+static void lib_open_search(Ui *u, const char *query, unsigned types, const char *title)
+{
+    Level *lv = lib_push(u, LV_SEARCH, title);
+    if (!lv)
+        return;
+    lv->types = types;
+    snprintf(lv->query, sizeof lv->query, "%s", query);
+    lib_request(u, lv);
+}
+
+/* What an album, artist, playlist or show row holds, on a screen of its own. */
+static void lib_open_item(Ui *u, const Item *it)
+{
+    SpList list = it->kind == ITEM_ALBUM    ? SP_LIST_ALBUM
+                : it->kind == ITEM_ARTIST   ? SP_LIST_ARTIST
+                : it->kind == ITEM_PLAYLIST ? SP_LIST_PLAYLIST
+                                            : SP_LIST_SHOW;
+    lib_open_list(u, list, it->name, it->uri);
+}
+
+/* The panel opened: the Liked Songs total, the queue and what played last
+ * may have changed since. */
+static void lib_opened(Ui *u)
+{
+    Level *lv = &u->lv[u->depth];
+    if (lv->kind == LV_ROOT)
+        lib_request(u, lv);
+    else if (lv->kind == LV_LIST && (lv->list == SP_LIST_QUEUE || lv->list == SP_LIST_RECENT))
+        lib_reload(u, lv);
+}
+
+/* Take the library worker's page if it answers the screen shown; one for a
+ * screen left since is dropped. */
+static void lib_sync(Ui *u)
+{
+    Level *lv = &u->lv[u->depth];
+    LibWorker *w = &u->libw;
+    int sort = 0;
+    if (!lv->want)
+        return;
+    plat_mutex_lock(w->mu);
+    if (w->res_seq == lv->want) {
+        int rc = w->res_rc;
+        lv->want = 0;
+        if (rc == SP_OK && lv->kind != LV_ROOT &&
+            browse_append(&lv->items, w->res, w->res_n, BROWSE_KEEP) < 0)
+            rc = SP_ERR_OTHER; /* out of memory: keep what there is */
+        if (rc == SP_OK) {
+            lv->page = w->res_page;
+            lv->loaded = 1;
+            sort = lv->kind == LV_SEARCH && lv->types == SP_SEARCH_ALL;
+        }
+        lv->err = rc;
+    }
+    plat_mutex_unlock(w->mu);
+    if (sort)
+        browse_sort_groups(lv->items.v, lv->items.n);
+}
+
 /* --- screen transitions -------------------------------------------------- */
 static void reset_player_state(Ui *u)
 {
@@ -1055,10 +1470,14 @@ static void reset_player_state(Ui *u)
     u->text_dirty = 1;
     u->art_seq = 0;
     u->panel = PANEL_NONE;
-    u->lib_scroll = u->lib_show_hits = 0;
-    u->lib_seq = u->dev_seq_noted = 0;
-    memset(&u->lib, 0, sizeof u->lib);
-    u->query[0] = 0;
+    u->devs_seq = u->dev_seq_noted = 0;
+    memset(&u->devs, 0, sizeof u->devs);
+    lib_reset(u);
+    u->heart_uri[0] = 0;
+    u->heart = -1;
+    u->heart_gen = u->like_sent = u->like_done = 0;
+    u->like_err = SP_OK;
+    u->note_until = 0;
 }
 
 static void set_screen(Ui *u, Screen s)
@@ -1090,10 +1509,12 @@ static void stop_session(Ui *u)
     if (u->dev.stop)
         plat_event_signal(u->dev.stop);
     cmd_signal_stop(&u->cmd);
+    lib_signal_stop(&u->libw);
     art_signal_stop(u->art);
     poller_signal_stop(u->poller);
     stop_engine(u);
     cmd_stop(&u->cmd);
+    lib_stop(&u->libw);
     art_stop(u->art);
     u->art = NULL;
     if (u->art_tex.id)
@@ -1123,7 +1544,8 @@ static void enter_player(Ui *u)
     stop_engine(u);
     reset_player_state(u);
     u->poller = poller_start(u->auth, ui_wake, NULL);
-    if (!u->poller || cmd_start(&u->cmd, u->auth, u->poller, u->cfg.device_name) != 0) {
+    if (!u->poller || cmd_start(&u->cmd, u->auth, u->poller, u->cfg.device_name) != 0 ||
+        lib_start(&u->libw, u->auth) != 0) {
         stop_session(u);
         u->login_msg = "Could not start the player.";
         set_screen(u, SCR_LOGIN);
@@ -1141,13 +1563,22 @@ static void enter_player(Ui *u)
     set_screen(u, SCR_PLAYER);
 }
 
-/* Sign-in first; everything else happens in the player. */
+/* Sign-in first; everything else happens in the player. An older sign-in
+ * still works for what it was granted, so the sign-in screen asks for the
+ * new permissions once per run, over the running player. */
 static void advance_signin(Ui *u)
 {
-    if (!auth_store_logged_in(u->auth))
+    u->reauth = 0;
+    if (!auth_store_logged_in(u->auth)) {
         set_screen(u, SCR_LOGIN);
-    else
-        enter_player(u);
+        return;
+    }
+    enter_player(u);
+    if (u->screen == SCR_PLAYER && !u->consent_asked && auth_store_needs_reconsent(u->auth)) {
+        u->consent_asked = u->reauth = 1;
+        u->login_msg = NULL;
+        set_screen(u, SCR_LOGIN);
+    }
 }
 
 /* Client id known: open the token store and continue with sign-in. */
@@ -1282,7 +1713,37 @@ static void start_login(Ui *u)
         u->login_msg = "Could not start sign-in.";
 }
 
-/* Our PKCE login for the Web API. */
+/* Sign in again over the running player, for permissions newer features
+ * need; now: open the browser at once (the user asked for it). */
+static void start_reauth(Ui *u, int now)
+{
+    u->reauth = 1;
+    u->login_msg = NULL;
+    set_screen(u, SCR_LOGIN);
+    if (now)
+        start_login(u);
+}
+
+/* Back to the player from the sign-in over it; after a new sign-in, what
+ * needed its permissions tries again. */
+static void end_reauth(Ui *u, int signed_in)
+{
+    u->reauth = 0;
+    u->login_msg = NULL;
+    set_screen(u, SCR_PLAYER);
+    if (!signed_in)
+        return;
+    plat_mutex_lock(u->cmd.mu);
+    u->cmd.me_stale = 1; /* it may be another account */
+    plat_mutex_unlock(u->cmd.mu);
+    Level *lv = &u->lv[u->depth];
+    if (lv->err != SP_OK)
+        lib_reload(u, lv);
+    u->heart_uri[0] = 0; /* the heart checks the playing track again */
+}
+
+/* Our PKCE login for the Web API. With reauth set it is over the running
+ * player, asking an older sign-in for new permissions: Later goes back. */
 static void draw_login(Ui *u)
 {
     const Metrics *m = &u->m;
@@ -1296,7 +1757,11 @@ static void draw_login(Ui *u)
             login_join(u);
             if (rc == 0) {
                 u->login_msg = NULL;
-                advance_signin(u);
+                u->consent_asked = 1; /* it got what Spotify grants */
+                if (u->reauth)
+                    end_reauth(u, 1);
+                else
+                    advance_signin(u);
                 return;
             }
             u->login_msg = cancelled ? "Sign-in cancelled." : auth_login_strerror(rc);
@@ -1304,18 +1769,28 @@ static void draw_login(Ui *u)
     }
 
     float y = 120 + (float)m->fl + 48;
-    text_center(u, "Sign in to control your music.", y, FS_S, C_TEXT);
-    y += (float)m->fs + 26;
+    if (u->reauth) {
+        y += para_center(u, AUTH_RECONSENT_REASON, y, C_TEXT) + 26;
+    } else {
+        text_center(u, "Sign in to control your music.", y, FS_S, C_TEXT);
+        y += (float)m->fs + 26;
+    }
     float bw = btn_w(u, "Sign in with Spotify", 200), bh = (float)m->fs + 30;
     Rectangle rb = { ((float)u->w - bw) / 2.0f, y, bw, bh };
     if (!u->login_th) {
         if (button(u, W_SIGNIN, rb, "Sign in with Spotify", FS_S, 1))
             start_login(u);
-        /* A client ID fixed in .env applies without a restart. */
-        float rw = btn_w(u, "Reload .env", 120), rh = (float)m->fs + 14;
+        /* Over the player: go on without the new permissions. Else a client
+         * ID fixed in .env applies without a restart. */
+        const char *second = u->reauth ? "Later" : "Reload .env";
+        float rw = btn_w(u, second, 120), rh = (float)m->fs + 14;
         Rectangle rr = { ((float)u->w - rw) / 2.0f, y + bh + 8, rw, rh };
         u->need_h = rr.y + rh + 12 + (float)m->fs + PAD;
-        if (button(u, W_RELOAD, rr, "Reload .env", FS_S, 0)) {
+        if (u->reauth && button(u, W_LATER, rr, second, FS_S, 0)) {
+            end_reauth(u, 0);
+            return;
+        }
+        if (!u->reauth && button(u, W_RELOAD, rr, second, FS_S, 0)) {
             Config c;
             AuthStore *a = NULL;
             if (config_load(&c) == 0 && (a = auth_store_new(&c)) != NULL) {
@@ -1656,11 +2131,61 @@ static void resync(Ui *u)
     u->text_dirty = 1;
 }
 
+/* --- the heart: is the playing track in your library? -------------------- */
+/* A track or episode the heart can save: anything playing but a local file. */
+static int likeable(const PlaybackState *s)
+{
+    return s->active && s->track.uri[0] && strncmp(s->track.uri, "spotify:local:", 14) != 0;
+}
+
+/* The heart's square at the end of the title's line. */
+static float heart_side(const Metrics *m)
+{
+    return (float)m->fl + 6;
+}
+
+/* One check per new track; a click shows at once, and the library worker's
+ * answer confirms it or puts it back. Returns 1 when it left the player: a
+ * save the sign-in lacks the permission for asks for it. */
+static int heart_sync(Ui *u)
+{
+    LibWorker *w = &u->libw;
+    const char *uri = likeable(&u->st) ? u->st.track.uri : "";
+    int scope = 0;
+    if (strcmp(uri, u->heart_uri) != 0) {
+        snprintf(u->heart_uri, sizeof u->heart_uri, "%s", uri);
+        u->heart = -1;
+        u->like_err = SP_OK;
+        if (uri[0])
+            lib_post_check(w, uri);
+    }
+    plat_mutex_lock(w->mu);
+    /* Checks first: one answered while a save was on its way is old news. */
+    if (w->checked_gen != u->heart_gen) {
+        u->heart_gen = w->checked_gen;
+        if (u->like_done == u->like_sent && !strcmp(w->checked, u->heart_uri))
+            u->heart = w->checked_rc == SP_OK ? w->checked_saved : -1;
+    }
+    if (w->saved_seq != u->like_done) {
+        u->like_done = w->saved_seq;
+        /* Only the newest save puts the heart back; a later one is coming. */
+        if (w->saved_rc != SP_OK && u->like_done == u->like_sent && !strcmp(w->saved, u->heart_uri))
+            u->heart = !w->saved_on;
+        scope = w->saved_rc == SP_ERR_SCOPE;
+        u->like_err = scope ? SP_OK : w->saved_rc;
+    }
+    plat_mutex_unlock(w->mu);
+    if (scope)
+        start_reauth(u, 0);
+    return scope;
+}
+
 static void refresh_player_text(Ui *u, float maxw, float status_w, float hint_w)
 {
     const PlaybackState *s = &u->st;
     if (s->active) {
-        fit_text(u, s->track.name[0] ? s->track.name : "Unknown title", FS_L, maxw, u->title, sizeof u->title);
+        float tw = likeable(s) ? maxw - heart_side(&u->m) - ROW_PAD : maxw; /* the heart */
+        fit_text(u, s->track.name[0] ? s->track.name : "Unknown title", FS_L, tw, u->title, sizeof u->title);
         fit_text(u, s->track.artists, FS_S, maxw, u->artists, sizeof u->artists);
         fit_text(u, s->track.album, FS_S, maxw, u->album, sizeof u->album);
     } else {
@@ -1690,10 +2215,14 @@ static int status_message(Ui *u, char *out, size_t cap)
             snprintf(out, cap, "Open Spotify on any device to start.");
         return 0;
     }
-    int err = u->cmd_err ? u->cmd_err : u->poll_err;
+    int err = u->cmd_err ? u->cmd_err : u->like_err ? u->like_err : u->poll_err;
     if (err) {
         snprintf(out, cap, "%s", sp_strerror(err));
         return 1;
+    }
+    if (plat_now_ms() < u->note_until) {
+        snprintf(out, cap, "Added to queue");
+        return 0;
     }
     if (u->paired && u->eng_err[0] && !u->sol && !u->inst.th) {
         snprintf(out, cap, "%s%s", strncmp(u->eng_err, "Soloist", 7) ? "Soloist: " : "", u->eng_err);
@@ -1758,84 +2287,303 @@ static void update_art(Ui *u, float slot_px)
     UnloadImage(img);
 }
 
-/* Pull new panel data from the command worker; copies only on change. */
-static void sync_library(Ui *u)
+/* Pull a new device list from the command worker; copies only on change. */
+static void sync_devices(Ui *u)
 {
     plat_mutex_lock(u->cmd.mu);
-    if (u->cmd.lib_seq != u->lib_seq) {
-        u->lib_seq = u->cmd.lib_seq;
-        u->lib = u->cmd.lib;
+    if (u->cmd.devs_seq != u->devs_seq) {
+        u->devs_seq = u->cmd.devs_seq;
+        u->devs = u->cmd.devs;
     }
     plat_mutex_unlock(u->cmd.mu);
 }
 
-/* Playlists and track search over the player area; rows reuse button(). */
+/* --- Library panel: drawing ----------------------------------------------- */
+/* The root's sections, each a screen of its list. */
+static const struct {
+    const char *name;
+    SpList      list;
+} LIB_SECTIONS[] = {
+    { "Liked Songs", SP_LIST_LIKED },      { "Playlists", SP_LIST_PLAYLISTS },
+    { "Albums", SP_LIST_ALBUMS },          { "Artists", SP_LIST_ARTISTS },
+    { "Podcasts", SP_LIST_SHOWS },         { "Your Episodes", SP_LIST_EPISODES },
+    { "Recently played", SP_LIST_RECENT }, { "Queue", SP_LIST_QUEUE },
+};
+#define LIB_SECTIONS_N ((int)(sizeof LIB_SECTIONS / sizeof LIB_SECTIONS[0]))
+
+/* Search results of every kind on one screen, grouped by kind. */
+static int lib_grouped(const Level *lv)
+{
+    return lv->kind == LV_SEARCH && lv->types == SP_SEARCH_ALL;
+}
+
+/* The heading over row i, or NULL: search results group by kind, the queue
+ * into what plays now and what comes next. */
+static const char *lib_heading(const Level *lv, int i)
+{
+    const Item *v = lv->items.v;
+    if (lib_grouped(lv)) {
+        int g = browse_group(v[i].kind);
+        return i == 0 || browse_group(v[i - 1].kind) != g ? browse_group_name(g) : NULL;
+    }
+    if (lv->kind == LV_LIST && lv->list == SP_LIST_QUEUE) {
+        if (i == 0 && lv->page.now_playing)
+            return "Now playing";
+        return i == lv->page.now_playing ? "Next up" : NULL;
+    }
+    return NULL;
+}
+
+/* A heading's line, with a gap to its first row. */
+static float lib_head_h(const Metrics *m)
+{
+    return m->line + ROW_GAP;
+}
+
+/* Row i's height; the one after the items is the footer. */
+static float lib_row_h(const Ui *u, const Level *lv, int i)
+{
+    if (lv->kind == LV_ROOT || i >= lv->items.n)
+        return u->m.row;
+    return u->m.row2 + (lib_heading(lv, i) ? lib_head_h(&u->m) : 0.0f);
+}
+
+/* The footer under the items, if any: more on the way, a page that failed
+ * (a click tries again), or the cap. */
+static int lib_footer(const Level *lv, char *out, size_t cap)
+{
+    if (lv->want)
+        snprintf(out, cap, "Loading" ELLIPSIS);
+    else if (lv->err != SP_OK)
+        snprintf(out, cap, "Could not load more. Click to try again.");
+    else if (lv->items.n >= BROWSE_KEEP && lv->page.more)
+        snprintf(out, cap, "Showing first %d", BROWSE_KEEP);
+    else
+        return 0;
+    return 1;
+}
+
+/* How many of the rows, from lv->scroll on, fit in avail. The mouse wheel
+ * moves lv->scroll first, never past where the last row shows. */
+static int lib_scroll(Ui *u, Level *lv, int rows, float avail)
+{
+    u->wheel += GetMouseWheelMove();
+    int step = (int)u->wheel; /* whole rows; the rest adds up */
+    u->wheel -= (float)step;
+    lv->scroll -= step;
+    int last = rows; /* the first row of the last screenful */
+    for (float used = 0.0f; last > 0; last--) {
+        used += lib_row_h(u, lv, last - 1) + (last < rows ? ROW_GAP : 0.0f);
+        if (used > avail)
+            break;
+    }
+    if (lv->scroll > last)
+        lv->scroll = last;
+    if (lv->scroll < 0)
+        lv->scroll = 0;
+    int n = 0;
+    for (float used = 0.0f; lv->scroll + n < rows; n++) {
+        used += lib_row_h(u, lv, lv->scroll + n) + (n ? ROW_GAP : 0.0f);
+        if (used > avail)
+            break;
+    }
+    return n;
+}
+
+/* The root: the search field (typing always goes there; Enter searches
+ * every kind) and the sections. */
+static void draw_lib_root(Ui *u, Rectangle area, Level *lv)
+{
+    const Metrics *m = &u->m;
+    edit_line(u->query, sizeof u->query, 0);
+    if ((IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) && u->query[strspn(u->query, " ")]) {
+        char title[sizeof lv->title];
+        snprintf(title, sizeof title, "\xE2\x80\x9C%s\xE2\x80\x9D", u->query); /* in quotes */
+        lib_open_search(u, u->query, SP_SEARCH_ALL, title);
+        return;
+    }
+    draw_field(u, (Rectangle){ area.x, area.y, area.width, m->row }, u->query, "Type to search, Enter");
+    float y = area.y + m->row + 10;
+    int n = lib_scroll(u, lv, LIB_SECTIONS_N, area.y + area.height - y);
+    for (int i = lv->scroll; i < lv->scroll + n; i++, y += m->row + ROW_GAP) {
+        Rectangle r = { area.x, y, area.width, m->row };
+        if (button(u, W_LIB_ROW + i, r, NULL, 0, 0)) {
+            lib_open_list(u, LIB_SECTIONS[i].list, LIB_SECTIONS[i].name, "");
+            return;
+        }
+        text(u, LIB_SECTIONS[i].name, r.x + ROW_PAD, mid_y(u, r), FS_S, C_TEXT);
+        if (LIB_SECTIONS[i].list == SP_LIST_LIKED && lv->loaded && lv->page.total >= 0) {
+            char total[32];
+            snprintf(total, sizeof total, "%d song%s", lv->page.total, lv->page.total == 1 ? "" : "s");
+            text(u, total, r.x + r.width - ROW_PAD - text_w(u, total, FS_S), mid_y(u, r), FS_S, C_DIM);
+        }
+    }
+}
+
+/* Row i of lv in r, under its heading if it starts a group. A track or
+ * episode plays and has +Queue, a container opens, anything else is
+ * dimmed. Returns 1 when it opened a screen. */
+static int draw_lib_row(Ui *u, Level *lv, int i, Rectangle r)
+{
+    const Metrics *m = &u->m;
+    const Item *it = &lv->items.v[i];
+    const char *head = lib_heading(lv, i);
+    if (head) {
+        Rectangle hr = { r.x, r.y, r.width, m->line };
+        text(u, head, hr.x, mid_y(u, hr), FS_S, C_DIM);
+        int g = browse_group(it->kind), in_group = 0;
+        for (int k = i; lib_grouped(lv) && k < lv->items.n && browse_group(lv->items.v[k].kind) == g; k++)
+            in_group++;
+        if (in_group >= SP_SEARCH_LIMIT) { /* a full share: Spotify has more */
+            float sw = text_w(u, "See all", FS_S) + 2 * ROW_PAD;
+            Rectangle rs = { r.x + r.width - sw, r.y, sw, m->line };
+            if (button(u, W_LIB_MORE + g, rs, "See all", FS_S, 0)) {
+                char title[sizeof lv->title];
+                snprintf(title, sizeof title, "%s: \xE2\x80\x9C%s\xE2\x80\x9D", browse_group_name(g),
+                         lv->query);
+                lib_open_search(u, lv->query, browse_group_type(g), title);
+                return 1;
+            }
+        }
+        r.y += lib_head_h(m);
+        r.height -= lib_head_h(m);
+    }
+    PlayTarget t;
+    int track = it->kind == ITEM_TRACK || it->kind == ITEM_EPISODE;
+    int plays = track && browse_play_target(lib_list_of(lv), lv->uri, it, &t) == 0;
+    int opens = !track && it->playable && it->uri[0];
+    Rectangle rb = r;
+    if (track) { /* the +Queue column, kept by unplayable rows too so they line up */
+        float qw = text_w(u, "+Queue", FS_S) + (float)m->fs;
+        Rectangle rq = { r.x + r.width - qw, r.y + (r.height - m->bar) / 2.0f, qw, m->bar };
+        rb.width -= qw + ROW_GAP;
+        if (plays && button(u, W_LIB_QUEUE + i, rq, "+Queue", FS_S, 0))
+            cmd_post_uri(&u->cmd, CMD_QUEUE, 0, it->uri, NULL);
+    }
+    if (!plays && !opens) {
+        DrawRectangleRounded(rb, 0.3f, 6, C_PRESS); /* Spotify can't play it */
+    } else if (button(u, W_LIB_ROW + i, rb, NULL, 0, 0)) {
+        if (opens) {
+            lib_open_item(u, it);
+            return 1;
+        }
+        cmd_post_uri(&u->cmd, CMD_PLAY_URI, t.liked, t.item, t.ctx);
+    }
+    Color name_c = !plays && !opens                                     ? C_DIM
+                 : u->st.active && !strcmp(it->uri, u->st.track.uri) ? C_ACCENT
+                                                                     : C_TEXT;
+    char sub[SP_NAME_LEN], info[32], fit[SP_NAME_LEN];
+    float tx = rb.x + ROW_PAD, tw = rb.width - 2 * ROW_PAD;
+    browse_row_text(it, sub, sizeof sub, info, sizeof info);
+    fit_text(u, it->name, FS_S, tw, fit, sizeof fit);
+    if (!sub[0] && !info[0]) { /* one line (an artist) */
+        text(u, fit, tx, mid_y(u, rb), FS_S, name_c);
+        return 0;
+    }
+    float ty = rb.y + (rb.height - (2.0f * (float)m->fs + LINE_GAP)) / 2.0f, iw = 0.0f;
+    text(u, fit, tx, ty, FS_S, name_c);
+    ty += (float)m->fs + LINE_GAP;
+    if (info[0]) {
+        iw = text_w(u, info, FS_S);
+        text(u, info, rb.x + rb.width - ROW_PAD - iw, ty, FS_S, C_DIM);
+        iw += ROW_PAD;
+    }
+    fit_text(u, sub, FS_S, tw - iw, fit, sizeof fit);
+    text(u, fit, tx, ty, FS_S, C_DIM);
+    return 0;
+}
+
+/* A list, a container or search results: Back, the title and Play (for a
+ * context) on top, then the rows; scrolling to the end loads more. */
+static void draw_lib_list(Ui *u, Rectangle area, Level *lv)
+{
+    const Metrics *m = &u->m;
+    PlayTarget pt;
+    int has_play = browse_play_target(lib_list_of(lv), lv->uri, NULL, &pt) == 0;
+    float bw = btn_w(u, "Back", 0.0f), pw = btn_w(u, "Play", 0.0f);
+    Rectangle back = { area.x, area.y, bw, m->row };
+    Rectangle rp = { area.x + area.width - pw, area.y, pw, m->row };
+    if (button(u, W_LIB_BACK, back, "Back", FS_S, 0)) {
+        lib_pop(u);
+        return;
+    }
+    if (has_play && button(u, W_LIB_PLAY, rp, "Play", FS_S, 1))
+        cmd_post_uri(&u->cmd, CMD_PLAY_URI, pt.liked, pt.item, pt.ctx);
+    char fit[sizeof lv->title];
+    float tx = back.x + bw + 10, tr = has_play ? rp.x - 10 : area.x + area.width;
+    fit_text(u, lv->title, FS_S, tr - tx, fit, sizeof fit);
+    text(u, fit, tx, mid_y(u, back), FS_S, C_TEXT);
+
+    float y = area.y + m->row + 10;
+    if (lv->page.restricted)
+        y += para(u, "Spotify only lists songs of your own playlists here.", area.x, y, area.width,
+                  C_DIM) + 10;
+    int n = lv->items.n;
+    if (n == 0) {
+        if (lv->want) {
+            text(u, "Loading" ELLIPSIS, area.x, y + 4, FS_S, C_DIM);
+        } else if (lv->err == SP_ERR_SCOPE) {
+            y += para(u, "Sign in again to allow this.", area.x, y + 4, area.width, C_DIM) + 12;
+            Rectangle rs = { area.x, y, btn_w(u, "Sign in again", 0.0f), m->row };
+            if (button(u, W_LIB_SIGNIN, rs, "Sign in again", FS_S, 1))
+                start_reauth(u, 1);
+        } else if (lv->err != SP_OK) {
+            para(u, sp_strerror(lv->err), area.x, y + 4, area.width, C_ERR);
+        } else if (lv->loaded && !lv->page.restricted) {
+            text(u, lv->kind == LV_SEARCH ? "No results." : "Nothing here.", area.x, y + 4, FS_S, C_DIM);
+        }
+        return;
+    }
+    char foot[64];
+    int rows = n + lib_footer(lv, foot, sizeof foot);
+    int shown = lib_scroll(u, lv, rows, area.y + area.height - y);
+    for (int i = lv->scroll; i < lv->scroll + shown; i++) {
+        Rectangle r = { area.x, y, area.width, lib_row_h(u, lv, i) };
+        y += r.height + ROW_GAP;
+        if (i < n) {
+            if (draw_lib_row(u, lv, i, r))
+                return;
+            continue;
+        }
+        int retry = lv->err != SP_OK && !lv->want;
+        if (retry && button(u, W_LIB_MORE + BROWSE_GROUPS, r, NULL, 0, 0)) {
+            lv->err = SP_OK;
+            lib_request(u, lv);
+        }
+        fit_text(u, foot, FS_S, r.width - 2 * ROW_PAD, fit, sizeof fit);
+        text(u, fit, r.x + ROW_PAD, mid_y(u, r), FS_S, retry ? C_ERR : C_DIM);
+    }
+    /* The end shows: the next page. Grouped search results are one page of
+     * every kind; See all has the rest of a kind. */
+    if (lv->scroll + shown >= n && lv->page.more && !lv->want && lv->err == SP_OK &&
+        n < BROWSE_KEEP && !lib_grouped(lv))
+        lib_request(u, lv);
+}
+
+/* The Library over the player area: a stack of screens. Back or Esc goes
+ * up one; Esc at the root closes the panel. */
 static void draw_library(Ui *u, Rectangle area)
 {
-    sync_library(u);
+    lib_sync(u);
     if (IsKeyPressed(KEY_ESCAPE)) {
-        u->panel = PANEL_NONE;
+        if (u->depth > 0)
+            lib_pop(u);
+        else
+            u->panel = PANEL_NONE;
         u->redraw = 1;
         return;
     }
-    edit_line(u->query, sizeof u->query, 0);
-    if ((IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) && u->query[0]) {
-        cmd_post_str(&u->cmd, CMD_SEARCH, 0, u->query);
-        u->lib_show_hits = 1;
-        u->lib_scroll = 0;
-    }
-
-    float bw = btn_w(u, "Playlists", 72), row_h = u->m.row, gap = 6;
-    Rectangle box = { area.x, area.y, area.width - bw - gap, row_h };
-    Rectangle back = { box.x + box.width + gap, area.y, bw, row_h };
-    draw_field(u, box, u->query, "Type to search tracks, Enter");
-    if (button(u, W_LIB_BACK, back, "Playlists", FS_S, !u->lib_show_hits)) {
-        u->lib_show_hits = 0;
-        u->lib_scroll = 0;
-        if (!u->lib.pl_loaded)
-            cmd_post(&u->cmd, CMD_PLAYLISTS, 0);
-    }
-
-    int hits = u->lib_show_hits;
-    int n = hits ? u->lib.nhits : u->lib.npl;
-    float y = area.y + row_h + 10;
-    const char *empty = hits ? (u->lib.searched ? "No results." : "Searching...")
-                             : (u->lib.pl_loaded ? "No playlists." : "Loading playlists...");
-    if (n == 0) {
-        text(u, empty, area.x, y + 4, FS_S, C_DIM);
-        return;
-    }
-    int visible = (int)((area.y + area.height - y + gap) / (row_h + gap));
-    if (visible < 1)
-        visible = 1;
-    float wheel = GetMouseWheelMove();
-    u->lib_scroll += wheel > 0 ? -1 : wheel < 0 ? 1 : 0;
-    if (u->lib_scroll > n - visible)
-        u->lib_scroll = n - visible;
-    if (u->lib_scroll < 0)
-        u->lib_scroll = 0;
-    for (int i = u->lib_scroll; i < n && i < u->lib_scroll + visible; i++, y += row_h + gap) {
-        Rectangle r = { area.x, y, area.width, row_h };
-        const char *name = hits ? u->lib.hits[i].name : u->lib.pl[i].name;
-        const char *uri = hits ? u->lib.hits[i].uri : u->lib.pl[i].uri;
-        char sub[SP_NAME_LEN], fit[SP_NAME_LEN];
-        if (hits) /* artists may be long: they get at most about half the row */
-            fit_text(u, u->lib.hits[i].artists, FS_S, r.width * 0.45f, sub, sizeof sub);
-        else
-            snprintf(sub, sizeof sub, "%d tracks", u->lib.pl[i].track_count);
-        if (button(u, W_LIB_ROW + i, r, NULL, 0, 0) && uri[0])
-            cmd_post_str(&u->cmd, CMD_PLAY_URI, hits, uri);
-        float sw = text_w(u, sub, FS_S);
-        fit_text(u, name, FS_S, r.width - sw - 28, fit, sizeof fit);
-        text(u, fit, r.x + 8, mid_y(u, r), FS_S, C_TEXT);
-        text(u, sub, r.x + r.width - 8 - sw, mid_y(u, r), FS_S, C_DIM);
-    }
+    Level *lv = &u->lv[u->depth];
+    if (lv->kind == LV_ROOT)
+        draw_lib_root(u, area, lv);
+    else
+        draw_lib_list(u, area, lv);
 }
 
 /* Spotify Connect devices; a click moves playback there via the worker. */
 static void draw_devices(Ui *u, Rectangle area)
 {
-    sync_library(u);
+    sync_devices(u);
     if (IsKeyPressed(KEY_ESCAPE)) {
         u->panel = PANEL_NONE;
         u->redraw = 1;
@@ -1858,23 +2606,23 @@ static void draw_devices(Ui *u, Rectangle area)
         }
         y += row_h + gap;
     }
-    if (u->lib.ndev == 0) {
-        para(u, u->lib.devs_loaded ? "No devices. Open Spotify on a phone or computer."
-                                   : "Loading devices...", area.x, y + 4, area.width, C_DIM);
+    if (u->devs.ndev == 0) {
+        para(u, u->devs.loaded ? "No devices. Open Spotify on a phone or computer."
+                               : "Loading devices...", area.x, y + 4, area.width, C_DIM);
         return;
     }
     /* Our own device first (once paired), then Spotify's order. */
     int order[SP_MAX_DEVICES], n = 0;
     for (int pass = 0; pass < 2; pass++)
-        for (int i = 0; i < u->lib.ndev; i++)
-            if ((u->paired && strcmp(u->lib.devs[i].name, u->cfg.device_name) == 0) == !pass)
+        for (int i = 0; i < u->devs.ndev; i++)
+            if ((u->paired && strcmp(u->devs.devs[i].name, u->cfg.device_name) == 0) == !pass)
                 order[n++] = i;
     for (int k = 0; k < n && y + row_h <= area.y + area.height; k++, y += row_h + gap) {
         int i = order[k];
-        const Device *d = &u->lib.devs[i];
+        const Device *d = &u->devs.devs[i];
         Rectangle r = { area.x, y, area.width, row_h };
         if (button(u, W_LIB_ROW + i, r, NULL, 0, d->is_active) && d->id[0]) {
-            cmd_post_str(&u->cmd, CMD_TRANSFER, 0, d->id);
+            cmd_post_uri(&u->cmd, CMD_TRANSFER, 0, d->id, NULL);
             u->panel = PANEL_NONE;
         }
         int ours = u->paired && strcmp(d->name, u->cfg.device_name) == 0;
@@ -1972,22 +2720,25 @@ static void draw_player(Ui *u)
         resync(u);
 
     plat_mutex_lock(u->cmd.mu);
-    uint64_t cseq = u->cmd.err_seq;
-    int cerr = u->cmd.err;
+    uint64_t cseq = u->cmd.err_seq, done_at = u->cmd.done_at;
+    int cerr = u->cmd.err, queued = u->cmd.done == CMD_QUEUE;
     char played_on[SP_NAME_LEN], other[SP_NAME_LEN] = "";
     memcpy(played_on, u->cmd.played_on, sizeof played_on);
-    int fresh = u->cmd.lib_seq != u->dev_seq_noted;
-    u->dev_seq_noted = u->cmd.lib_seq;
+    int fresh = u->cmd.devs_seq != u->dev_seq_noted;
+    u->dev_seq_noted = u->cmd.devs_seq;
     if (fresh) /* a fresh device list names another device? */
-        for (int i = 0; i < u->cmd.lib.ndev && !other[0]; i++)
-            if (u->cmd.lib.devs[i].id[0] && strcmp(u->cmd.lib.devs[i].name, u->cfg.device_name))
-                memcpy(other, u->cmd.lib.devs[i].name, sizeof other);
+        for (int i = 0; i < u->cmd.devs.ndev && !other[0]; i++)
+            if (u->cmd.devs.devs[i].id[0] && strcmp(u->cmd.devs.devs[i].name, u->cfg.device_name))
+                memcpy(other, u->cmd.devs.devs[i].name, sizeof other);
     plat_mutex_unlock(u->cmd.mu);
     note_other(u, other);
     if (cseq != u->cmd_seq) {
         u->cmd_seq = cseq;
         u->cmd_err = cerr;
         memcpy(u->played_on, played_on, sizeof u->played_on);
+        /* The worker wakes us PENDING_MS after its last command, which
+         * takes the note down again. */
+        u->note_until = queued && cerr == SP_OK ? done_at + PENDING_MS : 0;
         u->text_dirty = 1;
         if (cerr != SP_OK)
             resync(u);
@@ -2004,6 +2755,8 @@ static void draw_player(Ui *u)
         advance_signin(u);
         return;
     }
+    if (heart_sync(u))
+        return;
     poll_engine(u);
     plat_mutex_lock(u->cmd.mu);
     u->cmd.local = local_ready(u);
@@ -2082,8 +2835,8 @@ static void draw_player(Ui *u)
     }
     if (button(u, W_LIBRARY, library, "Library", FS_S, u->panel == PANEL_LIBRARY)) {
         u->panel = u->panel == PANEL_LIBRARY ? PANEL_NONE : PANEL_LIBRARY;
-        if (u->panel == PANEL_LIBRARY && !u->lib.pl_loaded)
-            cmd_post(&u->cmd, CMD_PLAYLISTS, 0);
+        if (u->panel == PANEL_LIBRARY)
+            lib_opened(u);
     }
     if (button(u, W_SETTINGS, settings, "Settings", FS_S, u->panel == PANEL_SETTINGS)) {
         u->panel = u->panel == PANEL_SETTINGS ? PANEL_NONE : PANEL_SETTINGS;
@@ -2131,6 +2884,16 @@ static void draw_player(Ui *u)
     y += art; /* the rows below are offsets from the art's bottom edge */
 
     text(u, u->title, PAD, y + rows.title, FS_L, C_TEXT);
+    if (likeable(&u->st)) {
+        /* The heart at the end of the title's line: save it or remove it. */
+        float hs = heart_side(m);
+        Rectangle rh = { w - PAD - hs, y + rows.title + ((float)m->fl - hs) / 2.0f, hs, hs };
+        if (clicked(u, W_HEART, rh)) {
+            u->heart = u->heart != 1;
+            lib_post_save(&u->libw, u->heart_uri, u->heart, ++u->like_sent);
+        }
+        draw_heart(u, rh, u->heart == 1, u->heart == 1 ? C_ACCENT : hovered(rh) ? C_TEXT : C_DIM);
+    }
     text(u, u->artists, PAD, y + rows.artists, FS_S, C_TEXT);
     text(u, u->album, PAD, y + rows.album, FS_S, C_DIM);
 
@@ -2305,6 +3068,7 @@ int ui_run(const Config *cfg)
     /* Every thread that could call ui_wake is joined before the window goes. */
     stop_session(u);
     login_join(u);
+    lib_reset(u);
     auth_store_free(u->auth);
     (void)plat_quit_watch(NULL, NULL); /* no wake-ups once GLFW is gone */
     plat_mutex_free(u->mu);
