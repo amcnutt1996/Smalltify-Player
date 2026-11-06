@@ -3,13 +3,14 @@
  * parsing, so error handling stays identical across endpoints. */
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cJSON.h"
 #include "platform.h"
 #include "spotify.h"
 
-#define SP_URL_MAX 1024
+#define SP_URL_MAX 2048 /* fits SP_LIBRARY_MAX encoded URIs */
 
 /* ======================================================================
  * Shared helpers: request + JSON field access (reuse these in every sp_*)
@@ -67,12 +68,12 @@ static int json_bool(const cJSON *obj, const char *key)
     return cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(obj, key));
 }
 
-/* Spotify reports why a player call failed in {"error":{"reason":...}}. */
-static int body_reason_is(const cJSON *root, const char *reason)
+/* Spotify says why a call failed in {"error":{"reason":...,"message":...}}. */
+static int body_error_is(const cJSON *root, const char *key, const char *value)
 {
     const cJSON *err = cJSON_GetObjectItemCaseSensitive(root, "error");
-    const cJSON *r = cJSON_GetObjectItemCaseSensitive(err, "reason");
-    return cJSON_IsString(r) && strcmp(r->valuestring, reason) == 0;
+    const cJSON *r = cJSON_GetObjectItemCaseSensitive(err, key);
+    return cJSON_IsString(r) && strcmp(r->valuestring, value) == 0;
 }
 
 static int map_status(long status, const char *path, const cJSON *body)
@@ -83,11 +84,15 @@ static int map_status(long status, const char *path, const cJSON *body)
     case 401:
         return SP_ERR_AUTH;
     case 403:
+        /* A sign-in from before a scope was added; other 403s are Premium or
+         * content restrictions. */
+        if (body_error_is(body, "message", "Insufficient client scope"))
+            return SP_ERR_SCOPE;
         return SP_ERR_PREMIUM;
     case 404:
         /* Player endpoints answer 404 when no device is active; elsewhere a
          * 404 is a bad ID unless Spotify says otherwise. */
-        if (body_reason_is(body, "NO_ACTIVE_DEVICE") || strncmp(path, "/me/player", 10) == 0)
+        if (body_error_is(body, "reason", "NO_ACTIVE_DEVICE") || strncmp(path, "/me/player", 10) == 0)
             return SP_ERR_NODEVICE;
         return SP_ERR_OTHER;
     case 429:
@@ -147,6 +152,7 @@ const char *sp_strerror(int err)
     case SP_ERR_RATE:     return "Spotify is rate limiting requests. Please wait a moment and try again.";
     case SP_ERR_PARSE:    return "Unexpected response from Spotify.";
     case SP_ERR_OTHER:    return "Spotify request failed.";
+    case SP_ERR_SCOPE:    return "Spotify needs your permission for this. Please sign in again.";
     default:              return "Unknown error.";
     }
 }
@@ -157,18 +163,24 @@ const char *sp_strerror(int err)
 
 /* Smallest image at least ART_SHARP_W wide (the GUI slot is ~330 pt, so
  * smaller covers look blurry); if none is that big, the largest image of at
- * least ART_MIN_W. Spotify usually offers 640/300/64, so this picks 300. */
+ * least ART_MIN_W. Spotify usually offers 640/300/64, so this picks 300.
+ * unsized_ok: with no such image, the first one without a width (custom
+ * playlist covers come that way). */
 #define ART_SHARP_W 300
 #define ART_MIN_W   64
-static void pick_image(char *dst, size_t cap, const cJSON *images)
+static void pick_image(char *dst, size_t cap, const cJSON *images, int unsized_ok)
 {
-    const cJSON *img, *sharp = NULL, *fallback = NULL;
+    const cJSON *img, *sharp = NULL, *fallback = NULL, *unsized = NULL;
     int sharp_w = INT_MAX, fallback_w = 0;
 
     dst[0] = '\0';
     cJSON_ArrayForEach(img, images) {
         int w = json_int(img, "width", -1);
-        if (w < ART_MIN_W || !cJSON_IsString(cJSON_GetObjectItemCaseSensitive(img, "url")))
+        if (!cJSON_IsString(cJSON_GetObjectItemCaseSensitive(img, "url")))
+            continue;
+        if (w < 0 && !unsized)
+            unsized = img;
+        if (w < ART_MIN_W)
             continue;
         if (w >= ART_SHARP_W && w < sharp_w) {
             sharp = img;
@@ -180,6 +192,8 @@ static void pick_image(char *dst, size_t cap, const cJSON *images)
     }
     if (sharp || fallback)
         json_str(dst, cap, sharp ? sharp : fallback, "url");
+    else if (unsized_ok && unsized)
+        json_str(dst, cap, unsized, "url");
 }
 
 /* "A, B, C" from an artists array, truncated like any other field but never
@@ -239,7 +253,7 @@ static void parse_item(const cJSON *item, Track *t)
                      cJSON_GetObjectItemCaseSensitive(item, "artists"));
         images = cJSON_GetObjectItemCaseSensitive(album, "images");
     }
-    pick_image(t->art_url, sizeof t->art_url, images);
+    pick_image(t->art_url, sizeof t->art_url, images, 0);
 }
 
 static RepeatMode parse_repeat(const cJSON *root)
@@ -492,152 +506,52 @@ int sp_transfer(HttpClient *c, const char *device_id, int play)
 }
 
 /* ======================================================================
- * Extras (playlists, search, play URI): build on sp_request()
+ * Playing something: sp_play_uri, sp_play_smart, the queue
  * ====================================================================== */
 
-/* Playlists beyond cap are dropped; *count is the number stored. */
-static int parse_playlists(const cJSON *root, Playlist *out, int cap, int *count)
+int sp_play_body(const char *context_uri, const char *item_uri, char *out, size_t cap)
 {
-    const cJSON *list = cJSON_GetObjectItemCaseSensitive(root, "items");
-    const cJSON *p;
-    int n = 0;
+    int has_ctx = context_uri && context_uri[0];
+    int has_item = item_uri && item_uri[0];
+    cJSON *body, *sub;
+    int ok;
 
-    *count = 0;
-    if (!cJSON_IsArray(list))
-        return SP_ERR_PARSE;
-    cJSON_ArrayForEach(p, list) {
-        Playlist *pl;
-
-        if (n >= cap)
-            break;
-        if (!cJSON_IsObject(p))
-            continue; /* Spotify returns null for unavailable playlists */
-        pl = &out[n++];
-        json_str(pl->id, sizeof pl->id, p, "id");
-        json_str(pl->uri, sizeof pl->uri, p, "uri");
-        json_str(pl->name, sizeof pl->name, p, "name");
-        /* "tracks" was renamed "items" in newer API responses; accept both. */
-        pl->track_count = json_int(cJSON_GetObjectItemCaseSensitive(p, "tracks"), "total", -1);
-        if (pl->track_count < 0)
-            pl->track_count = json_int(cJSON_GetObjectItemCaseSensitive(p, "items"), "total", 0);
-    }
-    *count = n;
-    return SP_OK;
-}
-
-/* Search results reuse parse_item() so tracks look identical to playback. */
-static int parse_search(const cJSON *root, Track *out, int cap, int *count)
-{
-    const cJSON *tracks = cJSON_GetObjectItemCaseSensitive(root, "tracks");
-    const cJSON *list = cJSON_GetObjectItemCaseSensitive(tracks, "items");
-    const cJSON *t;
-    int n = 0;
-
-    *count = 0;
-    if (!cJSON_IsArray(list))
-        return SP_ERR_PARSE;
-    cJSON_ArrayForEach(t, list) {
-        if (n >= cap)
-            break;
-        if (!cJSON_IsObject(t))
-            continue;
-        parse_item(t, &out[n++]);
-    }
-    *count = n;
-    return SP_OK;
-}
-
-int sp_parse_playlists(const char *json, Playlist *out, int cap, int *count)
-{
-    cJSON *root;
-    int rc;
-
-    if (!count || cap < 0 || (cap > 0 && !out))
-        return SP_ERR_OTHER;
-    root = json ? cJSON_Parse(json) : NULL;
-    rc = parse_playlists(root, out, cap, count);
-    cJSON_Delete(root);
-    return rc;
-}
-
-int sp_parse_search(const char *json, Track *out, int cap, int *count)
-{
-    cJSON *root;
-    int rc;
-
-    if (!count || cap < 0 || (cap > 0 && !out))
-        return SP_ERR_OTHER;
-    root = json ? cJSON_Parse(json) : NULL;
-    rc = parse_search(root, out, cap, count);
-    cJSON_Delete(root);
-    return rc;
-}
-
-int sp_get_playlists(HttpClient *c, Playlist *out, int cap, int *count)
-{
-    cJSON *root;
-    int rc;
-
-    if (!count || cap < 0 || (cap > 0 && !out))
-        return SP_ERR_OTHER;
-    *count = 0;
-    rc = sp_request(c, "GET", "/me/playlists?limit=50", NULL, &root);
-    if (rc != SP_OK)
-        return rc;
-    rc = parse_playlists(root, out, cap, count);
-    cJSON_Delete(root);
-    return rc;
-}
-
-int sp_search_tracks(HttpClient *c, const char *query, Track *out, int cap, int *count)
-{
-    char enc[SP_NAME_LEN * 3];
-    char path[SP_URL_MAX];
-    cJSON *root;
-    int n, rc;
-
-    if (!count || !query || !query[0] || cap <= 0 || !out)
-        return SP_ERR_OTHER;
-    *count = 0;
-    if (http_urlencode(query, enc, sizeof enc) != 0)
-        return SP_ERR_OTHER;
-    n = snprintf(path, sizeof path, "/search?type=track&limit=%d&q=%s", cap > 50 ? 50 : cap, enc);
-    if (n < 0 || (size_t)n >= sizeof path)
-        return SP_ERR_OTHER;
-    rc = sp_request(c, "GET", path, NULL, &root);
-    if (rc != SP_OK)
-        return rc;
-    rc = parse_search(root, out, cap, count);
-    cJSON_Delete(root);
-    return rc;
-}
-
-int sp_play_uri(HttpClient *c, const char *device_id, const char *uri, int is_track)
-{
-    char path[SP_URL_MAX];
-    cJSON *body;
-    char *json = NULL;
-    int rc;
-
-    if (!uri || !uri[0])
-        return SP_ERR_OTHER;
-    rc = with_device(path, sizeof path, "/me/player/play", device_id);
-    if (rc != SP_OK)
-        return rc;
+    if (!out || cap == 0 || cap > INT_MAX)
+        return -1;
+    out[0] = '\0';
+    if (!has_ctx && !has_item)
+        return -1;
     body = cJSON_CreateObject();
     if (!body)
-        return SP_ERR_OTHER;
-    if (is_track) {
-        cJSON *uris = cJSON_AddArrayToObject(body, "uris");
-        if (uris && cJSON_AddItemToArray(uris, cJSON_CreateString(uri)))
-            json = cJSON_PrintUnformatted(body);
-    } else if (cJSON_AddStringToObject(body, "context_uri", uri)) {
-        json = cJSON_PrintUnformatted(body);
+        return -1;
+    /* Built with cJSON so URIs are escaped; children belong to body as soon
+     * as they exist, so no failure path leaks. */
+    if (has_ctx) {
+        ok = cJSON_AddStringToObject(body, "context_uri", context_uri) != NULL;
+        if (ok && has_item)
+            ok = (sub = cJSON_AddObjectToObject(body, "offset")) != NULL &&
+                 cJSON_AddStringToObject(sub, "uri", item_uri) != NULL;
+    } else {
+        ok = (sub = cJSON_AddArrayToObject(body, "uris")) != NULL &&
+             cJSON_AddItemToArray(sub, cJSON_CreateString(item_uri));
     }
-    rc = json ? sp_request(c, "PUT", path, json, NULL) : SP_ERR_OTHER;
-    cJSON_free(json);
+    ok = ok && cJSON_PrintPreallocated(body, out, (int)cap, 0);
     cJSON_Delete(body);
-    return rc;
+    if (!ok)
+        out[0] = '\0';
+    return ok ? 0 : -1;
+}
+
+int sp_play_uri(HttpClient *c, const char *device_id, const char *context_uri,
+                const char *item_uri)
+{
+    char path[SP_URL_MAX], json[1024];
+    int rc;
+
+    if (sp_play_body(context_uri, item_uri, json, sizeof json) != 0)
+        return SP_ERR_OTHER;
+    rc = with_device(path, sizeof path, "/me/player/play", device_id);
+    return rc != SP_OK ? rc : sp_request(c, "PUT", path, json, NULL);
 }
 
 int sp_pick_device(const Device *devs, int n, const char *local_name, int local_first, int *where)
@@ -669,13 +583,14 @@ int sp_pick_device(const Device *devs, int n, const char *local_name, int local_
     return pick;
 }
 
-int sp_play_smart(HttpClient *c, const char *uri, int is_track, const char *local_name,
-                  int local_first, Device *on, int *where)
+int sp_play_smart(HttpClient *c, const char *context_uri, const char *item_uri,
+                  const char *local_name, int local_first, Device *on, int *where)
 {
     Device devs[SP_MAX_DEVICES];
     int n = 0, w = SP_ON_ACTIVE, rc;
+    int uris = context_uri || item_uri; /* else resume */
     if (!local_first) {
-        rc = uri ? sp_play_uri(c, NULL, uri, is_track) : sp_play(c, NULL);
+        rc = uris ? sp_play_uri(c, NULL, context_uri, item_uri) : sp_play(c, NULL);
         if (rc != SP_ERR_NODEVICE) {
             if (where)
                 *where = SP_ON_ACTIVE;
@@ -690,8 +605,8 @@ int sp_play_smart(HttpClient *c, const char *uri, int is_track, const char *loca
     int i = sp_pick_device(devs, n, local_name, local_first, &w);
     if (i < 0)
         return SP_ERR_NODEVICE;
-    if (uri)
-        rc = sp_play_uri(c, devs[i].id, uri, is_track);
+    if (uris)
+        rc = sp_play_uri(c, devs[i].id, context_uri, item_uri);
     else if (devs[i].is_active || w == SP_ON_LOCAL)
         rc = sp_play(c, devs[i].id);
     else
@@ -700,6 +615,607 @@ int sp_play_smart(HttpClient *c, const char *uri, int is_track, const char *loca
         *on = devs[i];
     if (where)
         *where = w;
+    return rc;
+}
+
+int sp_queue_add(HttpClient *c, const char *uri)
+{
+    char path[SP_URL_MAX];
+
+    if (sp_uris_path("/me/player/queue?uri=", &uri, 1, path, sizeof path) != 0)
+        return SP_ERR_OTHER;
+    return sp_request(c, "POST", path, NULL, NULL);
+}
+
+/* ======================================================================
+ * You (/me) and your library (/me/library)
+ * ====================================================================== */
+
+_Static_assert(SP_URI_LEN >= sizeof "spotify:user::collection" + SP_ID_LEN - 1,
+               "User.liked_uri must fit any user id");
+
+static int parse_me(const cJSON *root, User *out)
+{
+    memset(out, 0, sizeof *out);
+    json_str(out->id, sizeof out->id, root, "id");
+    if (!out->id[0])
+        return SP_ERR_PARSE;
+    json_str(out->name, sizeof out->name, root, "display_name");
+    snprintf(out->liked_uri, sizeof out->liked_uri, "spotify:user:%s:collection", out->id);
+    return SP_OK;
+}
+
+int sp_parse_me(const char *json, User *out)
+{
+    cJSON *root;
+    int rc;
+
+    if (!out)
+        return SP_ERR_OTHER;
+    root = json ? cJSON_Parse(json) : NULL;
+    rc = parse_me(root, out);
+    cJSON_Delete(root);
+    return rc;
+}
+
+int sp_get_me(HttpClient *c, User *out)
+{
+    cJSON *root;
+    int rc;
+
+    if (!out)
+        return SP_ERR_OTHER;
+    memset(out, 0, sizeof *out);
+    rc = sp_request(c, "GET", "/me", NULL, &root);
+    if (rc != SP_OK)
+        return rc;
+    rc = parse_me(root, out);
+    cJSON_Delete(root);
+    return rc;
+}
+
+int sp_uris_path(const char *prefix, const char *const *uris, int n, char *out, size_t cap)
+{
+    size_t len;
+
+    if (!out || cap == 0)
+        return -1;
+    out[0] = '\0';
+    if (!prefix || !uris || n < 1 || n > SP_LIBRARY_MAX || (len = strlen(prefix)) >= cap)
+        return -1;
+    memcpy(out, prefix, len + 1);
+    for (int i = 0; i < n; i++) {
+        if (!uris[i] || !uris[i][0] || (i > 0 && len + 1 >= cap))
+            goto fail;
+        if (i > 0)
+            out[len++] = ',';
+        if (http_urlencode(uris[i], out + len, cap - len) != 0)
+            goto fail;
+        len += strlen(out + len);
+    }
+    return 0;
+fail:
+    out[0] = '\0';
+    return -1;
+}
+
+int sp_library_set(HttpClient *c, const char *const *uris, int n, int save)
+{
+    char path[SP_URL_MAX];
+
+    if (sp_uris_path("/me/library?uris=", uris, n, path, sizeof path) != 0)
+        return SP_ERR_OTHER;
+    return sp_request(c, save ? "PUT" : "DELETE", path, NULL, NULL);
+}
+
+/* root = an array of booleans, one per URI asked about. */
+static int parse_contains(const cJSON *root, int *saved, int n)
+{
+    const cJSON *v;
+    int i = 0;
+
+    memset(saved, 0, (size_t)n * sizeof *saved);
+    if (!cJSON_IsArray(root) || cJSON_GetArraySize(root) < n)
+        return SP_ERR_PARSE;
+    cJSON_ArrayForEach(v, root) {
+        if (i >= n)
+            break;
+        saved[i++] = cJSON_IsTrue(v);
+    }
+    return SP_OK;
+}
+
+int sp_parse_contains(const char *json, int *saved, int n)
+{
+    cJSON *root;
+    int rc;
+
+    if (!saved || n < 1)
+        return SP_ERR_OTHER;
+    root = json ? cJSON_Parse(json) : NULL;
+    rc = parse_contains(root, saved, n);
+    cJSON_Delete(root);
+    return rc;
+}
+
+int sp_library_contains(HttpClient *c, const char *const *uris, int n, int *saved)
+{
+    char path[SP_URL_MAX];
+    cJSON *root;
+    int rc;
+
+    if (!saved || sp_uris_path("/me/library/contains?uris=", uris, n, path, sizeof path) != 0)
+        return SP_ERR_OTHER;
+    rc = sp_request(c, "GET", path, NULL, &root);
+    if (rc != SP_OK)
+        return rc;
+    rc = parse_contains(root, saved, n);
+    cJSON_Delete(root);
+    return rc;
+}
+
+/* ======================================================================
+ * Items: one parser for every kind, shared by lists and search
+ * ====================================================================== */
+
+static const cJSON *field(const cJSON *obj, const char *key)
+{
+    return cJSON_GetObjectItemCaseSensitive(obj, key);
+}
+
+/* obj's "type", or def when it has none we know (it may be missing). */
+static ItemKind kind_of(const cJSON *obj, ItemKind def)
+{
+    static const struct { const char *type; ItemKind kind; } kinds[] = {
+        { "track", ITEM_TRACK }, { "episode", ITEM_EPISODE }, { "album", ITEM_ALBUM },
+        { "artist", ITEM_ARTIST }, { "playlist", ITEM_PLAYLIST }, { "show", ITEM_SHOW },
+    };
+    const cJSON *t = field(obj, "type");
+
+    for (size_t i = 0; cJSON_IsString(t) && i < sizeof kinds / sizeof kinds[0]; i++)
+        if (!strcmp(t->valuestring, kinds[i].type))
+            return kinds[i].kind;
+    return def;
+}
+
+/* The uri of the first entry of list that has one ("" if none). */
+static void first_uri(char *dst, size_t cap, const cJSON *list)
+{
+    const cJSON *e;
+
+    dst[0] = '\0';
+    cJSON_ArrayForEach(e, list) {
+        if (cJSON_IsString(field(e, "uri"))) {
+            json_str(dst, cap, e, "uri");
+            return;
+        }
+    }
+}
+
+/* Fill it from one Spotify object; def is its kind unless "type" says
+ * otherwise. -1 (it zeroed) if obj is not an object (a null entry) or has
+ * neither a URI nor a name: Spotify's placeholder for an unavailable
+ * episode is all nulls. */
+static int parse_entity(const cJSON *obj, ItemKind def, Item *it)
+{
+    const cJSON *parent = NULL, *images = field(obj, "images");
+
+    memset(it, 0, sizeof *it);
+    if (!cJSON_IsObject(obj))
+        return -1;
+    json_str(it->uri, sizeof it->uri, obj, "uri");
+    json_str(it->name, sizeof it->name, obj, "name");
+    if (!it->uri[0] && !it->name[0])
+        return -1;
+    it->kind = kind_of(obj, def);
+    it->count = -1;
+    json_str(it->id, sizeof it->id, obj, "id");
+    switch (it->kind) {
+    case ITEM_TRACK:
+        parent = field(obj, "album");
+        images = field(parent, "images");
+        join_artists(it->sub, sizeof it->sub, field(obj, "artists"));
+        first_uri(it->artist_uri, sizeof it->artist_uri, field(obj, "artists"));
+        break;
+    case ITEM_EPISODE:
+        parent = field(obj, "show"); /* only in full episode objects */
+        if (!cJSON_GetArraySize(images))
+            images = field(parent, "images");
+        json_str(it->sub, sizeof it->sub, parent, "name");
+        json_str(it->date, sizeof it->date, obj, "release_date");
+        break;
+    case ITEM_ALBUM:
+        join_artists(it->sub, sizeof it->sub, field(obj, "artists"));
+        first_uri(it->artist_uri, sizeof it->artist_uri, field(obj, "artists"));
+        json_str(it->date, sizeof it->date, obj, "release_date");
+        it->count = json_int(obj, "total_tracks", -1);
+        break;
+    case ITEM_ARTIST:
+        break;
+    case ITEM_PLAYLIST:
+        json_str(it->sub, sizeof it->sub, field(obj, "owner"), "display_name");
+        /* "tracks" was renamed "items" in Feb 2026; playlists you neither own
+         * nor collaborate on may come with neither. */
+        it->count = json_int(field(obj, "items"), "total", -1);
+        if (it->count < 0)
+            it->count = json_int(field(obj, "tracks"), "total", -1);
+        break;
+    case ITEM_SHOW:
+        json_str(it->sub, sizeof it->sub, obj, "publisher");
+        it->count = json_int(obj, "total_episodes", -1);
+        break;
+    }
+    json_str(it->album, sizeof it->album, parent, "name");
+    json_str(it->album_uri, sizeof it->album_uri, parent, "uri");
+    pick_image(it->art_url, sizeof it->art_url, images, 1);
+    it->duration_ms = json_int(obj, "duration_ms", 0);
+    /* Local files only play on the device that has them; with a market,
+     * Spotify adds is_playable for content it can't play in yours. */
+    it->playable = it->uri[0] && !json_bool(obj, "is_local") &&
+                   !cJSON_IsFalse(field(obj, "is_playable"));
+    return 0;
+}
+
+/* ======================================================================
+ * Lists (sp_get_list): one table row per SpList
+ * ====================================================================== */
+
+enum { PAGE_OFFSET, PAGE_AFTER, PAGE_BEFORE, PAGE_NONE };
+
+typedef struct {
+    const char *pre, *post; /* path = pre + id + post, then the paging query */
+    int         needs_id;
+    const char *wrap;       /* key of the paging object in the body; NULL = the body */
+    const char *entity;     /* key of the object in each entry; NULL = the entry */
+    const char *old_entity; /* its name before Feb 2026, tried when entity is absent */
+    ItemKind    kind;       /* unless the object's "type" says otherwise */
+    int         paging;     /* PAGE_* */
+    int         max;        /* Spotify's largest limit for it */
+} ListSpec;
+
+/* market=from_token: Spotify adds is_playable and leaves out the per-item
+ * country lists. */
+static const ListSpec LISTS[SP_LIST_COUNT] = {
+    [SP_LIST_LIKED]     = { "/me/tracks", "?market=from_token", 0, NULL, "track", NULL,
+                            ITEM_TRACK, PAGE_OFFSET, SP_PAGE_MAX },
+    [SP_LIST_PLAYLISTS] = { "/me/playlists", "", 0, NULL, NULL, NULL, ITEM_PLAYLIST, PAGE_OFFSET,
+                            SP_PAGE_MAX },
+    [SP_LIST_ALBUMS]    = { "/me/albums", "?market=from_token", 0, NULL, "album", NULL,
+                            ITEM_ALBUM, PAGE_OFFSET, SP_PAGE_MAX },
+    [SP_LIST_ARTISTS]   = { "/me/following", "?type=artist", 0, "artists", NULL, NULL,
+                            ITEM_ARTIST, PAGE_AFTER, SP_PAGE_MAX },
+    [SP_LIST_SHOWS]     = { "/me/shows", "", 0, NULL, "show", NULL, ITEM_SHOW, PAGE_OFFSET,
+                            SP_PAGE_MAX },
+    [SP_LIST_EPISODES]  = { "/me/episodes", "?market=from_token", 0, NULL, "episode", NULL,
+                            ITEM_EPISODE, PAGE_OFFSET, SP_PAGE_MAX },
+    [SP_LIST_RECENT]    = { "/me/player/recently-played", "", 0, NULL, "track", NULL,
+                            ITEM_TRACK, PAGE_BEFORE, SP_PAGE_MAX },
+    [SP_LIST_QUEUE]     = { "/me/player/queue", "", 0, NULL, NULL, NULL, ITEM_TRACK, PAGE_NONE, 0 },
+    [SP_LIST_PLAYLIST]  = { "/playlists/", "/items?market=from_token&additional_types=track,episode",
+                            1, NULL, "item", "track", ITEM_TRACK, PAGE_OFFSET, SP_PAGE_MAX },
+    [SP_LIST_ALBUM]     = { "/albums/", "/tracks?market=from_token", 1, NULL, NULL, NULL,
+                            ITEM_TRACK, PAGE_OFFSET, SP_PAGE_MAX },
+    [SP_LIST_ARTIST]    = { "/artists/", "/albums?include_groups=album,single,compilation"
+                            "&market=from_token", 1, NULL, NULL, NULL, ITEM_ALBUM, PAGE_OFFSET,
+                            SP_ARTIST_PAGE_MAX },
+    [SP_LIST_SHOW]      = { "/shows/", "/episodes?market=from_token", 1, NULL, NULL, NULL,
+                            ITEM_EPISODE, PAGE_OFFSET, SP_PAGE_MAX },
+};
+
+/* /me/player/queue: {"currently_playing": item|null, "queue": [items]}. */
+static int parse_queue(const cJSON *root, SpPage *page, Item *out, int cap, int *count)
+{
+    const cJSON *queue = field(root, "queue"), *e;
+    int n = 0;
+
+    if (!cJSON_IsArray(queue))
+        return SP_ERR_PARSE;
+    page->now_playing = parse_entity(field(root, "currently_playing"), ITEM_TRACK, &out[0]) == 0;
+    n = page->now_playing;
+    cJSON_ArrayForEach(e, queue) {
+        if (n >= cap)
+            break;
+        if (parse_entity(e, ITEM_TRACK, &out[n]) == 0)
+            n++;
+    }
+    page->total = page->now_playing + cJSON_GetArraySize(queue);
+    page->more = 0;
+    *count = n;
+    return SP_OK;
+}
+
+/* root = one response of list `which`. page is only written on SP_OK. */
+static int parse_list(SpList which, const cJSON *root, SpPage *page, Item *out, int cap, int *count)
+{
+    const ListSpec *ls = &LISTS[which];
+    const cJSON *pg = ls->wrap ? field(root, ls->wrap) : root;
+    const cJSON *items = field(pg, "items"), *e, *last = NULL;
+    SpPage next = *page;
+    int n = 0, used = 0;
+
+    *count = 0;
+    next.restricted = next.now_playing = 0;
+    if (which == SP_LIST_QUEUE) {
+        int rc = parse_queue(root, &next, out, cap, count);
+        if (rc == SP_OK)
+            *page = next;
+        return rc;
+    }
+    if (!cJSON_IsArray(items))
+        return SP_ERR_PARSE;
+    cJSON_ArrayForEach(e, items) {
+        const cJSON *obj = ls->entity ? field(e, ls->entity) : e;
+
+        if (n >= cap)
+            break;
+        used++;
+        if (!cJSON_IsObject(obj) && ls->old_entity)
+            obj = field(e, ls->old_entity);
+        if (parse_entity(obj, ls->kind, &out[n]) != 0)
+            continue; /* null: removed or unavailable */
+        if (json_bool(e, "is_local")) /* playlist entries say it outside the item too */
+            out[n].playable = 0;
+        last = obj;
+        n++;
+    }
+    int size = cJSON_GetArraySize(items), cut = used < size; /* cap stopped it */
+    next.total = json_int(pg, "total", -1);
+    /* Entries left over by cap start the next page. */
+    next.more = cut || cJSON_IsString(field(pg, "next"));
+    if (ls->paging == PAGE_OFFSET) {
+        /* Spotify drops unavailable entries after paging, so a page can be
+         * short; like its "next", the following one starts a full limit on. */
+        next.offset += cut ? used : json_int(pg, "limit", size);
+    } else {
+        /* "after" is the last artist listed; "before" a time Spotify gives. */
+        if (ls->paging == PAGE_AFTER && cut && last)
+            json_str(next.cursor, sizeof next.cursor, last, "id");
+        else
+            json_str(next.cursor, sizeof next.cursor, field(pg, "cursors"),
+                     ls->paging == PAGE_AFTER ? "after" : "before");
+        next.more = next.more && next.cursor[0];
+    }
+    *page = next;
+    *count = n;
+    return SP_OK;
+}
+
+int sp_parse_list(SpList which, const char *json, SpPage *page, Item *out, int cap, int *count)
+{
+    cJSON *root;
+    int rc;
+
+    if (!count || !page || cap <= 0 || !out || (unsigned)which >= SP_LIST_COUNT)
+        return SP_ERR_OTHER;
+    *count = 0;
+    root = json ? cJSON_Parse(json) : NULL;
+    rc = parse_list(which, root, page, out, cap, count);
+    cJSON_Delete(root);
+    return rc;
+}
+
+int sp_get_list(HttpClient *c, SpList which, const char *id, SpPage *page,
+                Item *out, int cap, int *count)
+{
+    char path[SP_URL_MAX], enc[SP_ID_LEN * 3] = "", cur[SP_CURSOR_LEN * 3] = "";
+    const char *ckey = "";
+    const ListSpec *ls;
+    cJSON *root;
+    int limit, n, rc;
+    char sep;
+
+    if (!count || !page || cap <= 0 || !out || (unsigned)which >= SP_LIST_COUNT ||
+        page->offset < 0)
+        return SP_ERR_OTHER;
+    *count = 0;
+    ls = &LISTS[which];
+    if (ls->needs_id) {
+        const char *bare = id ? strrchr(id, ':') : NULL; /* "spotify:album:ID" -> "ID" */
+        bare = bare ? bare + 1 : id;
+        if (!bare || !bare[0] || http_urlencode(bare, enc, sizeof enc) != 0)
+            return SP_ERR_OTHER;
+    }
+    if ((ls->paging == PAGE_AFTER || ls->paging == PAGE_BEFORE) && page->cursor[0]) {
+        if (http_urlencode(page->cursor, cur, sizeof cur) != 0)
+            return SP_ERR_OTHER;
+        ckey = ls->paging == PAGE_AFTER ? "&after=" : "&before=";
+    }
+    limit = cap < ls->max ? cap : ls->max;
+    sep = strchr(ls->post, '?') ? '&' : '?';
+    if (ls->paging == PAGE_NONE)
+        n = snprintf(path, sizeof path, "%s%s%s", ls->pre, enc, ls->post);
+    else if (ls->paging == PAGE_OFFSET && page->offset > 0)
+        n = snprintf(path, sizeof path, "%s%s%s%climit=%d&offset=%d", ls->pre, enc, ls->post,
+                     sep, limit, page->offset);
+    else
+        n = snprintf(path, sizeof path, "%s%s%s%climit=%d%s%s", ls->pre, enc, ls->post, sep,
+                     limit, ckey, cur);
+    if (n < 0 || (size_t)n >= sizeof path)
+        return SP_ERR_OTHER;
+
+    rc = sp_request(c, "GET", path, NULL, &root);
+    if (rc == SP_ERR_PREMIUM && which == SP_LIST_PLAYLIST) {
+        /* Plain 403 "Forbidden": since Feb 2026 only your own and
+         * collaborative playlists list their items. */
+        page->total = -1;
+        page->more = page->now_playing = 0;
+        page->restricted = 1;
+        return SP_OK;
+    }
+    if (rc != SP_OK)
+        return rc;
+    if (!root) { /* 204: nothing to list */
+        page->total = 0;
+        page->more = page->restricted = page->now_playing = 0;
+        return SP_OK;
+    }
+    rc = parse_list(which, root, page, out, cap, count);
+    cJSON_Delete(root);
+    return rc;
+}
+
+/* ======================================================================
+ * Search
+ * ====================================================================== */
+
+/* In SP_SEARCH_* bit order: the result key and the type parameter. */
+static const struct { const char *key, *type; ItemKind kind; } SEARCH_KINDS[] = {
+    { "tracks", "track", ITEM_TRACK },       { "albums", "album", ITEM_ALBUM },
+    { "artists", "artist", ITEM_ARTIST },    { "playlists", "playlist", ITEM_PLAYLIST },
+    { "shows", "show", ITEM_SHOW },          { "episodes", "episode", ITEM_EPISODE },
+};
+#define SEARCH_KINDS_N ((int)(sizeof SEARCH_KINDS / sizeof SEARCH_KINDS[0]))
+
+/* Every kind pages together: the next page starts a full limit on. Results
+ * beyond cap are dropped (sp_search asks for at most cap unless cap is
+ * smaller than the number of kinds). */
+static int parse_search(const cJSON *root, SpPage *page, Item *out, int cap, int *count)
+{
+    SpPage next = *page;
+    int n = 0, kinds = 0, step = 0;
+
+    *count = 0;
+    next.total = -1;
+    next.more = next.restricted = next.now_playing = 0;
+    for (int k = 0; k < SEARCH_KINDS_N; k++) {
+        const cJSON *pg = field(root, SEARCH_KINDS[k].key);
+        const cJSON *items = field(pg, "items"), *e;
+        int size = cJSON_GetArraySize(items), total = json_int(pg, "total", -1);
+        int limit = json_int(pg, "limit", size);
+
+        if (!cJSON_IsArray(items))
+            continue;
+        kinds++;
+        cJSON_ArrayForEach(e, items) {
+            if (n >= cap)
+                break;
+            if (parse_entity(e, SEARCH_KINDS[k].kind, &out[n]) == 0)
+                n++; /* playlists and shows have null results */
+        }
+        if (total >= 0)
+            next.total = (next.total < 0 ? 0 : next.total) + total;
+        if (cJSON_IsString(field(pg, "next")))
+            next.more = 1;
+        step = limit > step ? limit : step;
+    }
+    if (!kinds)
+        return SP_ERR_PARSE;
+    next.offset += step;
+    *page = next;
+    *count = n;
+    return SP_OK;
+}
+
+int sp_parse_search(const char *json, SpPage *page, Item *out, int cap, int *count)
+{
+    cJSON *root;
+    int rc;
+
+    if (!count || !page || cap <= 0 || !out)
+        return SP_ERR_OTHER;
+    root = json ? cJSON_Parse(json) : NULL;
+    rc = parse_search(root, page, out, cap, count);
+    cJSON_Delete(root);
+    return rc;
+}
+
+int sp_search(HttpClient *c, const char *query, unsigned types, SpPage *page,
+              Item *out, int cap, int *count)
+{
+    char enc[SP_NAME_LEN * 3], path[SP_URL_MAX], list[64] = "";
+    size_t len = 0;
+    cJSON *root;
+    int kinds = 0, limit, n, rc;
+
+    if (!count || !page || !query || !query[0] || cap <= 0 || !out || page->offset < 0)
+        return SP_ERR_OTHER;
+    *count = 0;
+    for (int k = 0; k < SEARCH_KINDS_N; k++) {
+        if (types & (1u << k)) {
+            n = snprintf(list + len, sizeof list - len, "%s%s", kinds ? "," : "",
+                         SEARCH_KINDS[k].type);
+            len += (size_t)n; /* every name together fits list */
+            kinds++;
+        }
+    }
+    if (!kinds || http_urlencode(query, enc, sizeof enc) != 0)
+        return SP_ERR_OTHER;
+    limit = cap / kinds;
+    limit = limit < 1 ? 1 : limit > SP_SEARCH_LIMIT ? SP_SEARCH_LIMIT : limit;
+    /* No market=from_token: on /search it needs the user-read-private scope. */
+    if (page->offset > 0)
+        n = snprintf(path, sizeof path, "/search?type=%s&limit=%d&offset=%d&q=%s", list, limit,
+                     page->offset, enc);
+    else
+        n = snprintf(path, sizeof path, "/search?type=%s&limit=%d&q=%s", list, limit, enc);
+    if (n < 0 || (size_t)n >= sizeof path)
+        return SP_ERR_OTHER;
+    rc = sp_request(c, "GET", path, NULL, &root);
+    if (rc != SP_OK)
+        return rc;
+    rc = parse_search(root, page, out, cap, count);
+    cJSON_Delete(root);
+    return rc;
+}
+
+/* ======================================================================
+ * Used by ui.c until the Library UI migrates to Item; delete them then
+ * ====================================================================== */
+
+int sp_get_playlists(HttpClient *c, Playlist *out, int cap, int *count)
+{
+    SpPage page;
+    Item *items;
+    int n = 0, rc;
+
+    if (!count || cap < 0 || (cap > 0 && !out))
+        return SP_ERR_OTHER;
+    *count = 0;
+    if (cap == 0)
+        return SP_OK;
+    cap = cap < SP_PAGE_MAX ? cap : SP_PAGE_MAX;
+    items = malloc((size_t)cap * sizeof *items);
+    if (!items)
+        return SP_ERR_OTHER;
+    memset(&page, 0, sizeof page);
+    rc = sp_get_list(c, SP_LIST_PLAYLISTS, NULL, &page, items, cap, &n);
+    for (int i = 0; rc == SP_OK && i < n; i++) {
+        copy_utf8(out[i].id, sizeof out[i].id, items[i].id);
+        copy_utf8(out[i].uri, sizeof out[i].uri, items[i].uri);
+        copy_utf8(out[i].name, sizeof out[i].name, items[i].name);
+        out[i].track_count = items[i].count < 0 ? 0 : items[i].count;
+    }
+    if (rc == SP_OK)
+        *count = n;
+    free(items);
+    return rc;
+}
+
+int sp_search_tracks(HttpClient *c, const char *query, Track *out, int cap, int *count)
+{
+    Item hits[SP_SEARCH_LIMIT];
+    SpPage page;
+    int n = 0, rc;
+
+    if (!count || cap <= 0 || !out)
+        return SP_ERR_OTHER;
+    *count = 0;
+    memset(&page, 0, sizeof page);
+    rc = sp_search(c, query, SP_SEARCH_TRACK, &page, hits,
+                   cap < SP_SEARCH_LIMIT ? cap : SP_SEARCH_LIMIT, &n);
+    for (int i = 0; rc == SP_OK && i < n; i++) {
+        Track *t = &out[i];
+        memset(t, 0, sizeof *t);
+        copy_utf8(t->id, sizeof t->id, hits[i].id);
+        copy_utf8(t->uri, sizeof t->uri, hits[i].uri);
+        copy_utf8(t->name, sizeof t->name, hits[i].name);
+        copy_utf8(t->artists, sizeof t->artists, hits[i].sub);
+        copy_utf8(t->album, sizeof t->album, hits[i].album);
+        copy_utf8(t->art_url, sizeof t->art_url, hits[i].art_url);
+        t->duration_ms = hits[i].duration_ms;
+    }
+    if (rc == SP_OK)
+        *count = n;
     return rc;
 }
 

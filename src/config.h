@@ -45,6 +45,8 @@ typedef struct {
     char    access[2048];
     char    refresh[1024];
     int64_t expires_at;              /* unix seconds */
+    char    scope[1024];             /* scopes Spotify granted, space-separated;
+                                        "" for tokens saved before it was recorded */
 } Token;
 
 /* Fill paths and read .env. The env vars SPOTIFY_CLIENT_ID and

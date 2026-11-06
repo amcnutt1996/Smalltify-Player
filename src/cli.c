@@ -19,11 +19,16 @@
 /* Returned by helpers that already printed their own message. */
 #define CLI_REPORTED 1
 
+/* A usage string may hold several forms, one per line. */
 static int bad_usage(const char *name)
 {
     for (const CliCommand *c = cli_commands; c->name; c++)
         if (!strcmp(c->name, name)) {
-            fprintf(stderr, "usage: " CLI_PROG " %s\n", c->usage);
+            for (const char *u = c->usage, *pre = "usage: "; *u; pre = "       ") {
+                int len = (int)strcspn(u, "\n");
+                fprintf(stderr, "%s" CLI_PROG " %.*s\n", pre, len, u);
+                u += len + (u[len] == '\n');
+            }
             break;
         }
     return 1;
@@ -74,6 +79,9 @@ static int open_session(const Config *cfg, AuthStore **auth, HttpClient **http)
         *auth = NULL;
         return -1;
     }
+    /* The old sign-in still works; only the newer commands need more. */
+    if (auth_store_needs_reconsent(*auth))
+        fprintf(stderr, "%s Run: " CLI_PROG " login\n", AUTH_RECONSENT_REASON);
     if (http) {
         HttpAuth ha = auth_store_http(*auth);
         *http = http_client_new(&ha);
@@ -195,7 +203,9 @@ static int finish(AuthStore *auth, HttpClient *http, int rc)
     auth_store_free(auth);
     if (rc == SP_OK)
         return 0;
-    if (rc != CLI_REPORTED)
+    if (rc == SP_ERR_SCOPE)
+        fprintf(stderr, "%s Run: " CLI_PROG " login\n", sp_strerror(rc));
+    else if (rc != CLI_REPORTED)
         fprintf(stderr, "%s\n", sp_strerror(rc));
     return 1;
 }
@@ -244,14 +254,15 @@ static int parse_position(const char *s, int *ms)
 /* Our device name, for the play fallback (set by cli_dispatch). */
 static const char *g_device_name;
 
-/* Start playback (uri NULL = resume) on the active device; with none
- * active, on our own engine if it is online (so `play` works right after
- * `engine` starts), else on any available device of the account. */
-static int play_with_fallback(HttpClient *http, const char *uri, int is_track)
+/* Start playback (both URIs NULL = resume; see sp_play_uri) on the active
+ * device; with none active, on our own engine if it is online (so `play`
+ * works right after `engine` starts), else on any available device of the
+ * account. */
+static int play_with_fallback(HttpClient *http, const char *context_uri, const char *item_uri)
 {
     Device on;
     int where;
-    int rc = sp_play_smart(http, uri, is_track, g_device_name, 0, &on, &where);
+    int rc = sp_play_smart(http, context_uri, item_uri, g_device_name, 0, &on, &where);
     if (rc == SP_OK && where == SP_ON_OTHER)
         printf("Playing on %s\n", on.name);
     if (rc != SP_ERR_NODEVICE)
@@ -263,7 +274,7 @@ static int play_with_fallback(HttpClient *http, const char *uri, int is_track)
 
 static int play_or_fallback(HttpClient *http)
 {
-    return play_with_fallback(http, NULL, 0);
+    return play_with_fallback(http, NULL, NULL);
 }
 
 /* Names and queries may contain spaces, so unquoted words are joined back
@@ -463,25 +474,57 @@ static int cmd_transfer(const Config *cfg, int argc, char **argv)
     return finish(auth, http, rc);
 }
 
-#define CLI_MAX_PLAYLISTS 50 /* first page of /me/playlists */
-#define CLI_MAX_RESULTS   10
+/* Item.kind as a word, in ItemKind order. */
+static const char *const kind_names[] = { "track", "episode", "album", "artist", "playlist", "show" };
+
+/* " 3. Name - Sub (3:45)  spotify:track:..."; the kind is named unless it is
+ * plain (-1: name every kind). */
+static void print_item(int n, const Item *it, int plain)
+{
+    char dur[16];
+
+    printf("%2d. ", n);
+    if ((int)it->kind != plain)
+        printf("[%s] ", kind_names[it->kind]);
+    printf("%s", it->name[0] ? it->name : "(no name)");
+    if (it->sub[0])
+        printf(" - %s", it->sub);
+    if (it->duration_ms > 0) {
+        sp_fmt_time(dur, sizeof dur, it->duration_ms);
+        printf(" (%s)", dur);
+    } else if (it->count >= 0) {
+        printf(" (%d %s)", it->count, it->kind == ITEM_SHOW ? "episodes" : "tracks");
+    }
+    if (!it->playable)
+        printf(" [unavailable]");
+    printf("  %s\n", it->uri);
+}
+
+/* First page of your playlists (the `playlists` numbering). */
+static int get_playlists(HttpClient *http, Item *out, int *n)
+{
+    SpPage page;
+
+    memset(&page, 0, sizeof page);
+    return sp_get_list(http, SP_LIST_PLAYLISTS, NULL, &page, out, SP_PAGE_MAX, n);
+}
 
 static int cmd_playlists(const Config *cfg, int argc, char **argv)
 {
     AuthStore *auth;
     HttpClient *http;
-    Playlist p[CLI_MAX_PLAYLISTS];
+    Item p[SP_PAGE_MAX];
     int n, rc;
 
     if (argc != 1)
         return bad_usage(argv[0]);
     if (open_session(cfg, &auth, &http) != 0)
         return 1;
-    rc = sp_get_playlists(http, p, CLI_MAX_PLAYLISTS, &n);
+    rc = get_playlists(http, p, &n);
     if (rc == SP_OK && n == 0)
         printf("No playlists found.\n");
     for (int i = 0; rc == SP_OK && i < n; i++)
-        printf("%2d. %s (%d tracks)\n", i + 1, p[i].name, p[i].track_count);
+        printf("%2d. %s (%d tracks)\n", i + 1, p[i].name, p[i].count < 0 ? 0 : p[i].count);
     return finish(auth, http, rc);
 }
 
@@ -491,8 +534,8 @@ static int cmd_playlist(const Config *cfg, int argc, char **argv)
 {
     AuthStore *auth;
     HttpClient *http;
-    Playlist p[CLI_MAX_PLAYLISTS];
-    const Playlist *hit = NULL;
+    Item p[SP_PAGE_MAX];
+    const Item *hit = NULL;
     char want[SP_NAME_LEN];
     int n, idx = 0, rc;
 
@@ -500,8 +543,8 @@ static int cmd_playlist(const Config *cfg, int argc, char **argv)
         return bad_usage(argv[0]);
     if (open_session(cfg, &auth, &http) != 0)
         return 1;
-    rc = sp_get_playlists(http, p, CLI_MAX_PLAYLISTS, &n);
-    if (rc == SP_OK && argc == 2 && parse_int(want, 1, CLI_MAX_PLAYLISTS, &idx) == 0 && idx <= n)
+    rc = get_playlists(http, p, &n);
+    if (rc == SP_OK && argc == 2 && parse_int(want, 1, SP_PAGE_MAX, &idx) == 0 && idx <= n)
         hit = &p[idx - 1];
     for (int i = 0; rc == SP_OK && !hit && i < n; i++)
         if (!strcmp(p[i].name, want))
@@ -511,46 +554,240 @@ static int cmd_playlist(const Config *cfg, int argc, char **argv)
         rc = CLI_REPORTED;
     }
     if (rc == SP_OK)
-        rc = play_with_fallback(http, hit->uri, 0);
+        rc = play_with_fallback(http, hit->uri, NULL);
     if (rc == SP_OK)
         printf("Playing %s\n", hit->name);
     return finish(auth, http, rc);
 }
 
-/* `search [-p N] <query...>`: list results, or play result N. */
+/* "track,album" or "all" -> SP_SEARCH_* bits; 0 if a word is unknown. */
+static unsigned parse_types(const char *s)
+{
+    unsigned types = 0;
+
+    if (!strcmp(s, "all"))
+        return SP_SEARCH_ALL;
+    while (*s) {
+        size_t len = strcspn(s, ",");
+        unsigned bit = 0;
+        /* SP_SEARCH_* bits run track, album, artist, playlist, show, episode. */
+        static const char *const names[] = { "track", "album", "artist", "playlist", "show", "episode" };
+        for (unsigned k = 0; k < sizeof names / sizeof names[0]; k++)
+            if (strlen(names[k]) == len && !strncmp(s, names[k], len))
+                bit = 1u << k;
+        if (!bit)
+            return 0;
+        types |= bit;
+        s += len + (s[len] == ',');
+    }
+    return types;
+}
+
+/* `search [-p N] [--type T,...] <query...>`: list results, or play result
+ * N: a track or episode on its own, anything else as a context. */
 static int cmd_search(const Config *cfg, int argc, char **argv)
 {
+    enum { MAX_HITS = 6 * SP_SEARCH_LIMIT }; /* every kind, a full share each */
     AuthStore *auth;
     HttpClient *http;
-    Track t[CLI_MAX_RESULTS];
+    Item t[MAX_HITS];
+    SpPage page;
     char query[SP_NAME_LEN];
-    int first = 1, pick = 0, n, rc;
+    unsigned types = SP_SEARCH_TRACK;
+    int first = 1, pick = 0, kinds = 0, plain = -1, n, rc;
 
-    if (argc >= 2 && !strcmp(argv[1], "-p")) {
-        if (argc < 4 || parse_int(argv[2], 1, CLI_MAX_RESULTS, &pick) != 0)
+    while (first + 1 < argc && (!strcmp(argv[first], "-p") || !strcmp(argv[first], "--type"))) {
+        if (!strcmp(argv[first], "-p") ? parse_int(argv[first + 1], 1, MAX_HITS, &pick) != 0
+                                       : (types = parse_types(argv[first + 1])) == 0)
             return bad_usage(argv[0]);
-        first = 3;
+        first += 2;
     }
     if (argc <= first || join_args(query, sizeof query, argc - first, argv + first) != 0)
         return bad_usage(argv[0]);
+    for (int k = 0; k < 6; k++)
+        kinds += (types >> k) & 1;
     if (open_session(cfg, &auth, &http) != 0)
         return 1;
-    rc = sp_search_tracks(http, query, t, CLI_MAX_RESULTS, &n);
+    memset(&page, 0, sizeof page);
+    rc = sp_search(http, query, types, &page, t, kinds * SP_SEARCH_LIMIT, &n);
+    if (rc == SP_OK && kinds == 1 && n > 0)
+        plain = (int)t[0].kind;
     if (rc == SP_OK && pick) {
         if (pick > n) {
             fprintf(stderr, "Only %d result(s) for '%s'.\n", n, query);
             rc = CLI_REPORTED;
         } else {
-            rc = play_with_fallback(http, t[pick - 1].uri, 1);
+            const Item *it = &t[pick - 1];
+            int single = it->kind == ITEM_TRACK || it->kind == ITEM_EPISODE;
+            rc = play_with_fallback(http, single ? NULL : it->uri, single ? it->uri : NULL);
             if (rc == SP_OK)
-                printf("Playing %s - %s\n", t[pick - 1].name, t[pick - 1].artists);
+                printf("Playing %s%s%s\n", it->name, it->sub[0] ? " - " : "", it->sub);
         }
         return finish(auth, http, rc);
     }
     if (rc == SP_OK && n == 0)
         printf("No results for '%s'.\n", query);
     for (int i = 0; rc == SP_OK && i < n; i++)
-        printf("%2d. %s - %s (%s)\n", i + 1, t[i].name, t[i].artists, t[i].album);
+        print_item(i + 1, &t[i], plain);
+    return finish(auth, http, rc);
+}
+
+/* `list` arguments, and the kind each list holds (others, like episodes in
+ * a playlist, are named). */
+static const struct {
+    const char *name;
+    SpList      list;
+    int         needs_id;
+    ItemKind    plain;
+} list_names[] = {
+    { "liked",     SP_LIST_LIKED,     0, ITEM_TRACK },
+    { "playlists", SP_LIST_PLAYLISTS, 0, ITEM_PLAYLIST },
+    { "albums",    SP_LIST_ALBUMS,    0, ITEM_ALBUM },
+    { "artists",   SP_LIST_ARTISTS,   0, ITEM_ARTIST },
+    { "shows",     SP_LIST_SHOWS,     0, ITEM_SHOW },
+    { "episodes",  SP_LIST_EPISODES,  0, ITEM_EPISODE },
+    { "recent",    SP_LIST_RECENT,    0, ITEM_TRACK },
+    { "queue",     SP_LIST_QUEUE,     0, ITEM_TRACK },
+    { "playlist",  SP_LIST_PLAYLIST,  1, ITEM_TRACK },
+    { "album",     SP_LIST_ALBUM,     1, ITEM_TRACK },
+    { "artist",    SP_LIST_ARTIST,    1, ITEM_ALBUM },
+    { "show",      SP_LIST_SHOW,      1, ITEM_EPISODE },
+};
+
+/* `list [--all] <what> [id]`: one page of a library list, the queue, or what
+ * a playlist, album, artist or show holds; --all walks every page. */
+static int cmd_list(const Config *cfg, int argc, char **argv)
+{
+    AuthStore *auth;
+    HttpClient *http;
+    Item items[SP_PAGE_MAX];
+    SpPage page, prev;
+    int all = argc > 1 && !strcmp(argv[1], "--all"), first = 1 + all;
+    int w = -1, shown = 0, n, rc;
+
+    for (int i = 0; argc > first && i < (int)(sizeof list_names / sizeof list_names[0]); i++)
+        if (!strcmp(argv[first], list_names[i].name))
+            w = i;
+    if (w < 0 || argc != first + 1 + list_names[w].needs_id)
+        return bad_usage(argv[0]);
+    const char *id = list_names[w].needs_id ? argv[first + 1] : NULL;
+    if (open_session(cfg, &auth, &http) != 0)
+        return 1;
+    memset(&page, 0, sizeof page);
+    do {
+        prev = page;
+        rc = sp_get_list(http, list_names[w].list, id, &page, items, SP_PAGE_MAX, &n);
+        for (int i = 0; rc == SP_OK && i < n; i++) {
+            if (list_names[w].list == SP_LIST_QUEUE && (i == 0 || (i == 1 && page.now_playing)))
+                printf(i == 0 && page.now_playing ? "Now playing:\n" : "Up next:\n");
+            print_item(++shown, &items[i], (int)list_names[w].plain);
+        }
+        /* Stop where Spotify would hand out the same page again. */
+    } while (rc == SP_OK && all && page.more &&
+             (page.offset != prev.offset || strcmp(page.cursor, prev.cursor) != 0));
+    if (rc == SP_OK && page.restricted)
+        printf("Spotify lists the items of your own and collaborative playlists only.\n");
+    else if (rc == SP_OK && shown == 0)
+        printf("Nothing here.\n");
+    else if (rc == SP_OK && page.more) {
+        if (page.total > shown)
+            printf("(%d of %d. ", shown, page.total);
+        else
+            printf("(the first %d. ", shown);
+        printf("All of them: " CLI_PROG " list --all %s%s%s)\n", list_names[w].name,
+               id ? " " : "", id ? id : "");
+    }
+    return finish(auth, http, rc);
+}
+
+/* 0 if every argument from argv[1] on is a Spotify URI, 1..max of them. */
+static int check_uris(int argc, char **argv, int max)
+{
+    if (argc < 2 || argc - 1 > max)
+        return -1;
+    for (int i = 1; i < argc; i++)
+        if (strncmp(argv[i], "spotify:", 8) != 0)
+            return -1;
+    return 0;
+}
+
+/* `like`/`unlike <uri...>`: save to or remove from your library (follow or
+ * unfollow, for artists). */
+static int set_saved(const Config *cfg, int argc, char **argv, int save)
+{
+    AuthStore *auth;
+    HttpClient *http;
+    int rc;
+
+    if (check_uris(argc, argv, SP_LIBRARY_MAX) != 0)
+        return bad_usage(argv[0]);
+    if (open_session(cfg, &auth, &http) != 0)
+        return 1;
+    rc = sp_library_set(http, (const char *const *)(argv + 1), argc - 1, save);
+    if (rc == SP_OK)
+        printf(save ? "Saved to your library.\n" : "Removed from your library.\n");
+    return finish(auth, http, rc);
+}
+
+static int cmd_like(const Config *cfg, int argc, char **argv)
+{
+    return set_saved(cfg, argc, argv, 1);
+}
+
+static int cmd_unlike(const Config *cfg, int argc, char **argv)
+{
+    return set_saved(cfg, argc, argv, 0);
+}
+
+/* `saved <uri...>`: whether each is in your library (followed, for artists). */
+static int cmd_saved(const Config *cfg, int argc, char **argv)
+{
+    AuthStore *auth;
+    HttpClient *http;
+    int saved[SP_LIBRARY_MAX], rc;
+
+    if (check_uris(argc, argv, SP_LIBRARY_MAX) != 0)
+        return bad_usage(argv[0]);
+    if (open_session(cfg, &auth, &http) != 0)
+        return 1;
+    rc = sp_library_contains(http, (const char *const *)(argv + 1), argc - 1, saved);
+    for (int i = 0; rc == SP_OK && i < argc - 1; i++)
+        printf("%-9s %s\n", saved[i] ? "saved" : "not saved", argv[i + 1]);
+    return finish(auth, http, rc);
+}
+
+static int cmd_queue(const Config *cfg, int argc, char **argv)
+{
+    AuthStore *auth;
+    HttpClient *http;
+    int rc;
+
+    if (check_uris(argc, argv, 1) != 0)
+        return bad_usage(argv[0]);
+    if (open_session(cfg, &auth, &http) != 0)
+        return 1;
+    rc = sp_queue_add(http, argv[1]);
+    if (rc == SP_OK)
+        printf("Added to the queue.\n");
+    return finish(auth, http, rc);
+}
+
+/* `me`: who is signed in, and the Liked Songs context to play. */
+static int cmd_me(const Config *cfg, int argc, char **argv)
+{
+    AuthStore *auth;
+    HttpClient *http;
+    User me;
+    int rc;
+
+    if (argc != 1)
+        return bad_usage(argv[0]);
+    if (open_session(cfg, &auth, &http) != 0)
+        return 1;
+    rc = sp_get_me(http, &me);
+    if (rc == SP_OK)
+        printf("Signed in as %s (%s)\nLiked Songs: %s\n", me.name[0] ? me.name : me.id, me.id,
+               me.liked_uri);
     return finish(auth, http, rc);
 }
 
@@ -723,7 +960,15 @@ const CliCommand cli_commands[] = {
     { "transfer", "transfer <name-or-id>",           cmd_transfer },
     { "playlists", "playlists",                      cmd_playlists },
     { "playlist", "playlist <number | name>",        cmd_playlist },
-    { "search",   "search [-p N] <query...>",        cmd_search   },
+    { "search",   "search [-p N] [--type track,album,artist,playlist,show,episode | all] <query...>",
+      cmd_search },
+    { "list",     "list [--all] liked|playlists|albums|artists|shows|episodes|recent|queue\n"
+                  "list [--all] playlist|album|artist|show <id or uri>", cmd_list },
+    { "like",     "like <uri...>",                   cmd_like     },
+    { "unlike",   "unlike <uri...>",                 cmd_unlike   },
+    { "saved",    "saved <uri...>",                  cmd_saved    },
+    { "queue",    "queue <uri>",                     cmd_queue    },
+    { "me",       "me",                              cmd_me       },
     { NULL, NULL, NULL },
 };
 
@@ -744,5 +989,9 @@ void cli_usage(void)
            "Without a command the player window opens.\n\n"
            "Commands:\n");
     for (const CliCommand *c = cli_commands; c->name; c++)
-        printf("  %s\n", c->usage);
+        for (const char *u = c->usage; *u;) {
+            int len = (int)strcspn(u, "\n");
+            printf("  %.*s\n", len, u);
+            u += len + (u[len] == '\n');
+        }
 }

@@ -141,7 +141,8 @@ static int play(CmdWorker *w, HttpClient *h, const char *uri, int is_track)
     plat_mutex_unlock(w->mu);
     Device on;
     int where = SP_ON_ACTIVE;
-    int rc = sp_play_smart(h, uri, is_track, local ? w->name : NULL, local && uri, &on, &where);
+    int rc = sp_play_smart(h, is_track ? NULL : uri, is_track ? uri : NULL,
+                           local ? w->name : NULL, local && uri, &on, &where);
     plat_mutex_lock(w->mu);
     snprintf(w->played_on, sizeof w->played_on, "%s",
              rc == SP_OK && where == SP_ON_OTHER ? on.name : "");
