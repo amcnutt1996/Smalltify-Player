@@ -26,10 +26,10 @@
 The code is C11, about 6.5k lines in `src/`; the largest files are `ui.c` and `platform.c`. Every OS-specific call is in `platform.c`.
 
 ## Why Soloist instead of librespot
-- **Clean build:** no warnings from `src/` or `tests/`; **ctest 5/5** on the final tree. The ASan + UBSan builds of all tests were clean at the council stage, before the Soloist cutover; they weren't re-run afterwards.
+You approved both sign-ins with your real account, and everything worked: now playing, devices, search, playlists, volume and pause. librespot also authenticated. But Spotify refuses librespot's track-decryption keys for your account (`error audio key 0 1`), so nothing plays. This is a permanent server-side refusal ([librespot#1649](https://github.com/librespot-org/librespot/issues/1649)), and no client-side fix exists. You asked for Soloist: Spotify's official headless Connect player (Aug 2026, desktop since Oct 2026). It uses the same engine as the Spotify apps. Spotify forbids redistributing it, so the app downloads it into its own folder and renews it before the 90-day expiry. Details are in DECISIONS.md #18–#21.
 
 ## Verification (observed)
-- **Clean build:** no warnings from `src/` or `tests/`; **ctest 5/5**; ASan + UBSan builds of all tests are clean.
+- **Clean build:** no warnings from `src/` or `tests/`; **ctest 5/5** on the final tree. The ASan + UBSan builds of all tests were clean at the council stage, before the Soloist cutover; they weren't re-run afterwards.
 - **Real account, read-only:** `login` (PKCE in your browser) → `now` / `devices` / `playlists` / `search` all worked. The user-approved librespot run reached playback before Spotify refused the key.
 - **Soloist:** downloaded from Spotify's CDN into a scratch app folder; `--version` ran; the archive was deleted; `engine --update` re-downloaded. With a dummy key it starts and asks for pairing; EOF or Ctrl-C leaves no processes.
 - **GUI flow,** captured in screenshots inside the app: key screen → "Downloading Spotify Soloist… N%" → "Pair once" → player with art, controls, device picker and Library panel.
