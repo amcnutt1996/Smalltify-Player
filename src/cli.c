@@ -2,8 +2,12 @@
  * and problems on stderr; the return value is the process exit code. */
 #include "cli.h"
 
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "auth.h"
@@ -175,6 +179,280 @@ static int cmd_now(const Config *cfg, int argc, char **argv)
     return 0;
 }
 
+/* Returned by helpers that already printed their own message. */
+#define CLI_REPORTED 1
+
+static int bad_usage(const char *name)
+{
+    for (const CliCommand *c = cli_commands; c->name; c++)
+        if (!strcmp(c->name, name)) {
+            fprintf(stderr, "usage: " CLI_PROG " %s\n", c->usage);
+            break;
+        }
+    return 1;
+}
+
+/* Releases the session and turns an SP_* code into an exit code. */
+static int finish(AuthStore *auth, HttpClient *http, int rc)
+{
+    http_client_free(http);
+    auth_store_free(auth);
+    if (rc == SP_OK)
+        return 0;
+    if (rc != CLI_REPORTED)
+        fprintf(stderr, "%s\n", sp_strerror(rc));
+    return 1;
+}
+
+/* Whole-string decimal in [lo, hi]; 0 ok. */
+static int parse_int(const char *s, long lo, long hi, int *out)
+{
+    char *end;
+    long v;
+
+    if (!s || !isdigit((unsigned char)s[0]))
+        return -1;
+    errno = 0;
+    v = strtol(s, &end, 10);
+    if (errno || *end || v < lo || v > hi)
+        return -1;
+    *out = (int)v;
+    return 0;
+}
+
+/* "90" or "1:30" -> milliseconds; 0 ok. */
+static int parse_position(const char *s, int *ms)
+{
+    const char *colon = strchr(s, ':');
+    int min, sec;
+
+    if (!colon) {
+        if (parse_int(s, 0, INT_MAX / 1000, &sec) != 0)
+            return -1;
+        *ms = sec * 1000;
+        return 0;
+    }
+    char mbuf[16];
+    size_t mlen = (size_t)(colon - s);
+    if (mlen == 0 || mlen >= sizeof mbuf || strlen(colon + 1) != 2)
+        return -1;
+    memcpy(mbuf, s, mlen);
+    mbuf[mlen] = '\0';
+    if (parse_int(mbuf, 0, INT_MAX / 60000 - 1, &min) != 0 ||
+        parse_int(colon + 1, 0, 59, &sec) != 0)
+        return -1;
+    *ms = (min * 60 + sec) * 1000;
+    return 0;
+}
+
+/* Resume on the active device; with none active, fall back to our own
+ * engine if it is online so `play` works right after `engine` starts. */
+static int play_or_fallback(HttpClient *http)
+{
+    Device d;
+    int rc = sp_play(http, NULL);
+
+    if (rc != SP_ERR_NODEVICE)
+        return rc;
+    rc = sp_find_device(http, CFG_DEVICE_NAME, &d);
+    if (rc == SP_OK && d.id[0])
+        return sp_play(http, d.id);
+    if (rc != SP_OK && rc != SP_ERR_NODEVICE)
+        return rc;
+    fprintf(stderr, "No active device. Start one with: " CLI_PROG " engine (or open the app)\n");
+    return CLI_REPORTED;
+}
+
+/* Commands without arguments that map 1:1 onto one sp_* call. */
+static int run_simple(const Config *cfg, int argc, char **argv, int (*fn)(HttpClient *))
+{
+    AuthStore *auth;
+    HttpClient *http;
+
+    if (argc != 1)
+        return bad_usage(argv[0]);
+    if (open_session(cfg, &auth, &http) != 0)
+        return 1;
+    return finish(auth, http, fn(http));
+}
+
+static int cmd_play(const Config *cfg, int argc, char **argv)
+{
+    return run_simple(cfg, argc, argv, play_or_fallback);
+}
+
+static int cmd_pause(const Config *cfg, int argc, char **argv)
+{
+    return run_simple(cfg, argc, argv, sp_pause);
+}
+
+static int cmd_next(const Config *cfg, int argc, char **argv)
+{
+    return run_simple(cfg, argc, argv, sp_next);
+}
+
+static int cmd_prev(const Config *cfg, int argc, char **argv)
+{
+    return run_simple(cfg, argc, argv, sp_prev);
+}
+
+static int toggle(HttpClient *http)
+{
+    PlaybackState st;
+    int rc = sp_get_playback(http, &st);
+
+    if (rc != SP_OK)
+        return rc;
+    return st.active && st.is_playing ? sp_pause(http) : play_or_fallback(http);
+}
+
+static int cmd_toggle(const Config *cfg, int argc, char **argv)
+{
+    return run_simple(cfg, argc, argv, toggle);
+}
+
+static int cmd_seek(const Config *cfg, int argc, char **argv)
+{
+    AuthStore *auth;
+    HttpClient *http;
+    int ms;
+
+    if (argc != 2 || parse_position(argv[1], &ms) != 0)
+        return bad_usage(argv[0]);
+    if (open_session(cfg, &auth, &http) != 0)
+        return 1;
+    return finish(auth, http, sp_seek(http, ms));
+}
+
+static int cmd_vol(const Config *cfg, int argc, char **argv)
+{
+    AuthStore *auth;
+    HttpClient *http;
+    PlaybackState st;
+    int sign = 0, v, rc;
+
+    if (argc != 2)
+        return bad_usage(argv[0]);
+    if (argv[1][0] == '+' || argv[1][0] == '-')
+        sign = argv[1][0] == '+' ? 1 : -1;
+    if (parse_int(argv[1] + (sign != 0), 0, 100, &v) != 0)
+        return bad_usage(argv[0]);
+    if (open_session(cfg, &auth, &http) != 0)
+        return 1;
+    if (sign) {
+        /* Relative steps need the current level; sp_set_volume clamps. */
+        rc = sp_get_playback(http, &st);
+        if (rc == SP_OK && !st.active)
+            rc = SP_ERR_NODEVICE;
+        if (rc == SP_OK && st.volume < 0) {
+            fprintf(stderr, "This device does not report its volume.\n");
+            rc = CLI_REPORTED;
+        }
+        if (rc != SP_OK)
+            return finish(auth, http, rc);
+        v = st.volume + sign * v;
+    }
+    return finish(auth, http, sp_set_volume(http, v));
+}
+
+static int cmd_shuffle(const Config *cfg, int argc, char **argv)
+{
+    AuthStore *auth;
+    HttpClient *http;
+    int on;
+
+    if (argc != 2 || (strcmp(argv[1], "on") && strcmp(argv[1], "off")))
+        return bad_usage(argv[0]);
+    on = !strcmp(argv[1], "on");
+    if (open_session(cfg, &auth, &http) != 0)
+        return 1;
+    return finish(auth, http, sp_set_shuffle(http, on));
+}
+
+static int cmd_repeat(const Config *cfg, int argc, char **argv)
+{
+    static const char *const names[] = { "off", "context", "track" };
+    AuthStore *auth;
+    HttpClient *http;
+    int m;
+
+    if (argc != 2)
+        return bad_usage(argv[0]);
+    for (m = REPEAT_OFF; m <= REPEAT_TRACK && strcmp(argv[1], names[m]); m++) {
+    }
+    if (m > REPEAT_TRACK)
+        return bad_usage(argv[0]);
+    if (open_session(cfg, &auth, &http) != 0)
+        return 1;
+    return finish(auth, http, sp_set_repeat(http, (RepeatMode)m));
+}
+
+static int cmd_devices(const Config *cfg, int argc, char **argv)
+{
+    AuthStore *auth;
+    HttpClient *http;
+    Device d[SP_MAX_DEVICES];
+    int n, rc;
+
+    if (argc != 1)
+        return bad_usage(argv[0]);
+    if (open_session(cfg, &auth, &http) != 0)
+        return 1;
+    rc = sp_get_devices(http, d, SP_MAX_DEVICES, &n);
+    if (rc == SP_OK && n == 0)
+        printf("No devices found. Start one with: " CLI_PROG " engine (or open the app)\n");
+    for (int i = 0; rc == SP_OK && i < n; i++) {
+        printf("%c %s (%s)", d[i].is_active ? '*' : ' ', d[i].name, d[i].type);
+        if (d[i].volume >= 0)
+            printf(" %d%%", d[i].volume);
+        putchar('\n');
+    }
+    return finish(auth, http, rc);
+}
+
+/* Names may contain spaces, so unquoted words are joined back together. */
+static int cmd_transfer(const Config *cfg, int argc, char **argv)
+{
+    AuthStore *auth;
+    HttpClient *http;
+    Device d[SP_MAX_DEVICES];
+    const Device *hit = NULL;
+    char want[SP_NAME_LEN];
+    size_t len = 0;
+    int n, rc;
+
+    if (argc < 2)
+        return bad_usage(argv[0]);
+    want[0] = '\0';
+    for (int i = 1; i < argc; i++) {
+        int w = snprintf(want + len, sizeof want - len, "%s%s", i > 1 ? " " : "", argv[i]);
+        if (w < 0 || (size_t)w >= sizeof want - len)
+            return bad_usage(argv[0]);
+        len += (size_t)w;
+    }
+    if (open_session(cfg, &auth, &http) != 0)
+        return 1;
+    rc = sp_get_devices(http, d, SP_MAX_DEVICES, &n);
+    /* Names win over ids: a name the user typed is the likelier intent. */
+    for (int i = 0; rc == SP_OK && !hit && i < n; i++)
+        if (!strcmp(d[i].name, want))
+            hit = &d[i];
+    for (int i = 0; rc == SP_OK && !hit && i < n; i++)
+        if (d[i].id[0] && !strcmp(d[i].id, want))
+            hit = &d[i];
+    if (rc == SP_OK && (!hit || !hit->id[0])) {
+        fprintf(stderr, hit ? "Device '%s' cannot be controlled remotely.\n"
+                            : "No device named '%s'. List them with: " CLI_PROG " devices\n",
+                want);
+        rc = CLI_REPORTED;
+    }
+    if (rc == SP_OK)
+        rc = sp_transfer(http, hit->id, 0);
+    if (rc == SP_OK)
+        printf("Playback moved to %s\n", hit->name);
+    return finish(auth, http, rc);
+}
+
 /* Ends `engine` on stdin EOF (Ctrl-D / closed pipe). */
 static void stdin_watch(void *arg)
 {
@@ -242,6 +520,17 @@ const CliCommand cli_commands[] = {
     { "logout", "logout", cmd_logout },
     { "engine", "engine", cmd_engine },
     { "now",    "now",    cmd_now    },
+    { "play",     "play",                            cmd_play     },
+    { "pause",    "pause",                           cmd_pause    },
+    { "toggle",   "toggle",                          cmd_toggle   },
+    { "next",     "next",                            cmd_next     },
+    { "prev",     "prev",                            cmd_prev     },
+    { "seek",     "seek <seconds | m:ss>",           cmd_seek     },
+    { "vol",      "vol <0-100 | +N | -N>",           cmd_vol      },
+    { "shuffle",  "shuffle on|off",                  cmd_shuffle  },
+    { "repeat",   "repeat off|context|track",        cmd_repeat   },
+    { "devices",  "devices",                         cmd_devices  },
+    { "transfer", "transfer <name-or-id>",           cmd_transfer },
     { NULL, NULL, NULL },
 };
 
