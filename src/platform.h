@@ -25,6 +25,15 @@ int  plat_mkdir(const char *path);
 /* Atomically replace path with data (write tmp in same dir + rename),
  * owner-only perms. 0 ok, -1 error. */
 int  plat_write_file_atomic(const char *path, const void *data, size_t len);
+/* Read a whole file (at most max_len bytes, else error) into a malloc'd,
+ * NUL-terminated buffer; *out_len gets the length (may be NULL). Caller
+ * frees. NULL if missing/unreadable/too big. UTF-8 paths on every OS. */
+char *plat_read_file(const char *path, size_t max_len, size_t *out_len);
+/* Delete a file or a directory tree (symlinks are not followed).
+ * 0 if gone afterwards (including "did not exist"), -1 error. */
+int  plat_remove_tree(const char *path);
+/* Fill buf with cryptographically secure random bytes. 0 ok, -1 error. */
+int  plat_random_bytes(void *buf, size_t len);
 /* Open a URL in the default browser. 0 ok. */
 int  plat_open_url(const char *url);
 
@@ -61,6 +70,10 @@ plat_proc *plat_proc_spawn(const char *const argv[]);
 /* Blocking read of child output. Returns bytes read, 0 on EOF, -1 error. */
 long       plat_proc_read(plat_proc *p, char *buf, size_t cap);
 int        plat_proc_alive(plat_proc *p);
+/* Terminate (graceful, then forced after 2 s) and reap, but keep p valid:
+ * a reader thread blocked in plat_proc_read then sees EOF and can be
+ * joined before plat_proc_kill frees p. Idempotent. */
+void       plat_proc_terminate(plat_proc *p);
 /* Terminate (graceful, then forced), reap, free. NULL-safe. */
 void       plat_proc_kill(plat_proc *p);
 

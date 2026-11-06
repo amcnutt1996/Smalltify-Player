@@ -7,6 +7,7 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define CFG_PATH_LEN 1024
@@ -39,5 +40,11 @@ int config_load_token(const Config *c, Token *t);
 int config_save_token(const Config *c, const Token *t);
 /* Remove token file + librespot cache (logout). */
 int config_clear_login(const Config *c);
+
+/* Look up key in .env text (KEY=VALUE lines, '#' comments, optional
+ * quotes, surrounding whitespace, CRLF, UTF-8 BOM; the last assignment
+ * wins; unknown keys are ignored). Pure, exposed for tests.
+ * 0 found (out filled), -1 absent or value longer than cap-1. */
+int config_env_lookup(const char *text, const char *key, char *out, size_t cap);
 
 #endif
