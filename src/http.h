@@ -34,7 +34,8 @@ void        http_client_free(HttpClient *c);
  * With auth: adds "Authorization: Bearer", on 401 calls refresh once and
  * retries; on 429 honors Retry-After (capped) and retries once.
  * Returns 0 if a response was received (check out->status), -1 transport
- * error. Always call http_response_free. */
+ * error. out->body is the client's receive buffer handed over without a
+ * copy: the caller owns it and must always call http_response_free. */
 int  http_request(HttpClient *c, const char *method, const char *url,
                   const char *content_type, const char *body,
                   HttpResponse *out);
