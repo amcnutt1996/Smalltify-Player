@@ -34,9 +34,6 @@ int auth_store_login(AuthStore *s, const volatile int *cancel);
 typedef void (*AuthUrlFn)(const char *url, void *ud);
 void auth_store_set_url_callback(AuthStore *s, AuthUrlFn fn, void *ud);
 
-/* Copy a valid access token (refreshes if expiring within 60 s). 0 ok. */
-int auth_store_access_token(AuthStore *s, char *buf, size_t cap);
-
 /* Logout: forget tokens in memory and on disk. */
 void auth_store_logout(AuthStore *s);
 

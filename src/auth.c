@@ -273,8 +273,11 @@ static int refresh_since(AuthStore *s, unsigned seen, int force)
     return rc;
 }
 
-int auth_store_access_token(AuthStore *s, char *buf, size_t cap)
+/* HttpAuth.get_token: copy a valid access token, refreshing first if it
+ * expires within EXPIRY_MARGIN_S. 0 ok. */
+static int http_get_token(void *ud, char *buf, size_t cap)
 {
+    AuthStore *s = ud;
     for (int attempt = 0; attempt < 2; attempt++) {
         plat_mutex_lock(s->lock);
         int ok = s->tok.access[0] && s->tok.expires_at - EXPIRY_MARGIN_S > plat_unix_time();
@@ -302,11 +305,6 @@ void auth_store_logout(AuthStore *s)
     if (config_clear_login(&s->cfg) != 0)
         fprintf(stderr, "auth: could not remove all login data under %s\n", s->cfg.data_dir);
     plat_mutex_unlock(s->flight);
-}
-
-static int http_get_token(void *ud, char *buf, size_t cap)
-{
-    return auth_store_access_token(ud, buf, cap);
 }
 
 /* After a 401 the access token is bad even if not expired. Several threads

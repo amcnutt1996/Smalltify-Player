@@ -645,7 +645,7 @@ int sp_play_fallback(HttpClient *c, const char *uri, int is_track, const char *f
     Device d;
     int rc = uri ? sp_play_uri(c, NULL, uri, is_track) : sp_play(c, NULL);
 
-    if (rc != SP_ERR_NODEVICE || !fallback_name)
+    if (rc != SP_ERR_NODEVICE)
         return rc;
     rc = sp_find_device(c, fallback_name, &d);
     if (rc != SP_OK)

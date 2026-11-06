@@ -829,12 +829,12 @@ static void login_thread(void *arg)
 }
 
 /* Fallback when the browser tab got lost: open the pending URL again. */
-static void open_again(Ui *u, plat_mutex *mu, const char *src)
+static void open_again(Ui *u)
 {
     char url[SIGNIN_URL_LEN];
-    plat_mutex_lock(mu);
-    memcpy(url, src, sizeof url);
-    plat_mutex_unlock(mu);
+    plat_mutex_lock(u->mu);
+    memcpy(url, u->login_url, sizeof url);
+    plat_mutex_unlock(u->mu);
     if (url[0] && plat_open_url(url) != 0)
         u->login_msg = "Could not open the browser.";
 }
@@ -902,7 +902,7 @@ static void draw_login(Ui *u)
     if (has_url && !u->login_cancel) {
         Rectangle ro = { ((float)u->w - 200.0f) / 2.0f, by, 200, 28 };
         if (button(u, W_OPEN_URL, ro, "Open sign-in page again", FS_S, 0))
-            open_again(u, u->mu, u->login_url);
+            open_again(u);
         by += 36;
     }
     Rectangle rc = { ((float)u->w - 100.0f) / 2.0f, by, 100, 28 };

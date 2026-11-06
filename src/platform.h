@@ -88,7 +88,6 @@ typedef struct plat_proc plat_proc;
 plat_proc *plat_proc_spawn(const char *const argv[]);
 /* Blocking read of child output. Returns bytes read, 0 on EOF, -1 error. */
 long       plat_proc_read(plat_proc *p, char *buf, size_t cap);
-int        plat_proc_alive(plat_proc *p);
 /* Wait up to timeout_ms for the child to exit on its own. Returns its exit
  * code (0-255), or -1 if still running, killed by a signal, or on error. */
 int        plat_proc_wait(plat_proc *p, unsigned timeout_ms);

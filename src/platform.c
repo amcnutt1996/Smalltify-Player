@@ -582,11 +582,6 @@ long plat_proc_read(plat_proc *p, char *buf, size_t cap)
     return (long)got;
 }
 
-int plat_proc_alive(plat_proc *p)
-{
-    return p && WaitForSingleObject(p->process, 0) == WAIT_TIMEOUT;
-}
-
 int plat_proc_wait(plat_proc *p, unsigned timeout_ms)
 {
     DWORD code;
@@ -1359,16 +1354,6 @@ static int reap_within(plat_proc *p, unsigned timeout_ms)
             step *= 2;
     }
     return p->reaped;
-}
-
-int plat_proc_alive(plat_proc *p)
-{
-    if (!p)
-        return 0;
-    pthread_mutex_lock(&p->lock);
-    int alive = !reap_nohang(p);
-    pthread_mutex_unlock(&p->lock);
-    return alive;
 }
 
 int plat_proc_wait(plat_proc *p, unsigned timeout_ms)

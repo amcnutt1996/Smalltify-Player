@@ -1,5 +1,5 @@
 # Library
-`librespot` - a small open-source program that logs into Spotify allowing you to play audio with no UI. Standalone binary bundled w/ player to stream apps. spawn, read output, kill when done.
+`Spotify Soloist` - Spotify's official headless Spotify Connect player (replaced `librespot`, see DECISIONS.md #18). It's downloaded at runtime into the app folder, because Spotify forbids redistributing it. The app spawns it, reads its output, and kills it when done.
 
 # Build Order
 1. Auth CLI Wrapper
@@ -20,5 +20,8 @@
 `poller.c + poller.h` - background thread: every ~1/2 seconds fetch playback state, hand results to UI safely.
 `art.c + art.h` - (optional) download + decode + cache album art
 `ui.c + ui.h` - window, widgets, button callbacks -> spotify.c calls
+`soloist.c + soloist.h` - downloads and updates Soloist, spawns and supervises it, and tracks its pairing state
+`platform.c + platform.h` - all OS-specific code (paths, threads, processes, sockets)
+`cli.c + cli.h` - command-line front end
 
 
