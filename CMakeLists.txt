@@ -49,13 +49,26 @@ FetchContent_MakeAvailable(raylib)
 add_library(cjson STATIC third_party/cjson/cJSON.c)
 target_include_directories(cjson PUBLIC third_party/cjson)
 
+# GUI font: a subset of Inter (SIL OFL 1.1; third_party/inter/subset.py
+# makes it), compiled in as a byte array so the app needs no font file.
+# Regenerated at configure time whenever the .ttf changes.
+set(SCP_FONT ${CMAKE_SOURCE_DIR}/third_party/inter/Inter-Regular.subset.ttf)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${SCP_FONT})
+file(READ ${SCP_FONT} SCP_FONT_BYTES HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," SCP_FONT_BYTES "${SCP_FONT_BYTES}")
+string(REGEX REPLACE "((0x..,){16})" "\\1\n" SCP_FONT_BYTES "${SCP_FONT_BYTES}")
+file(CONFIGURE OUTPUT ${CMAKE_BINARY_DIR}/ui_font.c CONTENT
+  "/* Generated from third_party/inter/Inter-Regular.subset.ttf by CMakeLists.txt. */\nconst unsigned char ui_font_ttf[] = {\n@SCP_FONT_BYTES@};\nconst unsigned int ui_font_ttf_len = sizeof ui_font_ttf;\n"
+  @ONLY)
+
 # --- app -------------------------------------------------------------------
 # scp_core = every module except main.c. Static lib: tests and the exe pull
 # in only the objects they reference.
 file(GLOB SCP_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.c)
 list(REMOVE_ITEM SCP_SOURCES ${CMAKE_SOURCE_DIR}/src/main.c)
-add_library(scp_core STATIC ${SCP_SOURCES})
+add_library(scp_core STATIC ${SCP_SOURCES} ${CMAKE_BINARY_DIR}/ui_font.c)
 target_include_directories(scp_core PUBLIC src)
+target_include_directories(scp_core PRIVATE third_party/inter)
 target_link_libraries(scp_core PUBLIC raylib cjson CURL::libcurl Threads::Threads)
 if(WIN32)
   # platform.c uses Vista+ APIs (SRW locks, condition variables); MinGW
@@ -116,14 +129,24 @@ add_custom_target(scp_env ALL
   BYPRODUCTS ${SCP_ENV_STAMP}
   VERBATIM)
 
+# The font's license goes with the app, as the OFL asks.
+set(SCP_FONT_LICENSE "${SCP_APP_DIR}/Inter-LICENSE.txt")
+add_custom_command(OUTPUT ${SCP_FONT_LICENSE}
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${SCP_APP_DIR}
+  COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/third_party/inter/LICENSE.txt
+          ${SCP_FONT_LICENSE}
+  DEPENDS ${CMAKE_SOURCE_DIR}/third_party/inter/LICENSE.txt
+  VERBATIM)
+add_custom_target(scp_font_license ALL DEPENDS ${SCP_FONT_LICENSE})
+
 if(APPLE)
   find_program(SCP_CODESIGN codesign REQUIRED)
   configure_file(packaging/macos/Info.plist.in ${CMAKE_BINARY_DIR}/Info.plist @ONLY)
   set(SCP_ICON ${CMAKE_SOURCE_DIR}/packaging/macos/AppIcon.icns)
   set(SCP_SIGN_STAMP ${CMAKE_BINARY_DIR}/bundle.stamp)
   # Ad-hoc signature (no developer ID; fine for a locally built app). Only
-  # re-signed when the binary, plist, icon or seeded .env change: anything
-  # the app writes into Contents/Resources at runtime makes
+  # re-signed when the binary, plist, icon, font license or seeded .env
+  # change: anything the app writes into Contents/Resources at runtime makes
   # `codesign --verify` report modified contents, which is expected.
   add_custom_command(OUTPUT ${SCP_SIGN_STAMP}
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/Info.plist
@@ -132,6 +155,7 @@ if(APPLE)
     COMMAND ${SCP_CODESIGN} --force --sign - --options runtime "${SCP_BUNDLE}"
     COMMAND ${CMAKE_COMMAND} -E touch ${SCP_SIGN_STAMP}
     DEPENDS spotify-c-player scp_env ${SCP_ENV_STAMP} ${CMAKE_BINARY_DIR}/Info.plist ${SCP_ICON}
+            scp_font_license ${SCP_FONT_LICENSE}
     COMMENT "Signing ${SCP_APP_NAME}.app (ad hoc)"
     VERBATIM)
   add_custom_target(scp_bundle ALL DEPENDS ${SCP_SIGN_STAMP})
