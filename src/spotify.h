@@ -39,7 +39,12 @@ int sp_set_shuffle(HttpClient *c, int on);
 int sp_set_repeat(HttpClient *c, RepeatMode mode);
 
 /* --- devices ------------------------------------------------------------ */
+#define SP_MAX_DEVICES 32 /* enough for any account; bounds stack arrays */
+/* *count = devices stored; extra devices beyond cap are dropped. */
 int sp_get_devices(HttpClient *c, Device *out, int cap, int *count);
+/* Parse a /me/player/devices body (no network; used by tests). SP_OK, or
+ * SP_ERR_PARSE if json is not an object with a "devices" array. */
+int sp_parse_devices(const char *json, Device *out, int cap, int *count);
 int sp_transfer(HttpClient *c, const char *device_id, int play);
 /* Find device by exact name (e.g. CFG_DEVICE_NAME). SP_OK and fills out. */
 int sp_find_device(HttpClient *c, const char *name, Device *out);

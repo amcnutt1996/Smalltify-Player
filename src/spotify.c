@@ -305,9 +305,180 @@ int sp_get_playback(HttpClient *c, PlaybackState *out)
  * Playback control: build on sp_request()
  * ====================================================================== */
 
+/* path + "?device_id=<encoded>" when device_id is set, so every player
+ * command can target a specific device the same way. */
+static int with_device(char *buf, size_t cap, const char *path, const char *device_id)
+{
+    char enc[SP_ID_LEN * 3];
+    int n;
+
+    if (!device_id || !device_id[0])
+        n = snprintf(buf, cap, "%s", path);
+    else if (http_urlencode(device_id, enc, sizeof enc) != 0)
+        return SP_ERR_OTHER;
+    else
+        n = snprintf(buf, cap, "%s?device_id=%s", path, enc);
+    return (n < 0 || (size_t)n >= cap) ? SP_ERR_OTHER : SP_OK;
+}
+
+int sp_play(HttpClient *c, const char *device_id)
+{
+    char path[SP_URL_MAX];
+    int rc = with_device(path, sizeof path, "/me/player/play", device_id);
+    return rc != SP_OK ? rc : sp_request(c, "PUT", path, NULL, NULL);
+}
+
+int sp_pause(HttpClient *c)
+{
+    return sp_request(c, "PUT", "/me/player/pause", NULL, NULL);
+}
+
+int sp_next(HttpClient *c)
+{
+    return sp_request(c, "POST", "/me/player/next", NULL, NULL);
+}
+
+int sp_prev(HttpClient *c)
+{
+    return sp_request(c, "POST", "/me/player/previous", NULL, NULL);
+}
+
+int sp_seek(HttpClient *c, int position_ms)
+{
+    char path[64];
+    snprintf(path, sizeof path, "/me/player/seek?position_ms=%d", position_ms < 0 ? 0 : position_ms);
+    return sp_request(c, "PUT", path, NULL, NULL);
+}
+
+int sp_set_volume(HttpClient *c, int percent)
+{
+    char path[64];
+    percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
+    snprintf(path, sizeof path, "/me/player/volume?volume_percent=%d", percent);
+    return sp_request(c, "PUT", path, NULL, NULL);
+}
+
+int sp_set_shuffle(HttpClient *c, int on)
+{
+    return sp_request(c, "PUT", on ? "/me/player/shuffle?state=true"
+                                   : "/me/player/shuffle?state=false", NULL, NULL);
+}
+
+int sp_set_repeat(HttpClient *c, RepeatMode mode)
+{
+    static const char *const paths[] = {
+        "/me/player/repeat?state=off",
+        "/me/player/repeat?state=context",
+        "/me/player/repeat?state=track",
+    };
+    if ((int)mode < REPEAT_OFF || mode > REPEAT_TRACK)
+        return SP_ERR_OTHER;
+    return sp_request(c, "PUT", paths[mode], NULL, NULL);
+}
+
 /* ======================================================================
  * Devices: build on sp_request() + json_str()/json_int()
  * ====================================================================== */
+
+/* Devices beyond cap are dropped; *count is the number stored. */
+static int parse_devices(const cJSON *root, Device *out, int cap, int *count)
+{
+    const cJSON *list = cJSON_GetObjectItemCaseSensitive(root, "devices");
+    const cJSON *d;
+    int n = 0;
+
+    *count = 0;
+    if (!cJSON_IsArray(list))
+        return SP_ERR_PARSE;
+    cJSON_ArrayForEach(d, list) {
+        Device *dev;
+
+        if (n >= cap)
+            break;
+        if (!cJSON_IsObject(d))
+            continue;
+        dev = &out[n++];
+        json_str(dev->id, sizeof dev->id, d, "id");
+        json_str(dev->name, sizeof dev->name, d, "name");
+        json_str(dev->type, sizeof dev->type, d, "type");
+        dev->is_active = json_bool(d, "is_active");
+        dev->volume = json_int(d, "volume_percent", -1);
+    }
+    *count = n;
+    return SP_OK;
+}
+
+int sp_parse_devices(const char *json, Device *out, int cap, int *count)
+{
+    cJSON *root;
+    int rc;
+
+    if (!count || cap < 0 || (cap > 0 && !out))
+        return SP_ERR_OTHER;
+    root = json ? cJSON_Parse(json) : NULL;
+    rc = parse_devices(root, out, cap, count);
+    cJSON_Delete(root);
+    return rc;
+}
+
+int sp_get_devices(HttpClient *c, Device *out, int cap, int *count)
+{
+    cJSON *root;
+    int rc;
+
+    if (!count || cap < 0 || (cap > 0 && !out))
+        return SP_ERR_OTHER;
+    *count = 0;
+    rc = sp_request(c, "GET", "/me/player/devices", NULL, &root);
+    if (rc != SP_OK)
+        return rc;
+    rc = parse_devices(root, out, cap, count);
+    cJSON_Delete(root);
+    return rc;
+}
+
+int sp_find_device(HttpClient *c, const char *name, Device *out)
+{
+    Device devs[SP_MAX_DEVICES];
+    int n, i, rc;
+
+    if (!name || !out)
+        return SP_ERR_OTHER;
+    rc = sp_get_devices(c, devs, SP_MAX_DEVICES, &n);
+    if (rc != SP_OK)
+        return rc;
+    for (i = 0; i < n; i++) {
+        if (strcmp(devs[i].name, name) == 0) {
+            *out = devs[i];
+            return SP_OK;
+        }
+    }
+    return SP_ERR_NODEVICE;
+}
+
+int sp_transfer(HttpClient *c, const char *device_id, int play)
+{
+    cJSON *body = cJSON_CreateObject();
+    cJSON *ids;
+    char *json = NULL;
+    int rc = SP_ERR_OTHER;
+
+    if (!device_id || !device_id[0] || !body) {
+        cJSON_Delete(body);
+        return SP_ERR_OTHER;
+    }
+    /* Built with cJSON so ids are escaped; the array is owned by body as
+     * soon as it exists, so no failure path leaks. */
+    ids = cJSON_AddArrayToObject(body, "device_ids");
+    if (ids && cJSON_AddItemToArray(ids, cJSON_CreateString(device_id)) &&
+        cJSON_AddBoolToObject(body, "play", play ? 1 : 0))
+        json = cJSON_PrintUnformatted(body);
+    if (json)
+        rc = sp_request(c, "PUT", "/me/player", json, NULL);
+    cJSON_free(json);
+    cJSON_Delete(body);
+    return rc;
+}
 
 /* ======================================================================
  * Extras (playlists, search, play URI): build on sp_request()

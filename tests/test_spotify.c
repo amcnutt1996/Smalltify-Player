@@ -182,6 +182,60 @@ static void test_strerror(void)
     assert(sp_strerror(12345)[0]);
 }
 
+static const char DEVICES_JSON[] =
+    "{\"devices\":["
+    "{\"id\":\"a1\",\"is_active\":false,\"name\":\"Spotify C Player\",\"type\":\"Computer\",\"volume_percent\":70},"
+    "{\"id\":\"b2\",\"is_active\":true,\"name\":\"Kitchen\",\"type\":\"Speaker\",\"volume_percent\":null},"
+    "{\"id\":null,\"is_active\":false,\"name\":\"Restricted TV\",\"type\":\"TV\"}]}";
+
+static void test_devices(void)
+{
+    Device d[4];
+    int n = -1;
+
+    assert(sp_parse_devices(DEVICES_JSON, d, 4, &n) == SP_OK);
+    assert(n == 3);
+    assert(!strcmp(d[0].id, "a1") && !strcmp(d[0].name, "Spotify C Player"));
+    assert(!strcmp(d[0].type, "Computer") && d[0].volume == 70 && !d[0].is_active);
+    assert(d[1].is_active && d[1].volume == -1); /* null volume_percent */
+    assert(d[2].id[0] == '\0' && d[2].volume == -1 && !strcmp(d[2].type, "TV"));
+}
+
+static void test_devices_empty(void)
+{
+    Device d[2];
+    int n = -1;
+
+    assert(sp_parse_devices("{\"devices\":[]}", d, 2, &n) == SP_OK);
+    assert(n == 0);
+    assert(sp_parse_devices(DEVICES_JSON, NULL, 0, &n) == SP_OK);
+    assert(n == 0);
+}
+
+static void test_devices_cap(void)
+{
+    Device d[3];
+    int n = -1;
+
+    memset(d, 0x55, sizeof d);
+    assert(sp_parse_devices(DEVICES_JSON, d, 2, &n) == SP_OK);
+    assert(n == 2);
+    assert(!strcmp(d[1].name, "Kitchen"));
+    assert((unsigned char)d[2].name[0] == 0x55); /* untouched past cap */
+}
+
+static void test_devices_malformed(void)
+{
+    Device d[2];
+    int n = -1;
+
+    assert(sp_parse_devices("{\"devices\":[", d, 2, &n) == SP_ERR_PARSE && n == 0);
+    assert(sp_parse_devices("{}", d, 2, &n) == SP_ERR_PARSE);
+    assert(sp_parse_devices("[]", d, 2, &n) == SP_ERR_PARSE);
+    assert(sp_parse_devices(NULL, d, 2, &n) == SP_ERR_PARSE);
+    assert(sp_parse_devices("{\"devices\":[]}", d, 2, NULL) == SP_ERR_OTHER);
+}
+
 int main(void)
 {
     test_track();
@@ -191,5 +245,9 @@ int main(void)
     test_truncation();
     test_malformed();
     test_strerror();
+    test_devices();
+    test_devices_empty();
+    test_devices_cap();
+    test_devices_malformed();
     return 0;
 }
