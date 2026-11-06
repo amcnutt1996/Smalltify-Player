@@ -236,6 +236,56 @@ static void test_devices_malformed(void)
     assert(sp_parse_devices("{\"devices\":[]}", d, 2, NULL) == SP_ERR_OTHER);
 }
 
+static const char PLAYLISTS_JSON[] =
+    "{\"items\":["
+    "{\"id\":\"p1\",\"uri\":\"spotify:playlist:p1\",\"name\":\"Chill\",\"tracks\":{\"total\":42}},"
+    "null,"
+    "{\"id\":\"p2\",\"uri\":\"spotify:playlist:p2\",\"name\":\"Run\",\"items\":{\"total\":7}},"
+    "{\"id\":\"p3\",\"uri\":\"spotify:playlist:p3\",\"name\":\"Bare\"}"
+    "],\"next\":\"https://api.spotify.com/v1/me/playlists?offset=50\"}";
+
+static void test_playlists(void)
+{
+    Playlist p[4];
+    int n = -1;
+
+    assert(sp_parse_playlists(PLAYLISTS_JSON, p, 4, &n) == SP_OK);
+    assert(n == 3); /* null entry skipped */
+    assert(!strcmp(p[0].uri, "spotify:playlist:p1") && !strcmp(p[0].name, "Chill"));
+    assert(p[0].track_count == 42);
+    assert(!strcmp(p[1].id, "p2") && p[1].track_count == 7);
+    assert(p[2].track_count == 0);
+    assert(sp_parse_playlists(PLAYLISTS_JSON, p, 1, &n) == SP_OK && n == 1);
+    assert(sp_parse_playlists("{\"items\":[]}", p, 4, &n) == SP_OK && n == 0);
+    assert(sp_parse_playlists("{}", p, 4, &n) == SP_ERR_PARSE && n == 0);
+    assert(sp_parse_playlists("nope", p, 4, &n) == SP_ERR_PARSE);
+    assert(sp_parse_playlists(PLAYLISTS_JSON, p, 4, NULL) == SP_ERR_OTHER);
+}
+
+static const char SEARCH_JSON[] =
+    "{\"tracks\":{\"items\":["
+    "{\"id\":\"t1\",\"uri\":\"spotify:track:t1\",\"name\":\"Song\",\"duration_ms\":1000,"
+    "\"artists\":[{\"name\":\"A\"},{\"name\":\"B\"}],"
+    "\"album\":{\"name\":\"Alb\",\"images\":[{\"url\":\"big\",\"width\":640},{\"url\":\"small\",\"width\":64}]}},"
+    "{\"id\":\"t2\",\"uri\":\"spotify:track:t2\",\"name\":\"Other\"}"
+    "]}}";
+
+static void test_search(void)
+{
+    Track t[4];
+    int n = -1;
+
+    assert(sp_parse_search(SEARCH_JSON, t, 4, &n) == SP_OK && n == 2);
+    assert(!strcmp(t[0].uri, "spotify:track:t1") && !strcmp(t[0].artists, "A, B"));
+    assert(!strcmp(t[0].album, "Alb") && !strcmp(t[0].art_url, "small"));
+    assert(t[0].duration_ms == 1000);
+    assert(!strcmp(t[1].name, "Other") && t[1].artists[0] == '\0' && t[1].art_url[0] == '\0');
+    assert(sp_parse_search(SEARCH_JSON, t, 1, &n) == SP_OK && n == 1);
+    assert(sp_parse_search("{\"tracks\":{}}", t, 4, &n) == SP_ERR_PARSE && n == 0);
+    assert(sp_parse_search("{\"items\":[]}", t, 4, &n) == SP_ERR_PARSE);
+    assert(sp_parse_search(NULL, t, 4, &n) == SP_ERR_PARSE);
+}
+
 int main(void)
 {
     test_track();
@@ -249,5 +299,7 @@ int main(void)
     test_devices_empty();
     test_devices_cap();
     test_devices_malformed();
+    test_playlists();
+    test_search();
     return 0;
 }

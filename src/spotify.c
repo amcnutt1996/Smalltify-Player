@@ -483,3 +483,148 @@ int sp_transfer(HttpClient *c, const char *device_id, int play)
 /* ======================================================================
  * Extras (playlists, search, play URI): build on sp_request()
  * ====================================================================== */
+
+/* Playlists beyond cap are dropped; *count is the number stored. */
+static int parse_playlists(const cJSON *root, Playlist *out, int cap, int *count)
+{
+    const cJSON *list = cJSON_GetObjectItemCaseSensitive(root, "items");
+    const cJSON *p;
+    int n = 0;
+
+    *count = 0;
+    if (!cJSON_IsArray(list))
+        return SP_ERR_PARSE;
+    cJSON_ArrayForEach(p, list) {
+        Playlist *pl;
+
+        if (n >= cap)
+            break;
+        if (!cJSON_IsObject(p))
+            continue; /* Spotify returns null for unavailable playlists */
+        pl = &out[n++];
+        json_str(pl->id, sizeof pl->id, p, "id");
+        json_str(pl->uri, sizeof pl->uri, p, "uri");
+        json_str(pl->name, sizeof pl->name, p, "name");
+        /* "tracks" was renamed "items" in newer API responses; accept both. */
+        pl->track_count = json_int(cJSON_GetObjectItemCaseSensitive(p, "tracks"), "total", -1);
+        if (pl->track_count < 0)
+            pl->track_count = json_int(cJSON_GetObjectItemCaseSensitive(p, "items"), "total", 0);
+    }
+    *count = n;
+    return SP_OK;
+}
+
+/* Search results reuse parse_item() so tracks look identical to playback. */
+static int parse_search(const cJSON *root, Track *out, int cap, int *count)
+{
+    const cJSON *tracks = cJSON_GetObjectItemCaseSensitive(root, "tracks");
+    const cJSON *list = cJSON_GetObjectItemCaseSensitive(tracks, "items");
+    const cJSON *t;
+    int n = 0;
+
+    *count = 0;
+    if (!cJSON_IsArray(list))
+        return SP_ERR_PARSE;
+    cJSON_ArrayForEach(t, list) {
+        if (n >= cap)
+            break;
+        if (!cJSON_IsObject(t))
+            continue;
+        parse_item(t, &out[n++]);
+    }
+    *count = n;
+    return SP_OK;
+}
+
+int sp_parse_playlists(const char *json, Playlist *out, int cap, int *count)
+{
+    cJSON *root;
+    int rc;
+
+    if (!count || cap < 0 || (cap > 0 && !out))
+        return SP_ERR_OTHER;
+    root = json ? cJSON_Parse(json) : NULL;
+    rc = parse_playlists(root, out, cap, count);
+    cJSON_Delete(root);
+    return rc;
+}
+
+int sp_parse_search(const char *json, Track *out, int cap, int *count)
+{
+    cJSON *root;
+    int rc;
+
+    if (!count || cap < 0 || (cap > 0 && !out))
+        return SP_ERR_OTHER;
+    root = json ? cJSON_Parse(json) : NULL;
+    rc = parse_search(root, out, cap, count);
+    cJSON_Delete(root);
+    return rc;
+}
+
+int sp_get_playlists(HttpClient *c, Playlist *out, int cap, int *count)
+{
+    cJSON *root;
+    int rc;
+
+    if (!count || cap < 0 || (cap > 0 && !out))
+        return SP_ERR_OTHER;
+    *count = 0;
+    rc = sp_request(c, "GET", "/me/playlists?limit=50", NULL, &root);
+    if (rc != SP_OK)
+        return rc;
+    rc = parse_playlists(root, out, cap, count);
+    cJSON_Delete(root);
+    return rc;
+}
+
+int sp_search_tracks(HttpClient *c, const char *query, Track *out, int cap, int *count)
+{
+    char enc[SP_NAME_LEN * 3];
+    char path[SP_URL_MAX];
+    cJSON *root;
+    int n, rc;
+
+    if (!count || !query || !query[0] || cap <= 0 || !out)
+        return SP_ERR_OTHER;
+    *count = 0;
+    if (http_urlencode(query, enc, sizeof enc) != 0)
+        return SP_ERR_OTHER;
+    n = snprintf(path, sizeof path, "/search?type=track&limit=%d&q=%s", cap > 50 ? 50 : cap, enc);
+    if (n < 0 || (size_t)n >= sizeof path)
+        return SP_ERR_OTHER;
+    rc = sp_request(c, "GET", path, NULL, &root);
+    if (rc != SP_OK)
+        return rc;
+    rc = parse_search(root, out, cap, count);
+    cJSON_Delete(root);
+    return rc;
+}
+
+int sp_play_uri(HttpClient *c, const char *device_id, const char *uri, int is_track)
+{
+    char path[SP_URL_MAX];
+    cJSON *body;
+    char *json = NULL;
+    int rc;
+
+    if (!uri || !uri[0])
+        return SP_ERR_OTHER;
+    rc = with_device(path, sizeof path, "/me/player/play", device_id);
+    if (rc != SP_OK)
+        return rc;
+    body = cJSON_CreateObject();
+    if (!body)
+        return SP_ERR_OTHER;
+    if (is_track) {
+        cJSON *uris = cJSON_AddArrayToObject(body, "uris");
+        if (uris && cJSON_AddItemToArray(uris, cJSON_CreateString(uri)))
+            json = cJSON_PrintUnformatted(body);
+    } else if (cJSON_AddStringToObject(body, "context_uri", uri)) {
+        json = cJSON_PrintUnformatted(body);
+    }
+    rc = json ? sp_request(c, "PUT", path, json, NULL) : SP_ERR_OTHER;
+    cJSON_free(json);
+    cJSON_Delete(body);
+    return rc;
+}

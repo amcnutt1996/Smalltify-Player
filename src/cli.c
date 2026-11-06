@@ -245,22 +245,44 @@ static int parse_position(const char *s, int *ms)
     return 0;
 }
 
-/* Resume on the active device; with none active, fall back to our own
- * engine if it is online so `play` works right after `engine` starts. */
-static int play_or_fallback(HttpClient *http)
+/* Start playback (uri NULL = resume) on the active device; with none active,
+ * fall back to our own engine if it is online so `play` works right after
+ * `engine` starts. */
+static int play_with_fallback(HttpClient *http, const char *uri, int is_track)
 {
     Device d;
-    int rc = sp_play(http, NULL);
+    int rc = uri ? sp_play_uri(http, NULL, uri, is_track) : sp_play(http, NULL);
 
     if (rc != SP_ERR_NODEVICE)
         return rc;
     rc = sp_find_device(http, CFG_DEVICE_NAME, &d);
     if (rc == SP_OK && d.id[0])
-        return sp_play(http, d.id);
+        return uri ? sp_play_uri(http, d.id, uri, is_track) : sp_play(http, d.id);
     if (rc != SP_OK && rc != SP_ERR_NODEVICE)
         return rc;
     fprintf(stderr, "No active device. Start one with: " CLI_PROG " engine (or open the app)\n");
     return CLI_REPORTED;
+}
+
+static int play_or_fallback(HttpClient *http)
+{
+    return play_with_fallback(http, NULL, 0);
+}
+
+/* Names and queries may contain spaces, so unquoted words are joined back
+ * together. 0 ok, -1 empty or too long. */
+static int join_args(char *out, size_t cap, int argc, char **argv)
+{
+    size_t len = 0;
+
+    out[0] = '\0';
+    for (int i = 0; i < argc; i++) {
+        int w = snprintf(out + len, cap - len, "%s%s", i > 0 ? " " : "", argv[i]);
+        if (w < 0 || (size_t)w >= cap - len)
+            return -1;
+        len += (size_t)w;
+    }
+    return len > 0 ? 0 : -1;
 }
 
 /* Commands without arguments that map 1:1 onto one sp_* call. */
@@ -410,7 +432,6 @@ static int cmd_devices(const Config *cfg, int argc, char **argv)
     return finish(auth, http, rc);
 }
 
-/* Names may contain spaces, so unquoted words are joined back together. */
 static int cmd_transfer(const Config *cfg, int argc, char **argv)
 {
     AuthStore *auth;
@@ -418,18 +439,10 @@ static int cmd_transfer(const Config *cfg, int argc, char **argv)
     Device d[SP_MAX_DEVICES];
     const Device *hit = NULL;
     char want[SP_NAME_LEN];
-    size_t len = 0;
     int n, rc;
 
-    if (argc < 2)
+    if (argc < 2 || join_args(want, sizeof want, argc - 1, argv + 1) != 0)
         return bad_usage(argv[0]);
-    want[0] = '\0';
-    for (int i = 1; i < argc; i++) {
-        int w = snprintf(want + len, sizeof want - len, "%s%s", i > 1 ? " " : "", argv[i]);
-        if (w < 0 || (size_t)w >= sizeof want - len)
-            return bad_usage(argv[0]);
-        len += (size_t)w;
-    }
     if (open_session(cfg, &auth, &http) != 0)
         return 1;
     rc = sp_get_devices(http, d, SP_MAX_DEVICES, &n);
@@ -450,6 +463,97 @@ static int cmd_transfer(const Config *cfg, int argc, char **argv)
         rc = sp_transfer(http, hit->id, 0);
     if (rc == SP_OK)
         printf("Playback moved to %s\n", hit->name);
+    return finish(auth, http, rc);
+}
+
+#define CLI_MAX_PLAYLISTS 50 /* first page of /me/playlists */
+#define CLI_MAX_RESULTS   10
+
+static int cmd_playlists(const Config *cfg, int argc, char **argv)
+{
+    AuthStore *auth;
+    HttpClient *http;
+    Playlist p[CLI_MAX_PLAYLISTS];
+    int n, rc;
+
+    if (argc != 1)
+        return bad_usage(argv[0]);
+    if (open_session(cfg, &auth, &http) != 0)
+        return 1;
+    rc = sp_get_playlists(http, p, CLI_MAX_PLAYLISTS, &n);
+    if (rc == SP_OK && n == 0)
+        printf("No playlists found.\n");
+    for (int i = 0; rc == SP_OK && i < n; i++)
+        printf("%2d. %s (%d tracks)\n", i + 1, p[i].name, p[i].track_count);
+    return finish(auth, http, rc);
+}
+
+/* `playlist <n|name>`: a number picks from the `playlists` listing; anything
+ * else must match a playlist name exactly. */
+static int cmd_playlist(const Config *cfg, int argc, char **argv)
+{
+    AuthStore *auth;
+    HttpClient *http;
+    Playlist p[CLI_MAX_PLAYLISTS];
+    const Playlist *hit = NULL;
+    char want[SP_NAME_LEN];
+    int n, idx = 0, rc;
+
+    if (argc < 2 || join_args(want, sizeof want, argc - 1, argv + 1) != 0)
+        return bad_usage(argv[0]);
+    if (open_session(cfg, &auth, &http) != 0)
+        return 1;
+    rc = sp_get_playlists(http, p, CLI_MAX_PLAYLISTS, &n);
+    if (rc == SP_OK && argc == 2 && parse_int(want, 1, CLI_MAX_PLAYLISTS, &idx) == 0 && idx <= n)
+        hit = &p[idx - 1];
+    for (int i = 0; rc == SP_OK && !hit && i < n; i++)
+        if (!strcmp(p[i].name, want))
+            hit = &p[i];
+    if (rc == SP_OK && (!hit || !hit->uri[0])) {
+        fprintf(stderr, "No playlist '%s'. List them with: " CLI_PROG " playlists\n", want);
+        rc = CLI_REPORTED;
+    }
+    if (rc == SP_OK)
+        rc = play_with_fallback(http, hit->uri, 0);
+    if (rc == SP_OK)
+        printf("Playing %s\n", hit->name);
+    return finish(auth, http, rc);
+}
+
+/* `search [-p N] <query...>`: list results, or play result N. */
+static int cmd_search(const Config *cfg, int argc, char **argv)
+{
+    AuthStore *auth;
+    HttpClient *http;
+    Track t[CLI_MAX_RESULTS];
+    char query[SP_NAME_LEN];
+    int first = 1, pick = 0, n, rc;
+
+    if (argc >= 3 && !strcmp(argv[1], "-p")) {
+        if (parse_int(argv[2], 1, CLI_MAX_RESULTS, &pick) != 0)
+            return bad_usage(argv[0]);
+        first = 3;
+    }
+    if (argc <= first || join_args(query, sizeof query, argc - first, argv + first) != 0)
+        return bad_usage(argv[0]);
+    if (open_session(cfg, &auth, &http) != 0)
+        return 1;
+    rc = sp_search_tracks(http, query, t, CLI_MAX_RESULTS, &n);
+    if (rc == SP_OK && pick) {
+        if (pick > n) {
+            fprintf(stderr, "Only %d result(s) for '%s'.\n", n, query);
+            rc = CLI_REPORTED;
+        } else {
+            rc = play_with_fallback(http, t[pick - 1].uri, 1);
+            if (rc == SP_OK)
+                printf("Playing %s - %s\n", t[pick - 1].name, t[pick - 1].artists);
+        }
+        return finish(auth, http, rc);
+    }
+    if (rc == SP_OK && n == 0)
+        printf("No results for '%s'.\n", query);
+    for (int i = 0; rc == SP_OK && i < n; i++)
+        printf("%2d. %s - %s (%s)\n", i + 1, t[i].name, t[i].artists, t[i].album);
     return finish(auth, http, rc);
 }
 
@@ -541,6 +645,9 @@ const CliCommand cli_commands[] = {
     { "repeat",   "repeat off|context|track",        cmd_repeat   },
     { "devices",  "devices",                         cmd_devices  },
     { "transfer", "transfer <name-or-id>",           cmd_transfer },
+    { "playlists", "playlists",                      cmd_playlists },
+    { "playlist", "playlist <number | name>",        cmd_playlist },
+    { "search",   "search [-p N] <query...>",        cmd_search   },
     { NULL, NULL, NULL },
 };
 

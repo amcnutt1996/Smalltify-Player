@@ -54,5 +54,9 @@ int sp_get_playlists(HttpClient *c, Playlist *out, int cap, int *count);
 int sp_search_tracks(HttpClient *c, const char *query, Track *out, int cap, int *count);
 /* Play a context (playlist/album URI) or, if is_track, a single track URI. */
 int sp_play_uri(HttpClient *c, const char *device_id, const char *uri, int is_track);
+/* Parse /me/playlists and /search?type=track bodies (no network; used by
+ * tests). SP_OK, or SP_ERR_PARSE if the expected items array is missing. */
+int sp_parse_playlists(const char *json, Playlist *out, int cap, int *count);
+int sp_parse_search(const char *json, Track *out, int cap, int *count);
 
 #endif
