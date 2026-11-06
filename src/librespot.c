@@ -25,13 +25,19 @@
  * right after opening the URL in the default browser itself. */
 #define BROWSE_PREFIX "Browse to: "
 #define AUTHED_PREFIX "Authenticated as "
+/* librespot-core's audio_key / player log these when Spotify denies the
+ * decryption keys (error code 1: a permanent, account-level refusal). */
+#define REFUSED_KEY_ERR  "error audio key"
+#define REFUSED_KEY_WARN "Unable to load key"
+#define REFUSED_STATUS   "Spotify refused local playback for this account. Pick another device."
 
 struct Librespot {
     plat_proc   *proc;
     plat_thread *reader;
-    plat_mutex  *lock;            /* guards status, login_url */
+    plat_mutex  *lock;            /* guards status, login_url, refused */
     char         status[STATUS_LEN];
     char         login_url[URL_LEN]; /* "" unless waiting for OAuth */
+    int          refused;         /* sticky: audio keys were denied */
 };
 
 static void set_login_url(Librespot *l, const char *url)
@@ -44,10 +50,22 @@ static void set_login_url(Librespot *l, const char *url)
 static void set_status(Librespot *l, const char *s, size_t n)
 {
     plat_mutex_lock(l->lock);
-    if (n >= sizeof l->status)
-        n = sizeof l->status - 1;
-    memcpy(l->status, s, n);
-    l->status[n] = '\0';
+    /* After a refusal every later line is fallout ("unable to load track",
+     * skipping, ...); keep the message the user can act on. */
+    if (!l->refused) {
+        if (n >= sizeof l->status)
+            n = sizeof l->status - 1;
+        memcpy(l->status, s, n);
+        l->status[n] = '\0';
+    }
+    plat_mutex_unlock(l->lock);
+}
+
+static void set_refused(Librespot *l)
+{
+    plat_mutex_lock(l->lock);
+    l->refused = 1;
+    snprintf(l->status, sizeof l->status, "%s", REFUSED_STATUS);
     plat_mutex_unlock(l->lock);
 }
 
@@ -67,6 +85,10 @@ static void on_line(Librespot *l, char *line, size_t n)
         static const char wait[] = "waiting for Spotify sign-in in the browser";
         set_login_url(l, line + sizeof BROWSE_PREFIX - 1);
         set_status(l, wait, sizeof wait - 1);
+        return;
+    }
+    if (strstr(line, REFUSED_KEY_ERR) || strstr(line, REFUSED_KEY_WARN)) {
+        set_refused(l);
         return;
     }
     if (line[0] == '[') {
@@ -199,6 +221,16 @@ int librespot_login_url(Librespot *l, char *buf, size_t cap)
     if (!ok)
         buf[0] = '\0';
     return ok;
+}
+
+int librespot_playback_refused(Librespot *l)
+{
+    if (!l)
+        return 0;
+    plat_mutex_lock(l->lock);
+    int r = l->refused;
+    plat_mutex_unlock(l->lock);
+    return r;
 }
 
 int librespot_has_credentials(const Config *cfg)

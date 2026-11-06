@@ -592,10 +592,17 @@ static int cmd_engine(const Config *cfg, int argc, char **argv)
     plat_thread *watch = plat_thread_start(stdin_watch, eof);
 
     char last[1024] = "", cur[1024], url[4096];
-    int saw_eof = 0, url_shown = 0;
+    int saw_eof = 0, url_shown = 0, refused_shown = 0;
     for (;;) {
         librespot_status(ls, cur, sizeof cur);
-        if (strcmp(cur, last) != 0) {
+        if (librespot_playback_refused(ls)) {
+            /* Sticky status: say it once with what to do instead. */
+            if (!refused_shown)
+                printf("%s\nControl another device instead: " CLI_PROG " devices, then "
+                       CLI_PROG " transfer <name>\n", cur);
+            refused_shown = 1;
+            snprintf(last, sizeof last, "%s", cur);
+        } else if (strcmp(cur, last) != 0) {
             printf("librespot: %s\n", cur);
             snprintf(last, sizeof last, "%s", cur);
         }

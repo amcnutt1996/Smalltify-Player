@@ -23,6 +23,10 @@ void       librespot_status(Librespot *l, char *buf, size_t cap);
 int        librespot_login_url(Librespot *l, char *buf, size_t cap);
 /* 1 if cached librespot credentials exist (no browser sign-in needed). */
 int        librespot_has_credentials(const Config *cfg);
+/* 1 once Spotify denied the audio keys (sticky until stop): this account
+ * can't play locally, so the status reads "Spotify refused local playback
+ * for this account. Pick another device." Control other devices instead. */
+int        librespot_playback_refused(Librespot *l);
 void       librespot_stop(Librespot *l); /* NULL-safe */
 
 #endif

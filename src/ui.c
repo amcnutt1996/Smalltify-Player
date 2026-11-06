@@ -63,7 +63,9 @@ typedef enum {
     CMD_SEEK, CMD_VOLUME, CMD_SHUFFLE, CMD_REPEAT,
     CMD_PLAY_URI,  /* str = URI, arg = is_track */
     CMD_PLAYLISTS, /* results land in CmdWorker.lib */
-    CMD_SEARCH     /* str = query; results land in CmdWorker.lib */
+    CMD_SEARCH,    /* str = query; results land in CmdWorker.lib */
+    CMD_DEVICES,   /* results land in CmdWorker.lib */
+    CMD_TRANSFER   /* str = device id; plays there, then refreshes devices */
 } CmdKind;
 
 typedef struct {
@@ -81,6 +83,8 @@ typedef struct {
     int      npl, pl_loaded;
     Track    hits[LIB_RESULTS];
     int      nhits, searched;
+    Device   devs[DEVICE_LIST_CAP];
+    int      ndev, devs_loaded;
 } Library;
 
 typedef struct {
@@ -97,7 +101,33 @@ typedef struct {
     uint64_t err_seq; /* bumped after every command */
     Library  lib;     /* latest playlists/search results */
     uint64_t lib_seq; /* bumped when lib changes */
+    int      no_local; /* Spotify refused our engine: never fall back to it */
 } CmdWorker;
+
+/* Our own device as the fallback target, unless Spotify refused it. */
+static int find_local(CmdWorker *w, HttpClient *h, Device *d)
+{
+    plat_mutex_lock(w->mu);
+    int no_local = w->no_local;
+    plat_mutex_unlock(w->mu);
+    return no_local ? SP_ERR_NODEVICE : sp_find_device(h, CFG_DEVICE_NAME, d);
+}
+
+static int fetch_devices(CmdWorker *w, HttpClient *h)
+{
+    static Device devs[DEVICE_LIST_CAP]; /* worker-thread only */
+    int n = 0;
+    int rc = sp_get_devices(h, devs, DEVICE_LIST_CAP, &n);
+    if (rc != SP_OK)
+        return rc;
+    plat_mutex_lock(w->mu);
+    memcpy(w->lib.devs, devs, sizeof devs);
+    w->lib.ndev = n;
+    w->lib.devs_loaded = 1;
+    w->lib_seq++;
+    plat_mutex_unlock(w->mu);
+    return rc;
+}
 
 static int run_cmd(CmdWorker *w, HttpClient *h, const Cmd *c)
 {
@@ -108,7 +138,7 @@ static int run_cmd(CmdWorker *w, HttpClient *h, const Cmd *c)
     case CMD_PLAY:
         rc = sp_play(h, NULL);
         /* Nothing active anywhere: start playback on our own device. */
-        if (rc == SP_ERR_NODEVICE && (rc = sp_find_device(h, CFG_DEVICE_NAME, &d)) == SP_OK)
+        if (rc == SP_ERR_NODEVICE && (rc = find_local(w, h, &d)) == SP_OK)
             rc = sp_transfer(h, d.id, 1);
         return rc;
     case CMD_PAUSE:   return sp_pause(h);
@@ -120,8 +150,15 @@ static int run_cmd(CmdWorker *w, HttpClient *h, const Cmd *c)
     case CMD_REPEAT:  return sp_set_repeat(h, (RepeatMode)c->arg);
     case CMD_PLAY_URI:
         rc = sp_play_uri(h, NULL, c->str, c->arg);
-        if (rc == SP_ERR_NODEVICE && (rc = sp_find_device(h, CFG_DEVICE_NAME, &d)) == SP_OK)
+        if (rc == SP_ERR_NODEVICE && (rc = find_local(w, h, &d)) == SP_OK)
             rc = sp_play_uri(h, d.id, c->str, c->arg);
+        return rc;
+    case CMD_DEVICES:
+        return fetch_devices(w, h);
+    case CMD_TRANSFER:
+        rc = sp_transfer(h, c->str, 1);
+        if (rc == SP_OK)
+            fetch_devices(w, h); /* only refreshes the marker; its error is moot */
         return rc;
     case CMD_PLAYLISTS:
     case CMD_SEARCH: {
@@ -238,6 +275,7 @@ static void cmd_post(CmdWorker *w, CmdKind kind, int arg)
 typedef struct {
     AuthStore   *auth;
     Poller      *poller;
+    Librespot   *ls;
     plat_event  *stop; /* signaled = give up now */
     plat_thread *th;
 } DeviceWorker;
@@ -254,7 +292,10 @@ static void device_thread(void *arg)
         Device me;
         if (sp_find_device(http, CFG_DEVICE_NAME, &me) != SP_OK)
             continue;
-        /* Never steal playback from another device the user is using. */
+        /* Don't pick ours once Spotify refused it, and never steal playback
+         * from another device the user is using. */
+        if (librespot_playback_refused(d->ls))
+            break;
         Device list[DEVICE_LIST_CAP];
         int n = 0, busy = 1;
         if (sp_get_devices(http, list, DEVICE_LIST_CAP, &n) == SP_OK) {
@@ -279,11 +320,12 @@ static void device_stop(DeviceWorker *d)
     memset(d, 0, sizeof *d);
 }
 
-static void device_start(DeviceWorker *d, AuthStore *auth, Poller *poller)
+static void device_start(DeviceWorker *d, AuthStore *auth, Poller *poller, Librespot *ls)
 {
     memset(d, 0, sizeof *d);
     d->auth = auth;
     d->poller = poller;
+    d->ls = ls;
     d->stop = plat_event_new();
     if (d->stop)
         d->th = plat_thread_start(device_thread, d);
@@ -365,12 +407,14 @@ static int engine_start(EngineLogin *e, const Config *cfg, Librespot *ls)
 
 /* --- UI state ------------------------------------------------------------ */
 typedef enum { SCR_SETUP, SCR_LOGIN, SCR_PLAYER } Screen;
+typedef enum { PANEL_NONE, PANEL_LIBRARY, PANEL_DEVICES } Panel;
 
 /* Widget ids for the one widget that may hold the mouse. */
 enum {
     W_NONE, W_RELOAD, W_SIGNIN, W_CANCEL, W_CONNECT, W_OPEN_URL,
     W_PREV, W_PLAY, W_NEXT, W_SEEK, W_VOLUME, W_SHUFFLE, W_REPEAT, W_LOGOUT,
-    W_LIBRARY, W_LIB_BACK, W_LIB_ROW /* + row index */
+    W_LIBRARY, W_LIB_BACK, W_DEVICES, W_DEV_REFRESH,
+    W_LIB_ROW /* + row index; library and device rows never show together */
 };
 
 enum { PEND_PLAY = 1, PEND_SEEK = 2, PEND_SHUFFLE = 4, PEND_REPEAT = 8, PEND_VOLUME = 16 };
@@ -433,8 +477,9 @@ typedef struct {
     uint64_t   art_seq;
     Texture2D  art_tex; /* id 0 = none */
 
-    /* library panel (playlists + search) */
-    int      lib_open;
+    /* side panels over the player area (one at a time) */
+    Panel    panel;
+    int      refused_seen; /* the device picker auto-opened once for a refusal */
     int      lib_scroll;
     int      lib_show_hits; /* list search results instead of playlists */
     uint64_t lib_seq;
@@ -478,6 +523,27 @@ static void fit_text(const Ui *u, const char *src, int fs, float maxw, char *out
         if (text_w(u, out, fs) <= maxw)
             return;
     }
+}
+
+/* Word-wrap src onto at most two lines of maxw; the second is cut with "...". */
+static void fit_two_lines(const Ui *u, const char *src, int fs, float maxw, char *out, size_t cap)
+{
+    size_t best = 0;
+    for (size_t i = 0; src[i] && i + 1 < cap; i++) {
+        if (src[i] != ' ')
+            continue;
+        memcpy(out, src, i);
+        out[i] = 0;
+        if (text_w(u, out, fs) > maxw)
+            break;
+        best = i;
+    }
+    fit_text(u, src, fs, maxw, out, cap);
+    if (strcmp(out, src) == 0 || best == 0)
+        return; /* fits on one line, or no word break fits */
+    memcpy(out, src, best);
+    out[best] = '\n';
+    fit_text(u, src + best + 1, fs, maxw, out + best + 1, cap - best - 1);
 }
 
 /* Hard-wrap src (a path: no spaces to break at) into lines of maxw. */
@@ -609,7 +675,9 @@ static void reset_player_state(Ui *u)
     u->ls_status[0] = u->ls_shown[0] = 0;
     u->text_dirty = 1;
     u->art_seq = 0;
-    u->lib_open = u->lib_scroll = u->lib_show_hits = 0;
+    u->panel = PANEL_NONE;
+    u->refused_seen = 0;
+    u->lib_scroll = u->lib_show_hits = 0;
     u->lib_seq = 0;
     memset(&u->lib, 0, sizeof u->lib);
     u->query[0] = 0;
@@ -657,7 +725,7 @@ static void enter_player(Ui *u)
         set_screen(u, SCR_LOGIN);
         return;
     }
-    device_start(&u->dev, u->auth, u->poller);
+    device_start(&u->dev, u->auth, u->poller, u->ls);
     u->art = art_start(ui_wake, NULL); /* not fatal: the slot stays empty */
     set_screen(u, SCR_PLAYER);
 }
@@ -996,7 +1064,9 @@ static void refresh_player_text(Ui *u, float maxw, float status_w)
         fit_text(u, s->track.album, FS_S, maxw, u->album, sizeof u->album);
     } else {
         fit_text(u, "Nothing playing", FS_L, maxw, u->title, sizeof u->title);
-        fit_text(u, "Press play, or pick this device in Spotify.", FS_S, maxw, u->artists, sizeof u->artists);
+        fit_text(u, librespot_playback_refused(u->ls) ? "Pick a device with the Devices button."
+                                                      : "Press play, or pick this device in Spotify.",
+                 FS_S, maxw, u->artists, sizeof u->artists);
         u->album[0] = 0;
     }
     fmt_time(u->t_dur, sizeof u->t_dur, s->track.duration_ms);
@@ -1008,7 +1078,7 @@ static void refresh_player_text(Ui *u, float maxw, float status_w)
              s->active && s->device_name[0] ? s->device_name : "No active device",
              err ? " | " : "", err ? sp_strerror(err) : "",
              u->ls_shown[0] ? " | " : "", u->ls_shown);
-    fit_text(u, raw, FS_S, status_w, u->status, sizeof u->status);
+    fit_two_lines(u, raw, FS_S, status_w, u->status, sizeof u->status);
     u->text_dirty = 0;
 }
 
@@ -1065,7 +1135,7 @@ static void draw_library(Ui *u, Rectangle area)
 {
     sync_library(u);
     if (IsKeyPressed(KEY_ESCAPE)) {
-        u->lib_open = 0;
+        u->panel = PANEL_NONE;
         u->redraw = 1;
         return;
     }
@@ -1145,6 +1215,46 @@ static void draw_library(Ui *u, Rectangle area)
     }
 }
 
+/* Spotify Connect devices; a click moves playback there via the worker. */
+static void draw_devices(Ui *u, Rectangle area)
+{
+    sync_library(u);
+    if (IsKeyPressed(KEY_ESCAPE)) {
+        u->panel = PANEL_NONE;
+        u->redraw = 1;
+        return;
+    }
+    float row_h = 28, gap = 6, bw = 72;
+    text(u, "Play on", area.x, area.y + 9, FS_S, C_TEXT);
+    Rectangle refresh = { area.x + area.width - bw, area.y, bw, row_h };
+    if (button(u, W_DEV_REFRESH, refresh, "Refresh", FS_S, 0))
+        cmd_post(&u->cmd, CMD_DEVICES, 0);
+
+    float y = area.y + row_h + 10;
+    if (u->lib.ndev == 0) {
+        text(u, u->lib.devs_loaded ? "No devices. Open Spotify on a phone or computer."
+                                   : "Loading devices...", area.x, y + 4, FS_S, C_DIM);
+        return;
+    }
+    int refused = librespot_playback_refused(u->ls);
+    for (int i = 0; i < u->lib.ndev && y + row_h <= area.y + area.height; i++, y += row_h + gap) {
+        const Device *d = &u->lib.devs[i];
+        Rectangle r = { area.x, y, area.width, row_h };
+        if (button(u, W_LIB_ROW + i, r, NULL, 0, d->is_active) && d->id[0]) {
+            cmd_post_str(&u->cmd, CMD_TRANSFER, 0, d->id);
+            u->panel = PANEL_NONE;
+        }
+        const char *sub = d->is_active ? "active"
+                        : refused && strcmp(d->name, CFG_DEVICE_NAME) == 0 ? "can't play"
+                        : d->type;
+        char fit[SP_NAME_LEN];
+        float sw = text_w(u, sub, FS_S);
+        fit_text(u, d->name, FS_S, r.width - sw - 28, fit, sizeof fit);
+        text(u, fit, r.x + 8, r.y + 9, FS_S, C_TEXT);
+        text(u, sub, r.x + r.width - 8 - sw, r.y + 9, FS_S, d->is_active ? C_TEXT : C_DIM);
+    }
+}
+
 static void draw_player(Ui *u)
 {
     uint64_t now = plat_now_ms();
@@ -1197,11 +1307,26 @@ static void draw_player(Ui *u)
     if (art < 64.0f)
         art = 64.0f;
     Rectangle logout = { w - PAD - 64, h - PAD - 20, 64, 20 };
-    Rectangle library = { logout.x - 8 - 64, logout.y, 64, 20 };
+    Rectangle devices = { PAD, logout.y, 64, 20 };
+    Rectangle library = { devices.x + devices.width + 8, logout.y, 64, 20 };
+    float status_y = logout.y - 28; /* up to two lines */
     if (u->text_dirty)
-        refresh_player_text(u, cw, library.x - PAD - 8);
+        refresh_player_text(u, cw, cw);
 
-    text(u, u->status, PAD, logout.y + 5, FS_S, u->cmd_err || u->poll_err ? C_ERR : C_DIM);
+    int refused = librespot_playback_refused(u->ls);
+    if (refused && !u->refused_seen) {
+        /* Once per session: this account can only drive other devices. */
+        u->refused_seen = 1;
+        plat_mutex_lock(u->cmd.mu);
+        u->cmd.no_local = 1;
+        plat_mutex_unlock(u->cmd.mu);
+        u->panel = PANEL_DEVICES;
+        cmd_post(&u->cmd, CMD_DEVICES, 0);
+        u->text_dirty = 1;
+        u->redraw = 1;
+    }
+
+    text(u, u->status, PAD, status_y, FS_S, refused || u->cmd_err || u->poll_err ? C_ERR : C_DIM);
     if (button(u, W_LOGOUT, logout, "Log out", FS_S, 0)) {
         auth_store_logout(u->auth);
         stop_session(u);
@@ -1209,13 +1334,23 @@ static void draw_player(Ui *u)
         advance_signin(u);
         return;
     }
-    if (button(u, W_LIBRARY, library, "Library", FS_S, u->lib_open)) {
-        u->lib_open = !u->lib_open;
-        if (u->lib_open && !u->lib.pl_loaded)
+    if (button(u, W_DEVICES, devices, "Devices", FS_S, u->panel == PANEL_DEVICES)) {
+        u->panel = u->panel == PANEL_DEVICES ? PANEL_NONE : PANEL_DEVICES;
+        if (u->panel == PANEL_DEVICES)
+            cmd_post(&u->cmd, CMD_DEVICES, 0); /* devices come and go: always refresh */
+    }
+    if (button(u, W_LIBRARY, library, "Library", FS_S, u->panel == PANEL_LIBRARY)) {
+        u->panel = u->panel == PANEL_LIBRARY ? PANEL_NONE : PANEL_LIBRARY;
+        if (u->panel == PANEL_LIBRARY && !u->lib.pl_loaded)
             cmd_post(&u->cmd, CMD_PLAYLISTS, 0);
     }
-    if (u->lib_open) {
-        draw_library(u, (Rectangle){ PAD, PAD, cw, logout.y - 12 - PAD });
+    Rectangle panel = { PAD, PAD, cw, status_y - 8 - PAD };
+    if (u->panel == PANEL_LIBRARY) {
+        draw_library(u, panel);
+        return;
+    }
+    if (u->panel == PANEL_DEVICES) {
+        draw_devices(u, panel);
         return;
     }
 
@@ -1268,6 +1403,13 @@ static void draw_player(Ui *u)
     }
     if (button(u, W_PLAY, rplay, NULL, 0, 1)) {
         int play = !(s->active && s->is_playing);
+        if (play && librespot_playback_refused(u->ls) &&
+            (!s->active || strcmp(s->device_name, CFG_DEVICE_NAME) == 0)) {
+            /* Playing here can't work: offer the other devices instead. */
+            u->panel = PANEL_DEVICES;
+            cmd_post(&u->cmd, CMD_DEVICES, 0);
+            return;
+        }
         u->pend.playing = play;
         u->pend.progress_ms = progress_at(s, now);
         u->pend.progress_at = now;
