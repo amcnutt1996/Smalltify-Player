@@ -155,22 +155,31 @@ const char *sp_strerror(int err)
  * State (now playing)
  * ====================================================================== */
 
-/* Smallest image at least 64 px wide: enough for the UI, cheapest to load. */
+/* Smallest image at least ART_SHARP_W wide (the GUI slot is ~330 pt, so
+ * smaller covers look blurry); if none is that big, the largest image of at
+ * least ART_MIN_W. Spotify usually offers 640/300/64, so this picks 300. */
+#define ART_SHARP_W 300
+#define ART_MIN_W   64
 static void pick_image(char *dst, size_t cap, const cJSON *images)
 {
-    const cJSON *img, *best = NULL;
-    int best_w = INT_MAX;
+    const cJSON *img, *sharp = NULL, *fallback = NULL;
+    int sharp_w = INT_MAX, fallback_w = 0;
 
     dst[0] = '\0';
     cJSON_ArrayForEach(img, images) {
         int w = json_int(img, "width", -1);
-        if (w >= 64 && w < best_w && cJSON_IsString(cJSON_GetObjectItemCaseSensitive(img, "url"))) {
-            best = img;
-            best_w = w;
+        if (w < ART_MIN_W || !cJSON_IsString(cJSON_GetObjectItemCaseSensitive(img, "url")))
+            continue;
+        if (w >= ART_SHARP_W && w < sharp_w) {
+            sharp = img;
+            sharp_w = w;
+        } else if (w < ART_SHARP_W && w > fallback_w) {
+            fallback = img;
+            fallback_w = w;
         }
     }
-    if (best)
-        json_str(dst, cap, best, "url");
+    if (sharp || fallback)
+        json_str(dst, cap, sharp ? sharp : fallback, "url");
 }
 
 /* "A, B, C" from an artists array, truncated like any other field but never
@@ -287,7 +296,9 @@ int sp_get_playback(HttpClient *c, PlaybackState *out)
 
     if (!out)
         return SP_ERR_OTHER;
-    rc = sp_request(c, "GET", "/me/player?additional_types=episode", NULL, &root);
+    /* market=from_token: Spotify then omits the per-track available_markets
+     * lists, which are most of the payload of every poll. */
+    rc = sp_request(c, "GET", "/me/player?additional_types=episode&market=from_token", NULL, &root);
     if (rc != SP_OK)
         return rc;
     if (root) {

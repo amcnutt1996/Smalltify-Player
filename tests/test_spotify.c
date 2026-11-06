@@ -44,7 +44,8 @@ static void test_track(void)
     /* Null artist names are skipped, not joined as empty entries. */
     assert(!strcmp(s.track.artists, "Daft Punk, Romanthony"));
     assert(!strcmp(s.track.album, "Discovery"));
-    assert(!strcmp(s.track.art_url, "https://i/64"));
+    /* Smallest cover that is still sharp in the GUI slot (>= 300 px). */
+    assert(!strcmp(s.track.art_url, "https://i/300"));
     assert(s.track.duration_ms == 225000);
     assert(s.fetched_at_ms == 0);
 }
@@ -89,6 +90,12 @@ static void test_missing_fields(void)
                              "[{\"url\":\"u\",\"width\":32},{\"url\":\"v\",\"width\":null}]}}}",
                              &s) == SP_OK);
     assert(s.track.art_url[0] == '\0');
+
+    /* No sharp size offered: the largest usable one still beats no art. */
+    assert(sp_parse_playback("{\"item\":{\"album\":{\"images\":[{\"url\":\"s\",\"width\":64},"
+                             "{\"url\":\"m\",\"width\":200},{\"url\":\"t\",\"width\":32}]}}}",
+                             &s) == SP_OK);
+    assert(!strcmp(s.track.art_url, "m"));
 
     /* item null (ad, private session): a device is active but no track. */
     assert(sp_parse_playback("{\"device\":{\"name\":\"D\",\"volume_percent\":0},"
@@ -277,7 +284,7 @@ static void test_search(void)
 
     assert(sp_parse_search(SEARCH_JSON, t, 4, &n) == SP_OK && n == 2);
     assert(!strcmp(t[0].uri, "spotify:track:t1") && !strcmp(t[0].artists, "A, B"));
-    assert(!strcmp(t[0].album, "Alb") && !strcmp(t[0].art_url, "small"));
+    assert(!strcmp(t[0].album, "Alb") && !strcmp(t[0].art_url, "big"));
     assert(t[0].duration_ms == 1000);
     assert(!strcmp(t[1].name, "Other") && t[1].artists[0] == '\0' && t[1].art_url[0] == '\0');
     assert(sp_parse_search(SEARCH_JSON, t, 1, &n) == SP_OK && n == 1);

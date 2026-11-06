@@ -17,7 +17,7 @@ typedef struct {
     char name[SP_NAME_LEN];
     char artists[SP_NAME_LEN]; /* "Artist A, Artist B" */
     char album[SP_NAME_LEN];
-    char art_url[SP_URL_LEN];  /* smallest image >= 64px, "" if none */
+    char art_url[SP_URL_LEN];  /* smallest image >= 300px (else largest >= 64px), "" if none */
     int  duration_ms;
 } Track;
 
