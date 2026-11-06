@@ -25,7 +25,14 @@ int main(int argc, char **argv)
     }
 
     int rc;
-    if (argc < 2)
+#ifdef __APPLE__
+    /* Older LaunchServices pass "-psn_<n>_<n>" on a Finder launch: that is
+     * still a GUI launch, not a CLI command. */
+    int gui = argc < 2 || !strncmp(argv[1], "-psn_", 5);
+#else
+    int gui = argc < 2;
+#endif
+    if (gui)
         rc = ui_run(&cfg);
     else if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help") || !strcmp(argv[1], "help")) {
         cli_usage();

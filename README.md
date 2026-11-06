@@ -16,6 +16,16 @@ data/soloist-cache/      Soloist's playback cache (capped at 100 MB)
 
 Copy or move the folder anywhere. Delete it to uninstall.
 
+## Install on macOS
+The macOS build is an app bundle: `build/dist/Spotify C Player.app` (macOS 13 or newer, Apple silicon for local playback). Drag it to `/Applications` and open it from there, Launchpad or the Dock. Always open the `.app`: double-clicking the bare `spotify-c-player` file inside it opens Terminal.
+
+Inside the bundle, the app folder above is `Spotify C Player.app/Contents/Resources` (`.env`, `soloist/`, `data/`). Drag the app to the Trash to uninstall everything. The build seeds that `.env` with the `SPOTIFY_CLIENT_ID` and `SOLOIST_API_KEY` lines of the repo `.env` (never the client secret). Without a key, paste it on the key screen and press **Save**, which writes it to the bundle's `.env`.
+
+- The app writes into its own bundle, so keep it in a folder you can write to (`/Applications` works for admin accounts). From a read-only place (a disk image, or a downloaded copy macOS runs from a temporary location), it asks you to move it first.
+- It is ad-hoc signed, not notarized. After the first run, `codesign --verify` reports the bundle as modified because of the files in `Contents/Resources`. That's expected.
+- On first pairing, macOS asks to let "Spotify C Player" find devices on your local network. Allow it, or Spotify Connect can't see the player.
+- CLI: `"/Applications/Spotify C Player.app/Contents/MacOS/spotify-c-player" now`, etc.
+
 ## Setup
 1. Create an app at https://developer.spotify.com/dashboard.
    - Add the redirect URI `http://127.0.0.1:8888/callback`.

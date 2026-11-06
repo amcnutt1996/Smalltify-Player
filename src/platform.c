@@ -144,6 +144,11 @@ const char *plat_exe_dir(void)
     return g_exe_dir[0] ? g_exe_dir : NULL;
 }
 
+const char *plat_app_dir(void)
+{
+    return plat_exe_dir();
+}
+
 int plat_mkdir(const char *path)
 {
     wchar_t *w = to_wide(path);
@@ -204,12 +209,17 @@ char *plat_read_file(const char *path, size_t max_len, size_t *out_len)
     HANDLE h = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
                            FILE_ATTRIBUTE_NORMAL, NULL);
     free(w);
-    if (h == INVALID_HANDLE_VALUE)
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        errno = (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) ? ENOENT : EIO;
         return NULL;
+    }
     LARGE_INTEGER sz;
     char *buf = NULL;
-    if (!GetFileSizeEx(h, &sz) || sz.QuadPart < 0 || (unsigned long long)sz.QuadPart > max_len)
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart < 0 || (unsigned long long)sz.QuadPart > max_len) {
+        errno = EFBIG;
         goto out;
+    }
     buf = malloc((size_t)sz.QuadPart + 1);
     if (!buf)
         goto out;
@@ -218,6 +228,7 @@ char *plat_read_file(const char *path, size_t max_len, size_t *out_len)
                             got != (DWORD)sz.QuadPart)) {
         free(buf);
         buf = NULL;
+        errno = EIO;
         goto out;
     }
     buf[got] = '\0';
@@ -301,8 +312,43 @@ int plat_open_url(const char *url)
     return (INT_PTR)r > 32 ? 0 : -1;
 }
 
+static int std_handle_ok(HANDLE h)
+{
+    return h && h != INVALID_HANDLE_VALUE;
+}
+
+static void reopen_std(const char *name, const char *mode, FILE *stream)
+{
+#ifdef _MSC_VER
+    FILE *f;
+    (void)freopen_s(&f, name, mode, stream);
+#else
+    (void)freopen(name, mode, stream);
+#endif
+}
+
+/* The exe is GUI-subsystem so that launching it never opens a console
+ * window. A CLI command borrows the console of the shell that started it;
+ * streams the shell already redirected (pipes, files) are kept. */
+static void attach_parent_console(void)
+{
+    HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    if (!AttachConsole(ATTACH_PARENT_PROCESS))
+        return; /* started from Explorer or a pipe: nothing to print to */
+    if (!std_handle_ok(out))
+        reopen_std("CONOUT$", "w", stdout);
+    if (!std_handle_ok(err))
+        reopen_std("CONOUT$", "w", stderr);
+    if (!std_handle_ok(in))
+        reopen_std("CONIN$", "r", stdin);
+}
+
 int plat_startup(int *argc, char ***argv)
 {
+    if (*argc > 1)
+        attach_parent_console();
     SetConsoleOutputCP(CP_UTF8); /* fails harmlessly without a console */
     int n;
     wchar_t **wv = CommandLineToArgvW(GetCommandLineW(), &n);
@@ -728,6 +774,7 @@ void plat_close(plat_sock s)
 #include <sys/wait.h>
 #include <unistd.h>
 #ifdef __APPLE__
+#include <CoreServices/CoreServices.h> /* Apple events: the quit event */
 #include <mach-o/dyld.h>
 #endif
 #ifdef __linux__
@@ -765,6 +812,41 @@ const char *plat_exe_dir(void)
     pthread_once(&g_exe_once, exe_dir_init);
     return g_exe_dir[0] ? g_exe_dir : NULL;
 }
+
+#ifdef __APPLE__
+static char g_app_dir[PLAT_PATH_MAX];
+static pthread_once_t g_app_once = PTHREAD_ONCE_INIT;
+
+/* Finder-launched or not, a bundle keeps its data in Contents/Resources:
+ * dragging the .app to the Trash then removes everything. */
+static void app_dir_init(void)
+{
+    static const char tail[] = ".app/Contents/MacOS";
+    const char *exe = plat_exe_dir();
+    if (!exe)
+        return;
+    size_t n = strlen(exe), t = sizeof tail - 1;
+    int k;
+    if (n > t && exe[n - t - 1] != '/' && !strcmp(exe + n - t, tail))
+        k = snprintf(g_app_dir, sizeof g_app_dir, "%.*s/Resources",
+                     (int)(n - (sizeof "/MacOS" - 1)), exe);
+    else
+        k = snprintf(g_app_dir, sizeof g_app_dir, "%s", exe);
+    if (k < 0 || (size_t)k >= sizeof g_app_dir)
+        g_app_dir[0] = '\0';
+}
+
+const char *plat_app_dir(void)
+{
+    pthread_once(&g_app_once, app_dir_init);
+    return g_app_dir[0] ? g_app_dir : NULL;
+}
+#else
+const char *plat_app_dir(void)
+{
+    return plat_exe_dir();
+}
+#endif
 
 static int set_cloexec(int fd)
 {
@@ -814,6 +896,20 @@ static void *quit_thread(void *arg)
     }
 }
 
+#ifdef __APPLE__
+/* A quit Apple event (the Dock's Quit, logout, `osascript ... to quit`) is
+ * handled inside AppKit's event wait without ending it, so the GUI loop
+ * would sleep on; treat it exactly like a quit signal. */
+static OSErr quit_apple_event(const AppleEvent *ev, AppleEvent *reply, SRefCon ref)
+{
+    (void)ev;
+    (void)reply;
+    (void)ref;
+    quit_signal(0);
+    return noErr;
+}
+#endif
+
 /* Caller holds g_quit_lock. */
 static int quit_install(void)
 {
@@ -851,6 +947,12 @@ static int quit_install(void)
         if (sigaction(sigs[i], &sa, NULL) != 0)
             rc = -1;
     }
+#ifdef __APPLE__
+    /* Replaces AppKit's own handler, which needs a running GUI loop. */
+    if (AEInstallEventHandler(kCoreEventClass, kAEQuitApplication,
+                              NewAEEventHandlerUPP(quit_apple_event), 0, false) != noErr)
+        rc = -1;
+#endif
     return rc;
 }
 
@@ -920,8 +1022,10 @@ char *plat_read_file(const char *path, size_t max_len, size_t *out_len)
     struct stat st;
     char *buf = NULL;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
-        (unsigned long long)st.st_size > max_len)
+        (unsigned long long)st.st_size > max_len) {
+        errno = EFBIG; /* anything but ENOENT: the file is there */
         goto out;
+    }
     size_t size = (size_t)st.st_size, got = 0;
     buf = malloc(size + 1);
     if (!buf)

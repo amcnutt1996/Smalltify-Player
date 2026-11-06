@@ -1,10 +1,12 @@
-/* App configuration + token persistence. Everything lives in the app folder:
- *   <exe_dir>/.env                 SPOTIFY_CLIENT_ID=..., SOLOIST_API_KEY=... (user-edited)
- *   <exe_dir>/soloist/             Spotify Soloist, downloaded at runtime
- *   <exe_dir>/data/token.json      OAuth tokens (owner-only perms)
- *   <exe_dir>/data/soloist/        Soloist device state + paired session
- *   <exe_dir>/data/soloist-cache/  Soloist playback cache (100 MB cap)
- * Nothing is ever written outside <exe_dir>. */
+/* App configuration + token persistence. Everything lives in the app folder
+ * (plat_app_dir: the exe's directory, or Contents/Resources in a macOS
+ * bundle):
+ *   <app>/.env                 SPOTIFY_CLIENT_ID=..., SOLOIST_API_KEY=... (user-edited)
+ *   <app>/soloist/             Spotify Soloist, downloaded at runtime
+ *   <app>/data/token.json      OAuth tokens (owner-only perms)
+ *   <app>/data/soloist/        Soloist device state + paired session
+ *   <app>/data/soloist-cache/  Soloist playback cache (100 MB cap)
+ * Nothing is ever written outside <app>. */
 #ifndef CONFIG_H
 #define CONFIG_H
 
@@ -18,7 +20,10 @@
 typedef struct {
     char client_id[128];             /* "" if not configured yet */
     char soloist_key[256];           /* "" if not configured; secret, never log */
+    int  read_only;                  /* app folder not writable (e.g. a translocated
+                                        or read-only-volume .app): data can't be saved */
     char app_dir[CFG_PATH_LEN];
+    char env_path[CFG_PATH_LEN];     /* <app>/.env */
     char data_dir[CFG_PATH_LEN];
     char token_path[CFG_PATH_LEN];
     char soloist_dir[CFG_PATH_LEN];  /* <app>/soloist */
@@ -51,5 +56,16 @@ int config_clear_login(const Config *c);
  * wins; unknown keys are ignored). Pure, exposed for tests.
  * 0 found (out filled), -1 absent or value longer than cap-1. */
 int config_env_lookup(const char *text, const char *key, char *out, size_t cap);
+
+/* Pure, exposed for tests: text with every line that assigns key replaced
+ * by "key=value" (its line ending kept), or that line appended if there is
+ * none; every other line stays verbatim. malloc'd; NULL if out of memory. */
+char *config_env_set(const char *text, const char *key, const char *value);
+
+/* Write key=value into <app>/.env through config_env_set: an atomic
+ * replace with owner-only perms, created if missing. value must be
+ * printable ASCII without blanks, quotes or a leading '#', so it reads back
+ * unchanged. Does not reload c. Never logs the value. 0 ok, -1 error. */
+int config_set_env_value(const Config *c, const char *key, const char *value);
 
 #endif

@@ -1,6 +1,7 @@
 /* App folder paths, .env parsing and token persistence (data/token.json). */
 #include "config.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,13 +49,29 @@ static int parse_value(const char *v, const char *end, const char **vs, const ch
     return 0;
 }
 
+/* If the line [s, end) assigns key (optionally after "export "), returns
+ * the position right after its '='; else NULL. */
+static const char *match_key(const char *s, const char *end, const char *key, size_t klen)
+{
+    s = skip_blank(s, end);
+    if ((size_t)(end - s) > 7 && !strncmp(s, "export", 6) && is_blank(s[6]))
+        s = skip_blank(s + 6, end);
+    if ((size_t)(end - s) <= klen || strncmp(s, key, klen))
+        return NULL;
+    const char *eq = skip_blank(s + klen, end);
+    return (eq < end && *eq == '=') ? eq + 1 : NULL;
+}
+
+static const char *skip_bom(const char *p)
+{
+    return strncmp(p, "\xEF\xBB\xBF", 3) ? p : p + 3; /* Notepad-style UTF-8 BOM */
+}
+
 int config_env_lookup(const char *text, const char *key, char *out, size_t cap)
 {
     size_t klen = strlen(key);
     int found = -1;
-    const char *p = text;
-    if (!strncmp(p, "\xEF\xBB\xBF", 3)) /* Notepad-style UTF-8 BOM */
-        p += 3;
+    const char *p = skip_bom(text);
     while (*p) {
         const char *eol = strchr(p, '\n');
         if (!eol)
@@ -62,25 +79,79 @@ int config_env_lookup(const char *text, const char *key, char *out, size_t cap)
         const char *end = eol;
         if (end > p && end[-1] == '\r')
             end--;
-        const char *s = skip_blank(p, end);
-        if ((size_t)(end - s) > 7 && !strncmp(s, "export", 6) && is_blank(s[6]))
-            s = skip_blank(s + 6, end);
-        if ((size_t)(end - s) > klen && !strncmp(s, key, klen)) {
-            const char *eq = skip_blank(s + klen, end), *vs, *ve;
-            if (eq < end && *eq == '=' && parse_value(eq + 1, end, &vs, &ve) == 0) {
-                size_t n = (size_t)(ve - vs);
-                if (n < cap) {
-                    memcpy(out, vs, n);
-                    out[n] = '\0';
-                    found = 0;
-                } else {
-                    found = -1; /* the last assignment wins, even a bad one */
-                }
+        const char *v = match_key(p, end, key, klen), *vs, *ve;
+        if (v && parse_value(v, end, &vs, &ve) == 0) {
+            size_t n = (size_t)(ve - vs);
+            if (n < cap) {
+                memcpy(out, vs, n);
+                out[n] = '\0';
+                found = 0;
+            } else {
+                found = -1; /* the last assignment wins, even a bad one */
             }
         }
         p = *eol ? eol + 1 : eol;
     }
     return found;
+}
+
+/* Appends n bytes at out + o unless out is NULL (the sizing pass). */
+static size_t put(char *out, size_t o, const char *s, size_t n)
+{
+    if (out)
+        memcpy(out + o, s, n);
+    return o + n;
+}
+
+/* One pass of config_env_set; returns the output length. */
+static size_t env_set(char *out, const char *text, const char *key, const char *value)
+{
+    size_t klen = strlen(key), vlen = strlen(value);
+    const char *body = skip_bom(text), *p = body;
+    size_t o = put(out, 0, text, (size_t)(body - text));
+    int found = 0, crlf = 0;
+    while (*p) {
+        const char *eol = strchr(p, '\n');
+        if (!eol)
+            eol = p + strlen(p);
+        const char *end = eol;
+        if (end > p && end[-1] == '\r')
+            end--;
+        crlf |= end != eol; /* a CRLF file gets a CRLF line appended */
+        if (match_key(p, end, key, klen)) {
+            found = 1;
+            o = put(out, o, key, klen);
+            o = put(out, o, "=", 1);
+            o = put(out, o, value, vlen);
+            o = put(out, o, end, (size_t)(eol - end)); /* keep a CR */
+        } else {
+            o = put(out, o, p, (size_t)(eol - p));
+        }
+        if (*eol)
+            o = put(out, o, "\n", 1);
+        p = *eol ? eol + 1 : eol;
+    }
+    if (!found) {
+        const char *nl = crlf ? "\r\n" : "\n";
+        if (p > body && p[-1] != '\n')
+            o = put(out, o, nl, strlen(nl));
+        o = put(out, o, key, klen);
+        o = put(out, o, "=", 1);
+        o = put(out, o, value, vlen);
+        o = put(out, o, nl, strlen(nl));
+    }
+    return o;
+}
+
+char *config_env_set(const char *text, const char *key, const char *value)
+{
+    size_t n = env_set(NULL, text, key, value);
+    char *out = malloc(n + 1);
+    if (!out)
+        return NULL;
+    env_set(out, text, key, value);
+    out[n] = '\0';
+    return out;
 }
 
 /* The env var wins; else the .env line. Too long or absent leaves "". */
@@ -100,11 +171,10 @@ static void load_setting(const char *env_text, const char *key, char *out, size_
 int config_load(Config *c)
 {
     memset(c, 0, sizeof *c);
-    const char *exe = plat_exe_dir();
-    if (!exe)
+    const char *app = plat_app_dir();
+    if (!app)
         return -1;
-    char env_path[CFG_PATH_LEN];
-    int n = snprintf(c->app_dir, sizeof c->app_dir, "%s", exe);
+    int n = snprintf(c->app_dir, sizeof c->app_dir, "%s", app);
     if (n < 0 || (size_t)n >= sizeof c->app_dir ||
         plat_path_join(c->data_dir, sizeof c->data_dir, c->app_dir, "data") != 0 ||
         plat_path_join(c->token_path, sizeof c->token_path, c->data_dir, "token.json") != 0 ||
@@ -114,22 +184,51 @@ int config_load(Config *c)
         plat_path_join(c->soloist_data, sizeof c->soloist_data, c->data_dir, "soloist") != 0 ||
         plat_path_join(c->soloist_cache, sizeof c->soloist_cache, c->data_dir,
                        "soloist-cache") != 0 ||
-        plat_path_join(env_path, sizeof env_path, c->app_dir, ".env") != 0)
+        plat_path_join(c->env_path, sizeof c->env_path, c->app_dir, ".env") != 0)
         return -1;
     snprintf(c->redirect_uri, sizeof c->redirect_uri, "http://127.0.0.1:%d/callback",
              CFG_REDIRECT_PORT);
 
-    /* Not fatal: a read-only app folder still allows `help`; saving the
-     * token reports the failure later. */
-    (void)plat_mkdir(c->data_dir);
+    /* Not fatal: a read-only app folder still allows `help`; the GUI says
+     * to move the app, and saving the token reports the failure later. */
+    c->read_only = plat_mkdir(c->data_dir) != 0;
 
     /* Only these two keys are extracted; every other one (secrets
      * included) is ignored and the text is released right away. */
-    char *text = plat_read_file(env_path, ENV_MAX_BYTES, NULL);
+    char *text = plat_read_file(c->env_path, ENV_MAX_BYTES, NULL);
     load_setting(text, "SPOTIFY_CLIENT_ID", c->client_id, sizeof c->client_id);
     load_setting(text, "SOLOIST_API_KEY", c->soloist_key, sizeof c->soloist_key);
     free(text);
     return 0;
+}
+
+/* Characters a value may hold so that config_env_lookup reads it back
+ * unchanged: printable ASCII without blanks, and no leading quote or '#'. */
+static int env_value_ok(const char *v)
+{
+    if (!v[0] || v[0] == '"' || v[0] == '\'' || v[0] == '#')
+        return 0;
+    for (; *v; v++)
+        if (*v <= ' ' || *v > '~')
+            return 0;
+    return 1;
+}
+
+int config_set_env_value(const Config *c, const char *key, const char *value)
+{
+    if (!env_value_ok(value))
+        return -1;
+    errno = 0;
+    char *text = plat_read_file(c->env_path, ENV_MAX_BYTES, NULL);
+    if (!text && errno != ENOENT)
+        return -1; /* there but unreadable or huge: never clobber it */
+    char *out = config_env_set(text ? text : "", key, value);
+    free(text);
+    if (!out)
+        return -1;
+    int rc = plat_write_file_atomic(c->env_path, out, strlen(out));
+    free(out);
+    return rc;
 }
 
 int config_load_token(const Config *c, Token *t)

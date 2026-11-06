@@ -15,9 +15,13 @@
 #endif
 
 /* --- paths / files ------------------------------------------------------ */
-/* Absolute directory of the running executable, no trailing separator.
- * All app data lives under here (portable: nothing written elsewhere). */
+/* Absolute directory of the running executable, no trailing separator. */
 const char *plat_exe_dir(void);
+/* The app folder: all app data lives under here (portable: nothing written
+ * elsewhere). The exe dir, except in a macOS bundle (X.app/Contents/MacOS)
+ * where it is X.app/Contents/Resources, so the bundle stays self-contained.
+ * NULL if the exe dir is unknown. */
+const char *plat_app_dir(void);
 /* out = a + SEP + b. Returns 0, or -1 if truncated. */
 int  plat_path_join(char *out, size_t cap, const char *a, const char *b);
 /* Create dir if missing (owner-only perms). 0 ok/exists, -1 error. */
@@ -27,7 +31,8 @@ int  plat_mkdir(const char *path);
 int  plat_write_file_atomic(const char *path, const void *data, size_t len);
 /* Read a whole file (at most max_len bytes, else error) into a malloc'd,
  * NUL-terminated buffer; *out_len gets the length (may be NULL). Caller
- * frees. NULL if missing/unreadable/too big. UTF-8 paths on every OS. */
+ * frees. NULL if missing/unreadable/too big; errno is ENOENT only when the
+ * file does not exist. UTF-8 paths on every OS. */
 char *plat_read_file(const char *path, size_t max_len, size_t *out_len);
 /* Delete a file or a directory tree (symlinks are not followed).
  * 0 if gone afterwards (including "did not exist"), -1 error. */
@@ -38,13 +43,15 @@ int  plat_random_bytes(void *buf, size_t len);
 int  plat_open_url(const char *url);
 
 /* --- process lifetime --------------------------------------------------- */
-/* Call first in main(). Win32: UTF-8 console output, and *argv rebuilt as
- * UTF-8 from the wide command line (the CRT's argv uses the ANSI code
- * page). POSIX: ignore SIGPIPE, since a socket closed by the peer must not
+/* Call first in main(). Win32: with a command (*argc > 1) the GUI-subsystem
+ * exe attaches to its parent's console for stdio; UTF-8 console output, and
+ * *argv rebuilt as UTF-8 from the wide command line (the CRT's argv uses the
+ * ANSI code page). POSIX: ignore SIGPIPE, since a socket closed by the peer must not
  * kill us and curl's NOSIGNAL mode leaves that to the application.
  * 0 ok, -1 error. */
 int  plat_startup(int *argc, char ***argv);
-/* Turn SIGINT/SIGTERM/SIGHUP (Win32: console Ctrl-C/Break/close) into a quit
+/* Turn SIGINT/SIGTERM/SIGHUP (Win32: console Ctrl-C/Break/close; macOS also
+ * the quit Apple event, so call it after the window exists) into a quit
  * request instead of instant death, so the caller can stop its children.
  * on_quit(ud) then runs on a helper thread, never in signal context, and
  * may be NULL. Later calls only swap the callback: once a call returns, the
