@@ -32,6 +32,13 @@ void        http_client_free(HttpClient *c);
 /* Abort any response body larger than max bytes while it downloads
  * (http_request then returns -1). 0 = no limit, the default. */
 void        http_client_set_max_body(HttpClient *c, size_t max);
+/* Large downloads: fn(ud, received, total) runs on the calling thread
+ * while a response body arrives (total 0 while unknown); nonzero aborts
+ * the transfer (http_request then returns -1). With fn set, the 15 s
+ * request timeout is replaced by a stall timeout (under 1 KB/s for 30 s),
+ * so slow links still finish. fn NULL restores the defaults. */
+typedef int (*HttpProgressFn)(void *ud, size_t received, size_t total);
+void        http_client_set_progress(HttpClient *c, HttpProgressFn fn, void *ud);
 
 /* method: "GET" "PUT" "POST" "DELETE". body/content_type may be NULL.
  * With auth: adds "Authorization: Bearer", on 401 calls refresh once and

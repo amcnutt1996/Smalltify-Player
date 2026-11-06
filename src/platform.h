@@ -89,12 +89,19 @@ plat_proc *plat_proc_spawn(const char *const argv[]);
 /* Blocking read of child output. Returns bytes read, 0 on EOF, -1 error. */
 long       plat_proc_read(plat_proc *p, char *buf, size_t cap);
 int        plat_proc_alive(plat_proc *p);
+/* Wait up to timeout_ms for the child to exit on its own. Returns its exit
+ * code (0-255), or -1 if still running, killed by a signal, or on error. */
+int        plat_proc_wait(plat_proc *p, unsigned timeout_ms);
 /* Terminate (graceful, then forced after 2 s) and reap, but keep p valid:
  * a reader thread blocked in plat_proc_read then sees EOF and can be
  * joined before plat_proc_kill frees p. Idempotent. */
 void       plat_proc_terminate(plat_proc *p);
 /* Terminate (graceful, then forced), reap, free. NULL-safe. */
 void       plat_proc_kill(plat_proc *p);
+/* Extract a .tar.gz (POSIX) or .zip (Win32) into dir with the OS's own
+ * tar (built into macOS, Linux and Windows 10 1803+). Blocks until tar
+ * exits. 0 ok, -1 error. */
+int        plat_untar(const char *archive, const char *dir);
 
 /* --- loopback TCP (OAuth redirect listener) ----------------------------- */
 typedef intptr_t plat_sock;

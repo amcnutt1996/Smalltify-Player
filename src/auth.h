@@ -7,7 +7,7 @@
 #include "http.h"
 
 /* Scopes: playback read/modify, currently-playing, playlists, library.
- * No "streaming": librespot signs in on its own (see librespot.c). */
+ * No "streaming": Soloist plays with its own paired session (soloist.h). */
 #define AUTH_SCOPES "user-read-playback-state user-modify-playback-state " \
                     "user-read-currently-playing playlist-read-private " \
                     "playlist-read-collaborative user-library-read"

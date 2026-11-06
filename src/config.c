@@ -83,6 +83,20 @@ int config_env_lookup(const char *text, const char *key, char *out, size_t cap)
     return found;
 }
 
+/* The env var wins; else the .env line. Too long or absent leaves "". */
+static void load_setting(const char *env_text, const char *key, char *out, size_t cap)
+{
+    const char *env = getenv(key);
+    if (env && env[0]) {
+        int n = snprintf(out, cap, "%s", env);
+        if (n < 0 || (size_t)n >= cap)
+            out[0] = '\0';
+        return;
+    }
+    if (!env_text || config_env_lookup(env_text, key, out, cap) != 0)
+        out[0] = '\0';
+}
+
 int config_load(Config *c)
 {
     memset(c, 0, sizeof *c);
@@ -94,10 +108,12 @@ int config_load(Config *c)
     if (n < 0 || (size_t)n >= sizeof c->app_dir ||
         plat_path_join(c->data_dir, sizeof c->data_dir, c->app_dir, "data") != 0 ||
         plat_path_join(c->token_path, sizeof c->token_path, c->data_dir, "token.json") != 0 ||
-        plat_path_join(c->librespot_path, sizeof c->librespot_path, c->app_dir,
-                       "librespot" PLAT_EXE_SUFFIX) != 0 ||
-        plat_path_join(c->librespot_cache, sizeof c->librespot_cache, c->data_dir,
-                       "librespot") != 0 ||
+        plat_path_join(c->soloist_dir, sizeof c->soloist_dir, c->app_dir, "soloist") != 0 ||
+        plat_path_join(c->soloist_path, sizeof c->soloist_path, c->soloist_dir,
+                       "soloist" PLAT_EXE_SUFFIX) != 0 ||
+        plat_path_join(c->soloist_data, sizeof c->soloist_data, c->data_dir, "soloist") != 0 ||
+        plat_path_join(c->soloist_cache, sizeof c->soloist_cache, c->data_dir,
+                       "soloist-cache") != 0 ||
         plat_path_join(env_path, sizeof env_path, c->app_dir, ".env") != 0)
         return -1;
     snprintf(c->redirect_uri, sizeof c->redirect_uri, "http://127.0.0.1:%d/callback",
@@ -107,21 +123,12 @@ int config_load(Config *c)
      * token reports the failure later. */
     (void)plat_mkdir(c->data_dir);
 
-    const char *env = getenv("SPOTIFY_CLIENT_ID");
-    if (env && env[0]) {
-        n = snprintf(c->client_id, sizeof c->client_id, "%s", env);
-        if (n < 0 || (size_t)n >= sizeof c->client_id)
-            c->client_id[0] = '\0';
-        return 0;
-    }
-    /* Only SPOTIFY_CLIENT_ID is extracted; every other key (secrets
+    /* Only these two keys are extracted; every other one (secrets
      * included) is ignored and the text is released right away. */
     char *text = plat_read_file(env_path, ENV_MAX_BYTES, NULL);
-    if (text) {
-        if (config_env_lookup(text, "SPOTIFY_CLIENT_ID", c->client_id, sizeof c->client_id) != 0)
-            c->client_id[0] = '\0';
-        free(text);
-    }
+    load_setting(text, "SPOTIFY_CLIENT_ID", c->client_id, sizeof c->client_id);
+    load_setting(text, "SOLOIST_API_KEY", c->soloist_key, sizeof c->soloist_key);
+    free(text);
     return 0;
 }
 
@@ -179,6 +186,6 @@ int config_save_token(const Config *c, const Token *t)
 int config_clear_login(const Config *c)
 {
     int a = plat_remove_tree(c->token_path);
-    int b = plat_remove_tree(c->librespot_cache);
+    int b = plat_remove_tree(c->soloist_data); /* the paired Connect session */
     return (a == 0 && b == 0) ? 0 : -1;
 }

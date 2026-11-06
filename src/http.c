@@ -10,6 +10,8 @@
 #define HTTP_USER_AGENT        "spotify-c-player/0.1"
 #define HTTP_CONNECT_TIMEOUT_MS 5000L
 #define HTTP_TOTAL_TIMEOUT_MS   15000L
+#define HTTP_STALL_BYTES_PER_S  1024L /* download mode: slower than this... */
+#define HTTP_STALL_S            30L   /* ...for this long aborts */
 #define HTTP_RETRY_AFTER_MAX_S  5
 #define HTTP_BUF_INITIAL        16384
 #define HTTP_TOKEN_LEN          2048 /* matches Token.access in config.h */
@@ -24,6 +26,8 @@ struct HttpClient {
     size_t   len;
     size_t   cap;
     size_t   max_body; /* 0 = unlimited */
+    HttpProgressFn progress;
+    void    *progress_ud;
 };
 
 int http_global_init(void)
@@ -112,6 +116,33 @@ void http_client_set_max_body(HttpClient *c, size_t max)
 {
     if (c)
         c->max_body = max;
+}
+
+static int on_xfer(void *ud, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal,
+                   curl_off_t ulnow)
+{
+    (void)ultotal;
+    (void)ulnow;
+    HttpClient *c = ud;
+    return c->progress(c->progress_ud, dlnow > 0 ? (size_t)dlnow : 0,
+                       dltotal > 0 ? (size_t)dltotal : 0) ? 1 : 0;
+}
+
+void http_client_set_progress(HttpClient *c, HttpProgressFn fn, void *ud)
+{
+    if (!c)
+        return;
+    c->progress = fn;
+    c->progress_ud = ud;
+    CURL *h = c->h;
+    /* Best effort like the other tuning options: without them a download
+     * just keeps the default limits. */
+    (void)curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, fn ? 0L : HTTP_TOTAL_TIMEOUT_MS);
+    (void)curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, fn ? HTTP_STALL_BYTES_PER_S : 0L);
+    (void)curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, fn ? HTTP_STALL_S : 0L);
+    (void)curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, fn ? on_xfer : NULL);
+    (void)curl_easy_setopt(h, CURLOPT_XFERINFODATA, fn ? (void *)c : NULL);
+    (void)curl_easy_setopt(h, CURLOPT_NOPROGRESS, fn ? 0L : 1L);
 }
 
 void http_response_free(HttpResponse *r)

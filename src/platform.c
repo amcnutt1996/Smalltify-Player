@@ -587,6 +587,15 @@ int plat_proc_alive(plat_proc *p)
     return p && WaitForSingleObject(p->process, 0) == WAIT_TIMEOUT;
 }
 
+int plat_proc_wait(plat_proc *p, unsigned timeout_ms)
+{
+    DWORD code;
+    if (!p || WaitForSingleObject(p->process, timeout_ms) != WAIT_OBJECT_0 ||
+        !GetExitCodeProcess(p->process, &code) || code > 255)
+        return -1;
+    return (int)code;
+}
+
 void plat_proc_terminate(plat_proc *p)
 {
     if (!p)
@@ -612,6 +621,18 @@ void plat_proc_kill(plat_proc *p)
         CloseHandle(p->job);
     free(p);
 }
+
+/* System32's tar.exe, never one found through PATH or the current dir. */
+static int tar_path(char *out, size_t cap)
+{
+    wchar_t sys[MAX_PATH + 16];
+    UINT n = GetSystemDirectoryW(sys, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH)
+        return -1;
+    wmemcpy(sys + n, L"\\tar.exe", 9);
+    return from_wide(sys, out, cap);
+}
+#define TAR_EXTRACT "-xf" /* bsdtar reads .zip too */
 
 /* --- loopback TCP --- */
 static INIT_ONCE g_wsa_once = INIT_ONCE_STATIC_INIT;
@@ -1125,6 +1146,7 @@ struct plat_proc {
     pid_t pid;
     int out;
     int reaped;
+    int code;       /* exit code once reaped, -1 if signaled/unknown */
     pid_t guard;    /* watchdog process, 0 if none */
     int guard_fd;   /* our end of the watchdog's pipe, -1 if none */
     pthread_mutex_t lock; /* serializes waitpid between alive/terminate */
@@ -1313,11 +1335,28 @@ long plat_proc_read(plat_proc *p, char *buf, size_t cap)
 static int reap_nohang(plat_proc *p)
 {
     if (!p->reaped) {
-        pid_t r = waitpid(p->pid, NULL, WNOHANG);
+        int st = 0;
+        pid_t r = waitpid(p->pid, &st, WNOHANG);
         if (r == p->pid || (r < 0 && errno == ECHILD)) {
             p->reaped = 1;
+            p->code = r == p->pid && WIFEXITED(st) ? WEXITSTATUS(st) : -1;
             stop_guard(p);
         }
+    }
+    return p->reaped;
+}
+
+/* Caller holds p->lock. POSIX has no timed waitpid; back off from 1 ms to
+ * 64 ms so the usual quick exit is reaped fast with only a few dozen
+ * wakeups. Returns 1 once reaped. */
+static int reap_within(plat_proc *p, unsigned timeout_ms)
+{
+    uint64_t deadline = plat_now_ms() + timeout_ms;
+    unsigned step = 1;
+    while (!reap_nohang(p) && plat_now_ms() < deadline) {
+        plat_sleep_ms(step);
+        if (step < 64)
+            step *= 2;
     }
     return p->reaped;
 }
@@ -1332,6 +1371,16 @@ int plat_proc_alive(plat_proc *p)
     return alive;
 }
 
+int plat_proc_wait(plat_proc *p, unsigned timeout_ms)
+{
+    if (!p)
+        return -1;
+    pthread_mutex_lock(&p->lock);
+    int code = reap_within(p, timeout_ms) ? p->code : -1;
+    pthread_mutex_unlock(&p->lock);
+    return code;
+}
+
 void plat_proc_terminate(plat_proc *p)
 {
     if (!p)
@@ -1340,20 +1389,12 @@ void plat_proc_terminate(plat_proc *p)
     if (!reap_nohang(p)) {
         stop_guard(p);
         kill(p->pid, SIGTERM);
-        /* POSIX has no timed waitpid; back off from 1 ms to 64 ms so the
-         * usual quick exit is reaped fast with only a few dozen wakeups. */
-        uint64_t deadline = plat_now_ms() + 2000;
-        unsigned step = 1;
-        while (!reap_nohang(p) && plat_now_ms() < deadline) {
-            plat_sleep_ms(step);
-            if (step < 64)
-                step *= 2;
-        }
-        if (!p->reaped) {
+        if (!reap_within(p, 2000)) {
             kill(p->pid, SIGKILL);
             while (waitpid(p->pid, NULL, 0) < 0 && errno == EINTR) {
             }
             p->reaped = 1;
+            p->code = -1;
         }
     }
     pthread_mutex_unlock(&p->lock);
@@ -1368,6 +1409,16 @@ void plat_proc_kill(plat_proc *p)
     pthread_mutex_destroy(&p->lock);
     free(p);
 }
+
+static int tar_path(char *out, size_t cap)
+{
+    /* Absolute path: plat_proc_spawn doesn't search PATH. Older non-merged
+     * /usr Linux systems only have /bin/tar. */
+    const char *tar = access("/usr/bin/tar", X_OK) == 0 ? "/usr/bin/tar" : "/bin/tar";
+    int n = snprintf(out, cap, "%s", tar);
+    return n > 0 && (size_t)n < cap ? 0 : -1;
+}
+#define TAR_EXTRACT "-xzf"
 
 /* Reaps the opener so it never lingers as a zombie. */
 static void *reap_thread(void *arg)
@@ -1496,3 +1547,21 @@ void plat_close(plat_sock s)
 }
 
 #endif
+
+/* --- archive extraction (both OSes, on top of plat_proc) --- */
+int plat_untar(const char *archive, const char *dir)
+{
+    char tar[PLAT_PATH_MAX];
+    if (tar_path(tar, sizeof tar) != 0)
+        return -1;
+    const char *argv[] = { tar, TAR_EXTRACT, archive, "-C", dir, NULL };
+    plat_proc *p = plat_proc_spawn(argv);
+    if (!p)
+        return -1;
+    char buf[512];
+    while (plat_proc_read(p, buf, sizeof buf) > 0) {
+    } /* drain: a full pipe would stall tar */
+    int code = plat_proc_wait(p, 60000);
+    plat_proc_kill(p);
+    return code == 0 ? 0 : -1;
+}

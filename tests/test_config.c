@@ -2,6 +2,7 @@
  * scratch folder next to the test binary (inside build/). */
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "config.h"
@@ -52,6 +53,9 @@ static void test_env(void)
     expect("SPOTIFY_CLIENT_ID=first\nSPOTIFY_CLIENT_ID=second\n", "second"); /* last wins */
     expect("A=1\r\nSPOTIFY_CLIENT_SECRET=hidden\r\nSPOTIFY_CLIENT_ID=id42\r\nB=2", "id42");
     assert(lookup("SPOTIFY_CLIENT_SECRET=hidden\n", "SPOTIFY_CLIENT_ID") == NULL);
+    const char *both = "SPOTIFY_CLIENT_ID=id42\nSOLOIST_API_KEY=key7\n";
+    assert(strcmp(lookup(both, "SOLOIST_API_KEY"), "key7") == 0);
+    assert(strcmp(lookup(both, "SPOTIFY_CLIENT_ID"), "id42") == 0);
 
     /* Values that do not fit are rejected, not silently truncated. */
     char small[4];
@@ -65,7 +69,8 @@ static void make_config(Config *c, const char *root)
     memset(c, 0, sizeof *c);
     assert(plat_path_join(c->data_dir, sizeof c->data_dir, root, "data") == 0);
     assert(plat_path_join(c->token_path, sizeof c->token_path, c->data_dir, "token.json") == 0);
-    assert(plat_path_join(c->librespot_cache, sizeof c->librespot_cache, c->data_dir, "librespot") == 0);
+    assert(plat_path_join(c->soloist_data, sizeof c->soloist_data, c->data_dir, "soloist") == 0);
+    assert(plat_path_join(c->soloist_cache, sizeof c->soloist_cache, c->data_dir, "soloist-cache") == 0);
 }
 
 static void test_token(void)
@@ -111,17 +116,24 @@ static void test_token(void)
     assert(config_load_token(&c, &u) == -1);
     assert(u.access[0] == '\0');
 
-    /* Logout removes the token and the whole librespot cache tree. */
-    char nested[CFG_PATH_LEN], file[CFG_PATH_LEN];
-    assert(plat_mkdir(c.librespot_cache) == 0);
-    assert(plat_path_join(nested, sizeof nested, c.librespot_cache, "sub") == 0);
+    /* Logout removes the token and Soloist's whole data tree (its paired
+     * session), but keeps the playback cache. */
+    char nested[CFG_PATH_LEN], file[CFG_PATH_LEN], cached[CFG_PATH_LEN];
+    assert(plat_mkdir(c.soloist_data) == 0);
+    assert(plat_path_join(nested, sizeof nested, c.soloist_data, "sub") == 0);
     assert(plat_mkdir(nested) == 0);
-    assert(plat_path_join(file, sizeof file, nested, "credentials.json") == 0);
+    assert(plat_path_join(file, sizeof file, nested, "session") == 0);
     assert(plat_write_file_atomic(file, "{}", 2) == 0);
+    assert(plat_mkdir(c.soloist_cache) == 0);
+    assert(plat_path_join(cached, sizeof cached, c.soloist_cache, "blob") == 0);
+    assert(plat_write_file_atomic(cached, "x", 1) == 0);
     assert(config_save_token(&c, &t) == 0);
     assert(config_clear_login(&c) == 0);
     assert(config_load_token(&c, &u) == -1);
     assert(plat_read_file(file, 1024, NULL) == NULL);
+    char *kept = plat_read_file(cached, 1024, NULL);
+    assert(kept && kept[0] == 'x');
+    free(kept);
     assert(config_clear_login(&c) == 0); /* already gone is fine */
 
     assert(plat_remove_tree(root) == 0);
