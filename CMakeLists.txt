@@ -17,6 +17,10 @@ find_package(Threads REQUIRED)
 include(FetchContent)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+# Spotify album art is JPEG; raylib 5.5 leaves the JPEG decoder out by
+# default. CUSTOMIZE_BUILD keeps every other option at its config.h default.
+set(CUSTOMIZE_BUILD ON CACHE BOOL "" FORCE)
+set(SUPPORT_FILEFORMAT_JPG ON CACHE BOOL "" FORCE)
 FetchContent_Declare(raylib
   URL https://github.com/raysan5/raylib/archive/refs/tags/5.5.tar.gz
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE)

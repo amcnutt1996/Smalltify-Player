@@ -4,11 +4,13 @@
  * on worker threads; the UI thread only copies snapshots and draws. */
 #include "ui.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "raylib.h"
 
+#include "art.h"
 #include "auth.h"
 #include "http.h"
 #include "librespot.h"
@@ -58,13 +60,28 @@ static void ui_wake(void *ud)
 /* --- command worker: single-slot mailbox, latest command wins ----------- */
 typedef enum {
     CMD_PLAY, CMD_PAUSE, CMD_NEXT, CMD_PREV,
-    CMD_SEEK, CMD_VOLUME, CMD_SHUFFLE, CMD_REPEAT
+    CMD_SEEK, CMD_VOLUME, CMD_SHUFFLE, CMD_REPEAT,
+    CMD_PLAY_URI,  /* str = URI, arg = is_track */
+    CMD_PLAYLISTS, /* results land in CmdWorker.lib */
+    CMD_SEARCH     /* str = query; results land in CmdWorker.lib */
 } CmdKind;
 
 typedef struct {
     CmdKind kind;
     int     arg;
+    char    str[SP_NAME_LEN];
 } Cmd;
+
+#define LIB_PLAYLISTS 50 /* first page of /me/playlists */
+#define LIB_RESULTS   20
+
+/* Library panel data, filled by the command worker. */
+typedef struct {
+    Playlist pl[LIB_PLAYLISTS];
+    int      npl, pl_loaded;
+    Track    hits[LIB_RESULTS];
+    int      nhits, searched;
+} Library;
 
 typedef struct {
     AuthStore   *auth;
@@ -78,22 +95,22 @@ typedef struct {
     int      stop;
     int      err;     /* result of the last command */
     uint64_t err_seq; /* bumped after every command */
+    Library  lib;     /* latest playlists/search results */
+    uint64_t lib_seq; /* bumped when lib changes */
 } CmdWorker;
 
-static int run_cmd(HttpClient *h, const Cmd *c)
+static int run_cmd(CmdWorker *w, HttpClient *h, const Cmd *c)
 {
+    Device d;
+    int rc;
+
     switch (c->kind) {
-    case CMD_PLAY: {
-        int rc = sp_play(h, NULL);
-        if (rc == SP_ERR_NODEVICE) {
-            /* Nothing active anywhere: start playback on our own device. */
-            Device d;
-            rc = sp_find_device(h, CFG_DEVICE_NAME, &d);
-            if (rc == SP_OK)
-                rc = sp_transfer(h, d.id, 1);
-        }
+    case CMD_PLAY:
+        rc = sp_play(h, NULL);
+        /* Nothing active anywhere: start playback on our own device. */
+        if (rc == SP_ERR_NODEVICE && (rc = sp_find_device(h, CFG_DEVICE_NAME, &d)) == SP_OK)
+            rc = sp_transfer(h, d.id, 1);
         return rc;
-    }
     case CMD_PAUSE:   return sp_pause(h);
     case CMD_NEXT:    return sp_next(h);
     case CMD_PREV:    return sp_prev(h);
@@ -101,6 +118,35 @@ static int run_cmd(HttpClient *h, const Cmd *c)
     case CMD_VOLUME:  return sp_set_volume(h, c->arg);
     case CMD_SHUFFLE: return sp_set_shuffle(h, c->arg);
     case CMD_REPEAT:  return sp_set_repeat(h, (RepeatMode)c->arg);
+    case CMD_PLAY_URI:
+        rc = sp_play_uri(h, NULL, c->str, c->arg);
+        if (rc == SP_ERR_NODEVICE && (rc = sp_find_device(h, CFG_DEVICE_NAME, &d)) == SP_OK)
+            rc = sp_play_uri(h, d.id, c->str, c->arg);
+        return rc;
+    case CMD_PLAYLISTS:
+    case CMD_SEARCH: {
+        /* Fetched outside the lock: the UI thread reads lib every frame. */
+        static Playlist pl[LIB_PLAYLISTS]; /* worker-thread only; keeps the stack small */
+        static Track hits[LIB_RESULTS];
+        int n = 0;
+        rc = c->kind == CMD_PLAYLISTS ? sp_get_playlists(h, pl, LIB_PLAYLISTS, &n)
+                                      : sp_search_tracks(h, c->str, hits, LIB_RESULTS, &n);
+        if (rc != SP_OK)
+            return rc;
+        plat_mutex_lock(w->mu);
+        if (c->kind == CMD_PLAYLISTS) {
+            memcpy(w->lib.pl, pl, sizeof pl);
+            w->lib.npl = n;
+            w->lib.pl_loaded = 1;
+        } else {
+            memcpy(w->lib.hits, hits, sizeof hits);
+            w->lib.nhits = n;
+            w->lib.searched = 1;
+        }
+        w->lib_seq++;
+        plat_mutex_unlock(w->mu);
+        return rc;
+    }
     }
     return SP_ERR_OTHER;
 }
@@ -130,7 +176,7 @@ static void cmd_thread(void *arg)
             }
             continue;
         }
-        int rc = http ? run_cmd(http, &c) : SP_ERR_OTHER;
+        int rc = http ? run_cmd(w, http, &c) : SP_ERR_OTHER;
         poller_kick(w->poller);
         plat_mutex_lock(w->mu);
         w->err = rc;
@@ -172,14 +218,20 @@ static int cmd_start(CmdWorker *w, AuthStore *auth, Poller *poller)
     return 0;
 }
 
-static void cmd_post(CmdWorker *w, CmdKind kind, int arg)
+static void cmd_post_str(CmdWorker *w, CmdKind kind, int arg, const char *str)
 {
     plat_mutex_lock(w->mu);
     w->slot.kind = kind;
     w->slot.arg = arg;
+    snprintf(w->slot.str, sizeof w->slot.str, "%s", str);
     w->has = 1;
     plat_mutex_unlock(w->mu);
     plat_event_signal(w->ev);
+}
+
+static void cmd_post(CmdWorker *w, CmdKind kind, int arg)
+{
+    cmd_post_str(w, kind, arg, "");
 }
 
 /* --- one-shot device worker: make our Connect device the active one ----- */
@@ -317,7 +369,8 @@ typedef enum { SCR_SETUP, SCR_LOGIN, SCR_PLAYER } Screen;
 /* Widget ids for the one widget that may hold the mouse. */
 enum {
     W_NONE, W_RELOAD, W_SIGNIN, W_CANCEL, W_CONNECT, W_OPEN_URL,
-    W_PREV, W_PLAY, W_NEXT, W_SEEK, W_VOLUME, W_SHUFFLE, W_REPEAT, W_LOGOUT
+    W_PREV, W_PLAY, W_NEXT, W_SEEK, W_VOLUME, W_SHUFFLE, W_REPEAT, W_LOGOUT,
+    W_LIBRARY, W_LIB_BACK, W_LIB_ROW /* + row index */
 };
 
 enum { PEND_PLAY = 1, PEND_SEEK = 2, PEND_SHUFFLE = 4, PEND_REPEAT = 8, PEND_VOLUME = 16 };
@@ -374,6 +427,19 @@ typedef struct {
     char status[SP_NAME_LEN];
     char t_pos[16], t_dur[16];
     int  pos_sec; /* second shown in t_pos, -1 = reformat */
+
+    /* album art: decoded once per image, drawn from a texture */
+    ArtLoader *art;
+    uint64_t   art_seq;
+    Texture2D  art_tex; /* id 0 = none */
+
+    /* library panel (playlists + search) */
+    int      lib_open;
+    int      lib_scroll;
+    int      lib_show_hits; /* list search results instead of playlists */
+    uint64_t lib_seq;
+    Library  lib;
+    char     query[SP_NAME_LEN];
 } Ui;
 
 /* --- text helpers -------------------------------------------------------- */
@@ -542,6 +608,11 @@ static void reset_player_state(Ui *u)
     u->background = 0;
     u->ls_status[0] = u->ls_shown[0] = 0;
     u->text_dirty = 1;
+    u->art_seq = 0;
+    u->lib_open = u->lib_scroll = u->lib_show_hits = 0;
+    u->lib_seq = 0;
+    memset(&u->lib, 0, sizeof u->lib);
+    u->query[0] = 0;
 }
 
 static void set_screen(Ui *u, Screen s)
@@ -558,6 +629,11 @@ static void stop_session(Ui *u)
     engine_stop(&u->eng);
     device_stop(&u->dev);
     cmd_stop(&u->cmd);
+    art_stop(u->art);
+    u->art = NULL;
+    if (u->art_tex.id)
+        UnloadTexture(u->art_tex);
+    u->art_tex = (Texture2D){ 0 };
     poller_stop(u->poller);
     u->poller = NULL;
     librespot_stop(u->ls); /* never leave an orphaned librespot process */
@@ -582,6 +658,7 @@ static void enter_player(Ui *u)
         return;
     }
     device_start(&u->dev, u->auth, u->poller);
+    u->art = art_start(ui_wake, NULL); /* not fatal: the slot stays empty */
     set_screen(u, SCR_PLAYER);
 }
 
@@ -935,6 +1012,139 @@ static void refresh_player_text(Ui *u, float maxw, float status_w)
     u->text_dirty = 0;
 }
 
+/* New image bytes: decode once, shrink to the slot, upload, drop the CPU
+ * copy. Frames then only draw the texture. Empty bytes clear the slot. */
+static void update_art(Ui *u, float slot_px)
+{
+    const unsigned char *data;
+    size_t len;
+    if (!art_take(u->art, &data, &len, &u->art_seq))
+        return;
+    if (u->art_tex.id)
+        UnloadTexture(u->art_tex);
+    u->art_tex = (Texture2D){ 0 };
+    const char *ext = NULL;
+    if (len > 2 && data[0] == 0xFF && data[1] == 0xD8)
+        ext = ".jpg";
+    else if (len > 4 && !memcmp(data, "\x89PNG", 4))
+        ext = ".png";
+    if (!ext || len > (size_t)INT_MAX)
+        return;
+    Image img = LoadImageFromMemory(ext, data, (int)len);
+    if (!img.data)
+        return;
+    int side = (int)slot_px;
+    if (side > 0 && (img.width > side || img.height > side))
+        ImageResize(&img, side, side);
+    u->art_tex = LoadTextureFromImage(img);
+    UnloadImage(img);
+}
+
+/* Pull new panel data from the command worker; copies only on change. */
+static void sync_library(Ui *u)
+{
+    plat_mutex_lock(u->cmd.mu);
+    if (u->cmd.lib_seq != u->lib_seq) {
+        u->lib_seq = u->cmd.lib_seq;
+        u->lib = u->cmd.lib;
+    }
+    plat_mutex_unlock(u->cmd.mu);
+}
+
+/* Remove the last UTF-8 character of s. */
+static void pop_utf8(char *s)
+{
+    size_t n = strlen(s);
+    while (n > 0 && ((unsigned char)s[--n] & 0xC0) == 0x80)
+        ;
+    s[n] = 0;
+}
+
+/* Playlists and track search over the player area; rows reuse button(). */
+static void draw_library(Ui *u, Rectangle area)
+{
+    sync_library(u);
+    if (IsKeyPressed(KEY_ESCAPE)) {
+        u->lib_open = 0;
+        u->redraw = 1;
+        return;
+    }
+    size_t qlen = strlen(u->query);
+    for (int cp = GetCharPressed(); cp > 0; cp = GetCharPressed()) {
+        int n = 0;
+        const char *bytes = CodepointToUTF8(cp, &n);
+        if (n > 0 && qlen + (size_t)n < sizeof u->query) {
+            memcpy(u->query + qlen, bytes, (size_t)n);
+            qlen += (size_t)n;
+            u->query[qlen] = 0;
+        }
+    }
+    if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE))
+        pop_utf8(u->query);
+    if ((IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) && u->query[0]) {
+        cmd_post_str(&u->cmd, CMD_SEARCH, 0, u->query);
+        u->lib_show_hits = 1;
+        u->lib_scroll = 0;
+    }
+
+    float bw = 72, row_h = 28, gap = 6;
+    Rectangle box = { area.x, area.y, area.width - bw - gap, row_h };
+    Rectangle back = { box.x + box.width + gap, area.y, bw, row_h };
+    char shown[SP_NAME_LEN + 2];
+    DrawRectangleRounded(box, 0.3f, 6, C_PANEL);
+    if (u->query[0]) {
+        /* Static caret: a blinking one would need timed redraws. */
+        snprintf(shown, sizeof shown, "%s_", u->query);
+        float tw = text_w(u, shown, FS_S), room = box.width - 16;
+        BeginScissorMode((int)box.x + 8, (int)box.y, (int)room, (int)box.height);
+        text(u, shown, box.x + 8 + (tw > room ? room - tw : 0), box.y + 9, FS_S, C_TEXT);
+        EndScissorMode();
+    } else {
+        text(u, "Type to search tracks, Enter", box.x + 8, box.y + 9, FS_S, C_DIM);
+    }
+    if (button(u, W_LIB_BACK, back, "Playlists", FS_S, !u->lib_show_hits)) {
+        u->lib_show_hits = 0;
+        u->lib_scroll = 0;
+        if (!u->lib.pl_loaded)
+            cmd_post(&u->cmd, CMD_PLAYLISTS, 0);
+    }
+
+    int hits = u->lib_show_hits;
+    int n = hits ? u->lib.nhits : u->lib.npl;
+    float y = area.y + row_h + 10;
+    const char *empty = hits ? (u->lib.searched ? "No results." : "Searching...")
+                             : (u->lib.pl_loaded ? "No playlists." : "Loading playlists...");
+    if (n == 0) {
+        text(u, empty, area.x, y + 4, FS_S, C_DIM);
+        return;
+    }
+    int visible = (int)((area.y + area.height - y + gap) / (row_h + gap));
+    if (visible < 1)
+        visible = 1;
+    float wheel = GetMouseWheelMove();
+    u->lib_scroll += wheel > 0 ? -1 : wheel < 0 ? 1 : 0;
+    if (u->lib_scroll > n - visible)
+        u->lib_scroll = n - visible;
+    if (u->lib_scroll < 0)
+        u->lib_scroll = 0;
+    for (int i = u->lib_scroll; i < n && i < u->lib_scroll + visible; i++, y += row_h + gap) {
+        Rectangle r = { area.x, y, area.width, row_h };
+        const char *name = hits ? u->lib.hits[i].name : u->lib.pl[i].name;
+        const char *uri = hits ? u->lib.hits[i].uri : u->lib.pl[i].uri;
+        char sub[SP_NAME_LEN], fit[SP_NAME_LEN];
+        if (hits)
+            snprintf(sub, sizeof sub, "%s", u->lib.hits[i].artists);
+        else
+            snprintf(sub, sizeof sub, "%d tracks", u->lib.pl[i].track_count);
+        if (button(u, W_LIB_ROW + i, r, NULL, 0, 0) && uri[0])
+            cmd_post_str(&u->cmd, CMD_PLAY_URI, hits, uri);
+        float sw = text_w(u, sub, FS_S);
+        fit_text(u, name, FS_S, r.width - sw - 28, fit, sizeof fit);
+        text(u, fit, r.x + 8, r.y + 9, FS_S, C_TEXT);
+        text(u, sub, r.x + r.width - 8 - sw, r.y + 9, FS_S, C_DIM);
+    }
+}
+
 static void draw_player(Ui *u)
 {
     uint64_t now = plat_now_ms();
@@ -946,8 +1156,10 @@ static void draw_player(Ui *u)
         poller_set_background(u->poller, bg);
     }
 
-    if (poller_snapshot(u->poller, &snap, &u->seq))
+    if (poller_snapshot(u->poller, &snap, &u->seq)) {
         apply_snapshot(u, &snap, now);
+        art_request(u->art, snap.track.art_url); /* no-op unless the URL changed */
+    }
     if (u->pend.mask && now >= u->pend.until)
         resync(u);
 
@@ -985,13 +1197,35 @@ static void draw_player(Ui *u)
     if (art < 64.0f)
         art = 64.0f;
     Rectangle logout = { w - PAD - 64, h - PAD - 20, 64, 20 };
+    Rectangle library = { logout.x - 8 - 64, logout.y, 64, 20 };
     if (u->text_dirty)
-        refresh_player_text(u, cw, cw - logout.width - 8);
+        refresh_player_text(u, cw, library.x - PAD - 8);
+
+    text(u, u->status, PAD, logout.y + 5, FS_S, u->cmd_err || u->poll_err ? C_ERR : C_DIM);
+    if (button(u, W_LOGOUT, logout, "Log out", FS_S, 0)) {
+        auth_store_logout(u->auth);
+        stop_session(u);
+        u->login_msg = NULL;
+        advance_signin(u);
+        return;
+    }
+    if (button(u, W_LIBRARY, library, "Library", FS_S, u->lib_open)) {
+        u->lib_open = !u->lib_open;
+        if (u->lib_open && !u->lib.pl_loaded)
+            cmd_post(&u->cmd, CMD_PLAYLISTS, 0);
+    }
+    if (u->lib_open) {
+        draw_library(u, (Rectangle){ PAD, PAD, cw, logout.y - 12 - PAD });
+        return;
+    }
 
     float y = PAD;
     Rectangle art_r = { (w - art) / 2.0f, y, art, art };
-    /* Feature 7: album art texture is drawn into art_r here. */
+    update_art(u, art * GetWindowScaleDPI().x);
     DrawRectangleRounded(art_r, 0.03f, 8, C_PANEL);
+    if (u->art_tex.id)
+        DrawTexturePro(u->art_tex, (Rectangle){ 0, 0, (float)u->art_tex.width, (float)u->art_tex.height },
+                       art_r, (Vector2){ 0, 0 }, 0.0f, WHITE);
     DrawRectangleRoundedLinesEx(art_r, 0.03f, 8, 1.0f, C_HOVER);
     y += art + 14;
 
@@ -1078,14 +1312,6 @@ static void draw_player(Ui *u)
         pend_begin(u, PEND_VOLUME, now);
         pend_reapply(u);
         cmd_post(&u->cmd, CMD_VOLUME, u->pend.volume);
-    }
-
-    text(u, u->status, PAD, logout.y + 5, FS_S, u->cmd_err || u->poll_err ? C_ERR : C_DIM);
-    if (button(u, W_LOGOUT, logout, "Log out", FS_S, 0)) {
-        auth_store_logout(u->auth);
-        stop_session(u);
-        u->login_msg = NULL;
-        advance_signin(u);
     }
 }
 
