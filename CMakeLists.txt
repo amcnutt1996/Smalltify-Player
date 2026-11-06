@@ -26,16 +26,33 @@ add_library(cjson STATIC third_party/cjson/cJSON.c)
 target_include_directories(cjson PUBLIC third_party/cjson)
 
 # --- app -------------------------------------------------------------------
+# scp_core = every module except main.c. Static lib: tests and the exe pull
+# in only the objects they reference.
 file(GLOB SCP_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.c)
-add_executable(spotify-c-player ${SCP_SOURCES})
-target_link_libraries(spotify-c-player PRIVATE raylib cjson CURL::libcurl Threads::Threads)
+list(REMOVE_ITEM SCP_SOURCES ${CMAKE_SOURCE_DIR}/src/main.c)
+add_library(scp_core STATIC ${SCP_SOURCES})
+target_include_directories(scp_core PUBLIC src)
+target_link_libraries(scp_core PUBLIC raylib cjson CURL::libcurl Threads::Threads)
 if(MSVC)
-  target_compile_options(spotify-c-player PRIVATE /W4)
-  target_link_libraries(spotify-c-player PRIVATE ws2_32 bcrypt)
+  target_compile_options(scp_core PRIVATE /W4)
+  target_link_libraries(scp_core PUBLIC ws2_32 bcrypt)
 else()
-  target_compile_options(spotify-c-player PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(scp_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+add_executable(spotify-c-player src/main.c)
+target_link_libraries(spotify-c-player PRIVATE scp_core)
 set_target_properties(spotify-c-player PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${SCP_DIST_DIR})
+
+# --- tests: tests/test_<name>.c -> ctest target test_<name> -----------------
+enable_testing()
+file(GLOB SCP_TESTS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/test_*.c)
+foreach(t ${SCP_TESTS})
+  get_filename_component(n ${t} NAME_WE)
+  add_executable(${n} ${t})
+  target_link_libraries(${n} PRIVATE scp_core)
+  add_test(NAME ${n} COMMAND ${n})
+endforeach()
 
 # Seed dist/.env from the repo's .env (never overwrite the user's copy).
 if(EXISTS ${CMAKE_SOURCE_DIR}/.env AND NOT EXISTS ${SCP_DIST_DIR}/.env)
