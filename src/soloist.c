@@ -109,36 +109,78 @@ static plat_proc *spawn_soloist(const Config *cfg, const char *const argv[])
     return home_env(cfg, &h) == 0 ? plat_proc_spawn_env(argv, h.env) : NULL;
 }
 
-/* Run `soloist --version`: its exit code (-1 if it didn't run), output
- * in out. */
-static int read_version(const Config *cfg, char *out, size_t cap)
+/* Build day of the Soloist binary at path (from `--version`), -1 if it
+ * doesn't run or prints no date. */
+static long build_day_of(const Config *cfg, const char *path)
 {
-    out[0] = '\0';
-    const char *argv[] = { cfg->soloist_path, "--version", NULL };
+    const char *argv[] = { path, "--version", NULL };
     plat_proc *p = spawn_soloist(cfg, argv);
     if (!p)
         return -1;
+    char out[VERSION_LEN];
     size_t len = 0;
     char buf[256];
     long n;
     while ((n = plat_proc_read(p, buf, sizeof buf)) > 0) {
-        size_t k = (size_t)n < cap - 1 - len ? (size_t)n : cap - 1 - len;
+        size_t k = (size_t)n < sizeof out - 1 - len ? (size_t)n : sizeof out - 1 - len;
         memcpy(out + len, buf, k);
         len += k;
     }
     out[len] = '\0';
     int code = plat_proc_wait(p, 5000);
     plat_proc_kill(p);
-    return code;
+    return code == 0 ? soloist_build_day(out) : -1;
 }
 
-int soloist_installed_ok(const Config *cfg)
+int soloist_supported(void)
 {
-    char v[VERSION_LEN];
-    if (read_version(cfg, v, sizeof v) != 0)
+#ifdef SOLOIST_PKG
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int soloist_need_download(long installed_day, int64_t last_check, int64_t now)
+{
+    if (installed_day < 0 || soloist_days_left(installed_day, now) <= 0)
+        return 1; /* missing or expired: nothing else can help */
+    if (soloist_days_left(installed_day, now) > SOLOIST_RENEW_DAYS)
         return 0;
-    long day = soloist_build_day(v);
-    return day >= 0 && soloist_days_left(day, plat_unix_time()) > SOLOIST_RENEW_DAYS;
+    /* Renewal window: the CDN may still serve this same build, so ask at
+     * most once a day (a clock set back counts as due). */
+    return last_check <= 0 || now < last_check || now - last_check >= SECS_PER_DAY;
+}
+
+/* <data>/soloist-check holds the unix time of the last completed download. */
+static int check_path(const Config *cfg, char *out, size_t cap)
+{
+    return plat_path_join(out, cap, cfg->data_dir, "soloist-check");
+}
+
+static int64_t last_check(const Config *cfg)
+{
+    char path[CFG_PATH_LEN];
+    if (check_path(cfg, path, sizeof path) != 0)
+        return 0;
+    char *t = plat_read_file(path, 64, NULL);
+    int64_t v = t ? (int64_t)strtoll(t, NULL, 10) : 0;
+    free(t);
+    return v;
+}
+
+static void record_check(const Config *cfg)
+{
+    char path[CFG_PATH_LEN], v[32];
+    int n = snprintf(v, sizeof v, "%lld\n", (long long)plat_unix_time());
+    if (check_path(cfg, path, sizeof path) == 0 && n > 0)
+        (void)plat_write_file_atomic(path, v, (size_t)n); /* worst case: one more check */
+}
+
+int soloist_up_to_date(const Config *cfg)
+{
+    return !soloist_need_download(build_day_of(cfg, cfg->soloist_path), last_check(cfg),
+                                  plat_unix_time());
 }
 
 /* --- download ------------------------------------------------------------ */
@@ -175,8 +217,8 @@ int soloist_install(const Config *cfg, SoloistProgressFn progress, void *ud,
 #else
     int rc = -1;
     HttpResponse res = { 0 };
-    char archive[CFG_PATH_LEN];
-    archive[0] = '\0';
+    char archive[CFG_PATH_LEN], fresh[CFG_PATH_LEN], old[CFG_PATH_LEN];
+    archive[0] = fresh[0] = '\0';
     Progress pr = { progress, ud, cancel, -2 };
     HttpClient *http = http_client_new(NULL);
     if (!http)
@@ -193,29 +235,53 @@ int soloist_install(const Config *cfg, SoloistProgressFn progress, void *ud,
     if (cancel && *cancel)
         FAIL("Download cancelled.");
 
-    /* Replace, don't merge: a clean folder holds only the new build. */
-    if (plat_remove_tree(cfg->soloist_dir) != 0 || plat_mkdir(cfg->soloist_dir) != 0 ||
-        plat_path_join(archive, sizeof archive, cfg->soloist_dir, "download-" SOLOIST_PKG) != 0 ||
+    /* Unpack next to the working build and swap only once the new one is
+     * verified, so a bad download never costs a build that still runs. */
+    int n1 = snprintf(fresh, sizeof fresh, "%s.new", cfg->soloist_dir);
+    int n2 = snprintf(old, sizeof old, "%s.old", cfg->soloist_dir);
+    if (n1 < 0 || (size_t)n1 >= sizeof fresh || n2 < 0 || (size_t)n2 >= sizeof old)
+        FAIL("The app folder path is too long.");
+    if (plat_remove_tree(fresh) != 0 || plat_mkdir(fresh) != 0 ||
+        plat_path_join(archive, sizeof archive, fresh, "download-" SOLOIST_PKG) != 0 ||
         plat_write_file_atomic(archive, res.body, res.len) != 0)
-        FAIL("Could not write to %s.", cfg->soloist_dir);
+        FAIL("Could not write to %s.", fresh);
     http_response_free(&res);
-    int untarred = plat_untar(archive, cfg->soloist_dir);
+    int untarred = plat_untar(archive, fresh);
     if (plat_remove_tree(archive) != 0)
         FAIL("Could not delete %s.", archive);
     archive[0] = '\0';
     if (untarred != 0)
         FAIL("Could not unpack Soloist (the system's tar failed).");
 
-    char v[VERSION_LEN];
-    long day;
-    if (read_version(cfg, v, sizeof v) != 0 || (day = soloist_build_day(v)) < 0)
+    char bin[CFG_PATH_LEN];
+    long day = -1;
+    if (plat_path_join(bin, sizeof bin, fresh, "soloist" PLAT_EXE_SUFFIX) != 0 ||
+        (day = build_day_of(cfg, bin)) < 0)
         FAIL("The downloaded Soloist does not run on this computer.");
-    if (soloist_days_left(day, plat_unix_time()) <= 0)
+    record_check(cfg);
+    int64_t now = plat_unix_time();
+    long have = build_day_of(cfg, cfg->soloist_path);
+    if (have >= day) {
+        /* The CDN still serves the build we have: keep it. */
+        if (soloist_days_left(have, now) <= 0)
+            FAIL("Spotify's current Soloist build has already expired.");
+        rc = 0;
+        goto out;
+    }
+    if (soloist_days_left(day, now) <= 0)
         FAIL("Spotify's current Soloist build has already expired.");
+    if (plat_remove_tree(old) != 0)
+        FAIL("Could not delete %s.", old);
+    (void)plat_rename(cfg->soloist_dir, old); /* fails only if there is none */
+    if (plat_rename(fresh, cfg->soloist_dir) != 0) {
+        (void)plat_rename(old, cfg->soloist_dir);
+        FAIL("Could not replace %s.", cfg->soloist_dir);
+    }
+    (void)plat_remove_tree(old); /* leftovers go with the next update */
     rc = 0;
 out:
-    if (archive[0])
-        (void)plat_remove_tree(archive); /* failure path: best effort */
+    if (fresh[0])
+        (void)plat_remove_tree(fresh); /* the unused or failed build */
     http_response_free(&res);
     http_client_free(http);
     return rc;
@@ -263,7 +329,7 @@ static void on_line(Soloist *s, char *line, size_t n)
         msg = line + 25;
     if (!msg[0])
         return;
-    /* The version banner and expiry countdown: soloist_installed_ok has
+    /* The version banner and expiry countdown: soloist_up_to_date has
      * already checked both; the device id line precedes the real state. */
     if (starts(msg, "soloist ") || starts(msg, "client expires in ") || starts(msg, "ready,"))
         return;
@@ -346,7 +412,7 @@ Soloist *soloist_start(const Config *cfg, void (*on_change)(void *ud), void *ud)
     /* The key can only go in argv (Soloist's documented interface). */
     const char *argv[] = {
         cfg->soloist_path,
-        "-n", CFG_DEVICE_NAME,
+        "-n", cfg->device_name,
         "-k", cfg->soloist_key,
         "-D", cfg->soloist_data,   /* device id + paired session */
         "-C", cfg->soloist_cache,

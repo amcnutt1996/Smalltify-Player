@@ -1,5 +1,5 @@
 /* Spotify Soloist: Spotify's official headless Connect client, run as the
- * local device CFG_DEVICE_NAME. Spotify forbids redistributing it, so it is
+ * local device cfg->device_name. Spotify forbids redistributing it, so it is
  * downloaded at runtime from Spotify's CDN into cfg->soloist_dir. Builds
  * expire SOLOIST_EXPIRY_DAYS after their build date (then exit with code
  * 10). It pairs once through Spotify Connect discovery (the user picks the
@@ -16,21 +16,30 @@
 #define SOLOIST_RENEW_DAYS  7  /* re-download when this few days are left */
 
 /* --- install / update ---------------------------------------------------- */
-/* 1 if the binary runs (`--version`) and its build expires in more than
- * SOLOIST_RENEW_DAYS days. Runs the binary once (~40 ms); not a UI-thread
- * call. */
-int soloist_installed_ok(const Config *cfg);
+/* 1 if Spotify publishes a build for this OS/CPU. */
+int soloist_supported(void);
+/* 1 unless a download is due: the binary is missing, doesn't run or has
+ * expired, or it is within SOLOIST_RENEW_DAYS of expiry and the CDN was
+ * not asked in the last day. Runs the binary once (~40 ms); not a
+ * UI-thread call. */
+int soloist_up_to_date(const Config *cfg);
 
 /* percent: 0-100, or -1 while the download size is unknown. */
 typedef void (*SoloistProgressFn)(void *ud, int percent);
-/* Download this platform's build (progress may be NULL), replace
- * cfg->soloist_dir with it, check that it runs, delete the archive. Blocks;
- * returns -1 early once *cancel becomes nonzero (cancel may be NULL).
- * 0 ok; -1 with a user-facing message in err (platforms without a build
- * included). Soloist must not be running. */
+/* Download this platform's build (progress may be NULL) into
+ * <soloist_dir>.new, check that it runs, and swap it in only if it is
+ * newer than the installed one (the working build is never removed
+ * first). Records the check time (data/soloist-check). Blocks; returns -1
+ * early once *cancel becomes nonzero (cancel may be NULL). 0 ok (new build,
+ * or the same still-valid one kept); -1 with a user-facing message in err
+ * (platforms without a build included). Soloist must not be running. */
 int soloist_install(const Config *cfg, SoloistProgressFn progress, void *ud,
                     const volatile int *cancel, char *err, size_t cap);
 
+/* Pure, exposed for tests: should we download, given the installed
+ * build's day (-1 = none/broken), the last check (unix time, 0 = never)
+ * and now? */
+int soloist_need_download(long installed_day, int64_t last_check, int64_t now);
 /* Pure helpers (exposed for tests). Days since 1970-01-01 of the
  * "(YYYYMMDD)" build date in `soloist --version` output, -1 if absent. */
 long soloist_build_day(const char *version);
@@ -51,12 +60,14 @@ typedef enum {
 
 typedef struct Soloist Soloist;
 
-/* Spawn `soloist -n CFG_DEVICE_NAME -k <key> -D <data> -C <cache> -z 100`.
+/* Spawn `soloist -n <cfg->device_name> -k <key> -D <data> -C <cache> -z 100`.
  * Call from the main thread (Linux ties the child to the spawning thread).
  * NULL if the key is missing, the binary is missing or the spawn fails.
  * on_change(ud) runs on the reader thread whenever the state or status
  * changes, including its exit (on_change may be NULL). Neither the argv
- * nor the key is ever logged. */
+ * nor the key is ever logged. HOME, CFFIXED_USER_HOME and TMPDIR (Win32:
+ * USERPROFILE, APPDATA, LOCALAPPDATA, TEMP, TMP) point into
+ * cfg->soloist_home so its OS-level caches stay in the app folder. */
 Soloist     *soloist_start(const Config *cfg, void (*on_change)(void *ud), void *ud);
 SoloistState soloist_state(Soloist *s); /* NULL -> SOLOIST_STOPPED */
 /* Short status for display ("starting", "waiting for pairing", "ready",

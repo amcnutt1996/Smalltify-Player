@@ -69,8 +69,25 @@ static void test_exit_code(void)
 #endif
 }
 
+/* Same build, at most one check a day: no re-download on every launch. */
+static void test_need_download(void)
+{
+    long day = 20763;
+    int64_t fresh = (int64_t)day * DAY + DAY / 2;           /* 90 days left */
+    int64_t renew = fresh + (int64_t)(SOLOIST_EXPIRY_DAYS - SOLOIST_RENEW_DAYS) * DAY; /* 7 left */
+    int64_t dead = fresh + (int64_t)SOLOIST_EXPIRY_DAYS * DAY;
+    assert(soloist_need_download(-1, 0, fresh) == 1);       /* missing or broken */
+    assert(soloist_need_download(day, 0, fresh) == 0);      /* plenty of days left */
+    assert(soloist_need_download(day, 0, renew) == 1);      /* renewal window, never checked */
+    assert(soloist_need_download(day, renew - 3600, renew) == 0);    /* checked an hour ago */
+    assert(soloist_need_download(day, renew - DAY, renew) == 1);     /* a day ago */
+    assert(soloist_need_download(day, renew + 3600, renew) == 1);    /* clock set back */
+    assert(soloist_need_download(day, dead - 60, dead) == 1);        /* expired: always */
+}
+
 int main(void)
 {
+    test_need_download();
     test_build_day();
     test_days_left();
     test_exit_code();
