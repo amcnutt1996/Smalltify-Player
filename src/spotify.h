@@ -24,6 +24,9 @@ const char *sp_strerror(int err);
 /* --- state (now playing) ------------------------------------------------ */
 /* out->active = 0 when nothing is playing (204). */
 int sp_get_playback(HttpClient *c, PlaybackState *out);
+/* Parse a /me/player JSON body (no network; used by tests). Leaves
+ * fetched_at_ms 0. SP_OK, or SP_ERR_PARSE if json is not a JSON object. */
+int sp_parse_playback(const char *json, PlaybackState *out);
 
 /* --- playback control (device_id NULL = currently active device) -------- */
 int sp_play(HttpClient *c, const char *device_id);
