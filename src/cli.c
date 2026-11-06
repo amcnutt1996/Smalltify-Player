@@ -10,6 +10,7 @@
 #include "http.h"
 #include "librespot.h"
 #include "platform.h"
+#include "spotify.h"
 
 #define CLI_PROG "spotify-c-player"
 
@@ -111,6 +112,69 @@ static int cmd_logout(const Config *cfg, int argc, char **argv)
     return 0;
 }
 
+/* m:ss, or h:mm:ss for long episodes. */
+static void fmt_time(char *out, size_t cap, int ms)
+{
+    int s = ms > 0 ? ms / 1000 : 0;
+    if (s >= 3600)
+        snprintf(out, cap, "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60);
+    else
+        snprintf(out, cap, "%d:%02d", s / 60, s % 60);
+}
+
+static void print_playback(const PlaybackState *st)
+{
+    static const char *const repeat_names[] = { "off", "context", "track" };
+    const Track *t = &st->track;
+    char pos[16], dur[16];
+
+    if (!st->active) {
+        printf("Nothing playing.\n");
+        return;
+    }
+    printf("%s %s", st->is_playing ? "\xE2\x96\xB6" : "\xE2\x8F\xB8", /* ▶ / ⏸ */
+           t->name[0] ? t->name : "Unknown");
+    if (t->artists[0])
+        printf(" \xE2\x80\x94 %s", t->artists); /* em dash */
+    printf("\n");
+    if (t->album[0])
+        printf("  %s\n", t->album);
+
+    fmt_time(pos, sizeof pos, st->progress_ms);
+    fmt_time(dur, sizeof dur, t->duration_ms);
+    printf("  %s / %s", pos, dur);
+    if (st->device_name[0])
+        printf("  on %s", st->device_name);
+    if (st->shuffle && st->repeat != REPEAT_OFF)
+        printf("  (shuffle, repeat: %s)", repeat_names[st->repeat]);
+    else if (st->shuffle)
+        printf("  (shuffle)");
+    else if (st->repeat != REPEAT_OFF)
+        printf("  (repeat: %s)", repeat_names[st->repeat]);
+    printf("\n");
+}
+
+static int cmd_now(const Config *cfg, int argc, char **argv)
+{
+    AuthStore *auth;
+    HttpClient *http;
+    PlaybackState st;
+    int rc;
+
+    (void)argc; (void)argv;
+    if (open_session(cfg, &auth, &http) != 0)
+        return 1;
+    rc = sp_get_playback(http, &st);
+    http_client_free(http);
+    auth_store_free(auth);
+    if (rc != SP_OK) {
+        fprintf(stderr, "%s\n", sp_strerror(rc));
+        return 1;
+    }
+    print_playback(&st);
+    return 0;
+}
+
 /* Ends `engine` on stdin EOF (Ctrl-D / closed pipe). */
 static void stdin_watch(void *arg)
 {
@@ -177,6 +241,7 @@ const CliCommand cli_commands[] = {
     { "login",  "login",  cmd_login  },
     { "logout", "logout", cmd_logout },
     { "engine", "engine", cmd_engine },
+    { "now",    "now",    cmd_now    },
     { NULL, NULL, NULL },
 };
 
