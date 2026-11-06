@@ -39,8 +39,14 @@ void glfwPostEmptyEvent(void);
 #define DEVICE_WAIT_TRIES 15
 #define DEVICE_FIRST_MS   1500 /* Soloist needs a moment to register */
 #define DEVICE_RETRY_MS   1000
-#define DEVICE_LIST_CAP   16
-#define PAIR_POLL_MS      2000 /* pairing: look for our device this often */
+#define PAIR_FAST_MS      2000   /* pairing: look for our device this often... */
+#define PAIR_FAST_FOR_MS  120000 /* ...for the first 2 minutes, */
+#define PAIR_SLOW_MS      15000  /* then (or while minimized) this often */
+#ifndef PAIR_IDLE_STOP_MS
+/* Unpaired Soloist stops when no other device of the account has been
+ * listed this long (overridable at compile time for tests). */
+#define PAIR_IDLE_STOP_MS 600000
+#endif
 #define IDLE_WAIT_MS      3600000u
 #define SIGNIN_URL_LEN    4096 /* authorize URLs with many scopes are long */
 
@@ -86,13 +92,14 @@ typedef struct {
     int      npl, pl_loaded;
     Track    hits[LIB_RESULTS];
     int      nhits, searched;
-    Device   devs[DEVICE_LIST_CAP];
+    Device   devs[SP_MAX_DEVICES];
     int      ndev, devs_loaded;
 } Library;
 
 typedef struct {
     AuthStore   *auth;
     Poller      *poller;
+    const char  *name;   /* our device name */
     plat_mutex  *mu;
     plat_event  *ev;
     plat_thread *th;
@@ -100,7 +107,9 @@ typedef struct {
     Cmd      slot;
     int      has;
     int      stop;
+    int      local;   /* our Soloist device is running and paired */
     int      err;     /* result of the last command */
+    char     played_on[SP_NAME_LEN]; /* "" unless it played on another, inactive device */
     uint64_t err_seq; /* bumped after every command */
     Library  lib;     /* latest playlists/search results */
     uint64_t lib_seq; /* bumped when lib changes */
@@ -108,9 +117,9 @@ typedef struct {
 
 static int fetch_devices(CmdWorker *w, HttpClient *h)
 {
-    static Device devs[DEVICE_LIST_CAP]; /* worker-thread only */
+    static Device devs[SP_MAX_DEVICES]; /* worker-thread only */
     int n = 0;
-    int rc = sp_get_devices(h, devs, DEVICE_LIST_CAP, &n);
+    int rc = sp_get_devices(h, devs, SP_MAX_DEVICES, &n);
     if (rc != SP_OK)
         return rc;
     plat_mutex_lock(w->mu);
@@ -122,14 +131,31 @@ static int fetch_devices(CmdWorker *w, HttpClient *h)
     return rc;
 }
 
+/* Play (uri NULL = resume): on our own device when it is paired and
+ * running and a uri was picked (or nothing else is active), else on the
+ * active device, else on any available one (said in played_on). */
+static int play(CmdWorker *w, HttpClient *h, const char *uri, int is_track)
+{
+    plat_mutex_lock(w->mu);
+    int local = w->local;
+    plat_mutex_unlock(w->mu);
+    Device on;
+    int where = SP_ON_ACTIVE;
+    int rc = sp_play_smart(h, uri, is_track, local ? w->name : NULL, local && uri, &on, &where);
+    plat_mutex_lock(w->mu);
+    snprintf(w->played_on, sizeof w->played_on, "%s",
+             rc == SP_OK && where == SP_ON_OTHER ? on.name : "");
+    plat_mutex_unlock(w->mu);
+    return rc;
+}
+
 static int run_cmd(CmdWorker *w, HttpClient *h, const Cmd *c)
 {
     int rc;
 
     switch (c->kind) {
     case CMD_PLAY:
-        /* Nothing active anywhere: start playback on our own device. */
-        return sp_play_fallback(h, NULL, 0, CFG_DEVICE_NAME);
+        return play(w, h, NULL, 0);
     case CMD_PAUSE:   return sp_pause(h);
     case CMD_NEXT:    return sp_next(h);
     case CMD_PREV:    return sp_prev(h);
@@ -138,7 +164,7 @@ static int run_cmd(CmdWorker *w, HttpClient *h, const Cmd *c)
     case CMD_SHUFFLE: return sp_set_shuffle(h, c->arg);
     case CMD_REPEAT:  return sp_set_repeat(h, (RepeatMode)c->arg);
     case CMD_PLAY_URI:
-        return sp_play_fallback(h, c->str, c->arg, CFG_DEVICE_NAME);
+        return play(w, h, c->str, c->arg);
     case CMD_DEVICES:
         return fetch_devices(w, h);
     case CMD_TRANSFER:
@@ -211,13 +237,21 @@ static void cmd_thread(void *arg)
     http_client_free(http);
 }
 
-static void cmd_stop(CmdWorker *w)
+/* Ask the worker to stop without waiting (cmd_stop then joins). */
+static void cmd_signal_stop(CmdWorker *w)
 {
     if (w->th) {
         plat_mutex_lock(w->mu);
         w->stop = 1;
         plat_mutex_unlock(w->mu);
         plat_event_signal(w->ev);
+    }
+}
+
+static void cmd_stop(CmdWorker *w)
+{
+    if (w->th) {
+        cmd_signal_stop(w);
         plat_thread_join(w->th);
     }
     plat_event_free(w->ev);
@@ -225,11 +259,12 @@ static void cmd_stop(CmdWorker *w)
     memset(w, 0, sizeof *w);
 }
 
-static int cmd_start(CmdWorker *w, AuthStore *auth, Poller *poller)
+static int cmd_start(CmdWorker *w, AuthStore *auth, Poller *poller, const char *name)
 {
     memset(w, 0, sizeof *w);
     w->auth = auth;
     w->poller = poller;
+    w->name = name;
     w->mu = plat_mutex_new();
     w->ev = plat_event_new();
     if (w->mu && w->ev)
@@ -258,40 +293,90 @@ static void cmd_post(CmdWorker *w, CmdKind kind, int arg)
 }
 
 /* --- device worker ------------------------------------------------------- */
-/* Player: one shot, make our device the active one when nothing else plays.
- * Pairing: poll until our device shows up in the Web API, which is the only
- * sign that the user picked it in a Spotify app. */
+/* Transfer: one shot at engine start, make our device the active one when
+ * nothing else plays. Pair: poll the device list until our device shows
+ * up, which is the only sign that the user picked it in a Spotify app;
+ * meanwhile report another device of the account to name in the hint,
+ * and give up once none has been listed for PAIR_IDLE_STOP_MS. */
 typedef struct {
     AuthStore   *auth;
-    Poller      *poller; /* NULL in pairing mode */
+    Poller      *poller;
+    const char  *name;      /* our device name */
     int          pair;
-    volatile int found;  /* pairing: set once our device is listed */
-    plat_event  *stop;   /* signaled = give up now */
+    volatile int slow;      /* set by the UI: minimized */
+    volatile int found;     /* pair: our device is listed */
+    volatile int idle_out;  /* pair: no other device for too long */
+    plat_mutex  *mu;
+    char         other[SP_NAME_LEN]; /* pair: another device, guarded by mu */
+    plat_event  *stop;      /* signaled = give up now */
     plat_thread *th;
 } DeviceWorker;
+
+/* The pairing poll cadence: quick while the user is likely picking the
+ * device, then slow; always slow while minimized. */
+static unsigned pair_poll_ms(uint64_t elapsed_ms, int slow)
+{
+    return !slow && elapsed_ms < PAIR_FAST_FOR_MS ? PAIR_FAST_MS : PAIR_SLOW_MS;
+}
 
 static void transfer_to_us(DeviceWorker *d, HttpClient *http)
 {
     for (int i = 0; i < DEVICE_WAIT_TRIES; i++) {
         if (plat_event_wait(d->stop, i ? DEVICE_RETRY_MS : DEVICE_FIRST_MS))
             return;
-        Device me;
-        if (sp_find_device(http, CFG_DEVICE_NAME, &me) != SP_OK)
+        Device list[SP_MAX_DEVICES];
+        int n = 0;
+        if (sp_get_devices(http, list, SP_MAX_DEVICES, &n) != SP_OK)
             continue;
-        /* Never steal playback from another device the user is using. */
-        Device list[DEVICE_LIST_CAP];
-        int n = 0, busy = 1;
-        /* Each call can take seconds: re-check stop before the next one. */
-        if (plat_event_wait(d->stop, 0))
-            return;
-        if (sp_get_devices(http, list, DEVICE_LIST_CAP, &n) == SP_OK) {
-            busy = 0;
-            for (int j = 0; j < n; j++)
-                busy |= list[j].is_active;
+        const Device *me = NULL;
+        int busy = 0;
+        for (int j = 0; j < n; j++) {
+            busy |= list[j].is_active;
+            if (!me && list[j].id[0] && strcmp(list[j].name, d->name) == 0)
+                me = &list[j];
         }
-        if (!busy && !plat_event_wait(d->stop, 0) && sp_transfer(http, me.id, 0) == SP_OK)
+        if (!me)
+            continue; /* Soloist needs a moment to register */
+        /* Never steal playback from another device the user is using. */
+        if (!busy && !plat_event_wait(d->stop, 0) && sp_transfer(http, me->id, 0) == SP_OK)
             poller_kick(d->poller);
         return;
+    }
+}
+
+static void pair_poll(DeviceWorker *d, HttpClient *http)
+{
+    uint64_t start = plat_now_ms(), last_other = start;
+    while (!plat_event_wait(d->stop, pair_poll_ms(plat_now_ms() - start, d->slow))) {
+        Device list[SP_MAX_DEVICES];
+        int n = 0;
+        uint64_t now = plat_now_ms();
+        if (sp_get_devices(http, list, SP_MAX_DEVICES, &n) == SP_OK) {
+            const char *other = NULL;
+            for (int j = 0; j < n; j++) {
+                if (strcmp(list[j].name, d->name) == 0) {
+                    d->found = 1;
+                    ui_wake(NULL);
+                    return;
+                }
+                if (!other || list[j].is_active)
+                    other = list[j].name; /* the active one names it best */
+            }
+            if (other) {
+                last_other = now;
+                plat_mutex_lock(d->mu);
+                int changed = strcmp(d->other, other) != 0;
+                snprintf(d->other, sizeof d->other, "%s", other);
+                plat_mutex_unlock(d->mu);
+                if (changed)
+                    ui_wake(NULL);
+            }
+        }
+        if (now - last_other >= PAIR_IDLE_STOP_MS) {
+            d->idle_out = 1;
+            ui_wake(NULL);
+            return;
+        }
     }
 }
 
@@ -300,18 +385,10 @@ static void device_thread(void *arg)
     DeviceWorker *d = arg;
     HttpAuth ha = auth_store_http(d->auth);
     HttpClient *http = http_client_new(&ha);
-    if (http && d->pair) {
-        Device me;
-        while (!plat_event_wait(d->stop, PAIR_POLL_MS)) {
-            if (sp_find_device(http, CFG_DEVICE_NAME, &me) == SP_OK) {
-                d->found = 1;
-                ui_wake(NULL);
-                break;
-            }
-        }
-    } else if (http) {
+    if (http && d->pair)
+        pair_poll(d, http);
+    else if (http)
         transfer_to_us(d, http);
-    }
     http_client_free(http);
 }
 
@@ -322,17 +399,21 @@ static void device_stop(DeviceWorker *d)
         plat_thread_join(d->th);
     }
     plat_event_free(d->stop);
+    plat_mutex_free(d->mu);
     memset(d, 0, sizeof *d);
 }
 
-static void device_start(DeviceWorker *d, AuthStore *auth, Poller *poller, int pair)
+static void device_start(DeviceWorker *d, AuthStore *auth, Poller *poller, const char *name,
+                         int pair)
 {
     memset(d, 0, sizeof *d);
     d->auth = auth;
     d->poller = poller;
+    d->name = name;
     d->pair = pair;
     d->stop = plat_event_new();
-    if (d->stop)
+    d->mu = plat_mutex_new();
+    if (d->stop && d->mu)
         d->th = plat_thread_start(device_thread, d);
     if (!d->th)
         device_stop(d); /* not fatal: the user can still pick the device in Spotify */
@@ -366,7 +447,7 @@ static void install_thread(void *arg)
     Installer *in = arg;
     char err[ERR_LEN] = "";
     int rc = 0;
-    if (in->force || !soloist_installed_ok(in->cfg)) {
+    if (in->force || !soloist_up_to_date(in->cfg)) {
         plat_mutex_lock(in->mu);
         in->downloading = 1;
         in->percent = -1;
@@ -385,7 +466,7 @@ static void install_thread(void *arg)
 static void installer_stop(Installer *in)
 {
     if (in->th) {
-        in->cancel = 1;
+        in->cancel = 1; /* aborts a download within moments */
         plat_thread_join(in->th);
     }
     plat_mutex_free(in->mu);
@@ -408,12 +489,13 @@ static int installer_start(Installer *in, const Config *cfg, int force)
 }
 
 /* --- UI state ------------------------------------------------------------ */
-typedef enum { SCR_MOVE, SCR_SETUP, SCR_LOGIN, SCR_KEY, SCR_ENGINE, SCR_PLAYER } Screen;
+typedef enum { SCR_MOVE, SCR_SETUP, SCR_LOGIN, SCR_KEY, SCR_PLAYER } Screen;
 typedef enum { PANEL_NONE, PANEL_LIBRARY, PANEL_DEVICES } Panel;
 
 /* Widget ids for the one widget that may hold the mouse. */
 enum {
-    W_NONE, W_RELOAD, W_SIGNIN, W_CANCEL, W_OPEN_URL, W_OPEN_KEY, W_SKIP, W_RETRY,
+    W_NONE, W_RELOAD, W_SIGNIN, W_CANCEL, W_OPEN_URL, W_OPEN_KEY, W_BACK, W_CHANGE_KEY,
+    W_RESTART, W_HINT_CLOSE,
     W_PREV, W_PLAY, W_NEXT, W_SEEK, W_VOLUME, W_SHUFFLE, W_REPEAT, W_LOGOUT,
     W_LIBRARY, W_LIB_BACK, W_DEVICES, W_DEV_REFRESH,
     W_LIB_ROW /* + row index; library and device rows never show together */
@@ -452,11 +534,17 @@ typedef struct {
     char         login_url[SIGNIN_URL_LEN]; /* guarded by mu */
     const char  *login_msg;
 
-    /* engine screen: Soloist install, start and one-time pairing */
+    /* Soloist, run from the player: always once paired, else only while
+     * another device of the account is online so it can pick us */
     Installer    inst;
     Soloist     *sol;
-    int          engine_skipped; /* "control other devices only" this run */
+    int          paired;         /* data/soloist-paired exists */
+    int          sol_was_paired; /* paired when this Soloist started */
+    int          transferred;    /* startup transfer tried for this Soloist */
+    int          auto_failed;    /* an unpaired start failed: not again this run */
     int          reinstalled;    /* an expired build was replaced once */
+    int          hint_hidden;    /* pairing tip dismissed this run */
+    char         other_dev[SP_NAME_LEN]; /* another device of the account, for the tip */
     char         eng_err[ERR_LEN]; /* "" = no error to show */
 
     /* player screen */
@@ -468,8 +556,11 @@ typedef struct {
     Pending       pend;
     uint64_t      cmd_seq;
     int           cmd_err, poll_err, background;
+    int           status_red; /* u->status is an error */
+    char          played_on[SP_NAME_LEN];
     float         seek_t, vol_t; /* slider positions while dragged */
-    char sol_status[256], sol_shown[256];
+    char msg[320], msg_shown[320]; /* the one status message, see status_message */
+    char hint[320], hint_fit[320]; /* pairing tip; "" = none */
     char title[SP_NAME_LEN], artists[SP_NAME_LEN], album[SP_NAME_LEN];
     char status[SP_NAME_LEN];
     char t_pos[16], t_dur[16];
@@ -485,6 +576,7 @@ typedef struct {
     int      lib_scroll;
     int      lib_show_hits; /* list search results instead of playlists */
     uint64_t lib_seq;
+    uint64_t dev_seq_noted; /* cmd.lib_seq last checked by note_other */
     Library  lib;
     char     query[SP_NAME_LEN];
     char     key_input[sizeof(((Config *)0)->soloist_key)]; /* key screen; secret */
@@ -740,12 +832,13 @@ static void reset_player_state(Ui *u)
     u->cmd_seq = 0;
     u->cmd_err = u->poll_err = 0;
     u->background = 0;
-    u->sol_status[0] = u->sol_shown[0] = 0;
+    u->msg[0] = u->msg_shown[0] = u->hint[0] = 0;
+    u->played_on[0] = 0;
     u->text_dirty = 1;
     u->art_seq = 0;
     u->panel = PANEL_NONE;
     u->lib_scroll = u->lib_show_hits = 0;
-    u->lib_seq = 0;
+    u->lib_seq = u->dev_seq_noted = 0;
     memset(&u->lib, 0, sizeof u->lib);
     u->query[0] = 0;
 }
@@ -758,11 +851,30 @@ static void set_screen(Ui *u, Screen s)
     u->redraw = 1;
 }
 
-/* Stops everything that talks to Spotify; safe to call in any state. */
-static void stop_session(Ui *u)
+/* Soloist and its helpers; safe to call in any state. */
+static void stop_engine(Ui *u)
 {
+    u->inst.cancel = 1;
+    if (u->dev.stop)
+        plat_event_signal(u->dev.stop);
     installer_stop(&u->inst);
     device_stop(&u->dev);
+    soloist_stop(u->sol); /* never leave an orphaned Soloist process */
+    u->sol = NULL;
+}
+
+/* Stops everything that talks to Spotify; safe to call in any state.
+ * Every worker is told first and only then joined, so the wait is the
+ * slowest one's, not their sum. */
+static void stop_session(Ui *u)
+{
+    u->inst.cancel = 1;
+    if (u->dev.stop)
+        plat_event_signal(u->dev.stop);
+    cmd_signal_stop(&u->cmd);
+    art_signal_stop(u->art);
+    poller_signal_stop(u->poller);
+    stop_engine(u);
     cmd_stop(&u->cmd);
     art_stop(u->art);
     u->art = NULL;
@@ -771,51 +883,53 @@ static void stop_session(Ui *u)
     u->art_tex = (Texture2D){ 0 };
     poller_stop(u->poller);
     u->poller = NULL;
-    soloist_stop(u->sol); /* never leave an orphaned Soloist process */
-    u->sol = NULL;
 }
 
-/* Signed in, and Soloist is ready, pairing in the background, or skipped.
- * A running Soloist keeps running: it is the device we play on. */
+/* Check (and if needed download, silently) Soloist on the install worker;
+ * the player starts it once that is done (poll_engine). No-op if it is
+ * already on its way, or can't run here. */
+static void start_engine(Ui *u, int force)
+{
+    if (u->inst.th || u->sol || !soloist_supported() || !u->cfg.soloist_key[0])
+        return;
+    u->eng_err[0] = 0;
+    u->text_dirty = 1;
+    if (installer_start(&u->inst, &u->cfg, force) != 0)
+        snprintf(u->eng_err, sizeof u->eng_err, "Could not start the Soloist setup.");
+}
+
+/* Signed in: the player. Soloist starts right away once paired; unpaired,
+ * only when another device of the account shows up (note_other). */
 static void enter_player(Ui *u)
 {
-    installer_stop(&u->inst);
-    device_stop(&u->dev); /* the pairing poll, if any */
+    stop_engine(u);
     reset_player_state(u);
     u->poller = poller_start(u->auth, ui_wake, NULL);
-    if (!u->poller || cmd_start(&u->cmd, u->auth, u->poller) != 0) {
+    if (!u->poller || cmd_start(&u->cmd, u->auth, u->poller, u->cfg.device_name) != 0) {
         stop_session(u);
         u->login_msg = "Could not start the player.";
         set_screen(u, SCR_LOGIN);
         return;
     }
-    if (u->sol)
-        device_start(&u->dev, u->auth, u->poller, 0);
     u->art = art_start(ui_wake, NULL); /* not fatal: the slot stays empty */
+    u->paired = config_paired(&u->cfg);
+    u->auto_failed = u->hint_hidden = 0;
+    u->other_dev[0] = 0;
+    u->eng_err[0] = 0;
+    /* A device id without the marker: maybe paired with an older build;
+     * a restored session then shows as READY (poll_engine). */
+    if (u->paired || config_soloist_used(&u->cfg))
+        start_engine(u, 0);
     set_screen(u, SCR_PLAYER);
 }
 
-/* Check (and if needed download) Soloist on the install worker. */
-static void start_engine_setup(Ui *u, int force)
-{
-    u->eng_err[0] = 0;
-    if (installer_start(&u->inst, &u->cfg, force) != 0)
-        snprintf(u->eng_err, sizeof u->eng_err, "Could not start the Soloist setup.");
-    set_screen(u, SCR_ENGINE);
-}
-
-/* Next unfinished setup step: sign-in, Soloist key, Soloist, then the
- * player. Once paired, later launches pass straight through. */
+/* Sign-in first; everything else happens in the player. */
 static void advance_signin(Ui *u)
 {
     if (!auth_store_logged_in(u->auth))
         set_screen(u, SCR_LOGIN);
-    else if (u->engine_skipped)
-        enter_player(u);
-    else if (!u->cfg.soloist_key[0])
-        set_screen(u, SCR_KEY);
     else
-        start_engine_setup(u, 0);
+        enter_player(u);
 }
 
 /* Client id known: open the token store and continue with sign-in. */
@@ -961,7 +1075,7 @@ static void draw_login(Ui *u)
                 advance_signin(u);
                 return;
             }
-            u->login_msg = cancelled ? "Sign-in cancelled." : "Sign-in failed. Please try again.";
+            u->login_msg = cancelled ? "Sign-in cancelled." : auth_login_strerror(rc);
         }
     }
 
@@ -972,8 +1086,24 @@ static void draw_login(Ui *u)
     if (!u->login_th) {
         if (button(u, W_SIGNIN, rb, "Sign in with Spotify", FS_S, 1))
             start_login(u);
+        /* A client ID fixed in .env applies without a restart. */
+        Rectangle rr = { ((float)u->w - 120.0f) / 2.0f, y + 48, 120, 24 };
+        if (button(u, W_RELOAD, rr, "Reload .env", FS_S, 0)) {
+            Config c;
+            AuthStore *a = NULL;
+            if (config_load(&c) == 0 && (a = auth_store_new(&c)) != NULL) {
+                auth_store_free(u->auth); /* nothing else uses it on this screen */
+                u->auth = a;
+                u->cfg = c;
+                u->login_msg = NULL;
+                if (!c.client_id[0])
+                    set_screen(u, SCR_SETUP);
+            }
+            memset(&c, 0, sizeof c);
+            return;
+        }
         if (u->login_msg)
-            text_center(u, u->login_msg, y + 56, FS_S, C_ERR);
+            text_center(u, u->login_msg, y + 84, FS_S, C_ERR);
         return;
     }
     text_center(u, u->login_cancel ? "Cancelling..." : "Waiting for browser...", y + 12, FS_S, C_TEXT);
@@ -997,11 +1127,12 @@ static void draw_login(Ui *u)
 /* --- Soloist key screen -------------------------------------------------- */
 #define SOLOIST_KEY_URL "https://developer.spotify.com/dashboard/soloist"
 
-static void skip_engine(Ui *u)
+/* Back to the player, which kept running behind this screen. */
+static void leave_key(Ui *u)
 {
-    u->engine_skipped = 1;
-    stop_session(u);
-    enter_player(u);
+    memset(u->key_input, 0, sizeof u->key_input);
+    u->setup_msg = NULL;
+    set_screen(u, SCR_PLAYER);
 }
 
 /* '*' for all but the last 4 characters: enough to recognise the key. */
@@ -1011,6 +1142,17 @@ static void mask_secret(const char *s, char *out, size_t cap)
     for (; i + keep < n && i + 1 < cap; i++)
         out[i] = '*';
     snprintf(out + i, cap - i, "%s", s + n - keep);
+}
+
+/* Read SOLOIST_API_KEY from .env (or the environment) again. Only the key
+ * changes; the AuthStore keeps its own copy of the rest. */
+static void reload_key(Ui *u)
+{
+    Config c;
+    if (config_load(&c) == 0) {
+        memcpy(u->cfg.soloist_key, c.soloist_key, sizeof u->cfg.soloist_key);
+        memset(c.soloist_key, 0, sizeof c.soloist_key);
+    }
 }
 
 /* Save the pasted key into <app>/.env (if any), then read .env again. */
@@ -1023,19 +1165,17 @@ static void save_key(Ui *u)
         u->setup_msg = "Could not save the key to .env.";
         return;
     }
-    Config c;
-    if (config_load(&c) == 0) {
-        /* Only the key changes; the AuthStore keeps its own copy. */
-        memcpy(u->cfg.soloist_key, c.soloist_key, sizeof u->cfg.soloist_key);
-        memset(c.soloist_key, 0, sizeof c.soloist_key);
-    }
+    reload_key(u);
     if (!u->cfg.soloist_key[0]) {
         u->setup_msg = typed ? "Could not read the key back from .env."
                              : "Still no SOLOIST_API_KEY in .env.";
         return;
     }
-    u->setup_msg = NULL;
-    start_engine_setup(u, 0);
+    leave_key(u);
+    stop_engine(u); /* a running Soloist still has the old key */
+    u->auto_failed = 0;
+    u->reinstalled = 0;
+    start_engine(u, 0);
 }
 
 static void draw_key(Ui *u)
@@ -1052,7 +1192,7 @@ static void draw_key(Ui *u)
     float y = 48;
     text_center(u, "Spotify C Player", y, FS_L, C_TEXT);
     y += 48;
-    text(u, "To play music on this computer, it needs\na Spotify Soloist API key.", PAD, y,
+    text(u, "To play music on this computer, it needs\na Spotify Soloist API key (optional).", PAD, y,
          FS_S, C_TEXT);
     y += 40;
     text(u, "1. Generate a key at", PAD, y, FS_S, C_DIM);
@@ -1083,18 +1223,16 @@ static void draw_key(Ui *u)
     text(u, u->env_wrapped, PAD, y, FS_S, C_TEXT);
     y += MeasureTextEx(u->font, u->env_wrapped, FS_S, spacing(FS_S)).y + 16;
 
-    Rectangle rs = { ((float)u->w - 240.0f) / 2.0f, y, 240, 28 };
-    if (button(u, W_SKIP, rs, "Skip: control other devices only", FS_S, 0)) {
-        memset(u->key_input, 0, sizeof u->key_input);
-        u->setup_msg = NULL;
-        skip_engine(u);
+    Rectangle rs = { ((float)u->w - 100.0f) / 2.0f, y, 100, 28 };
+    if (button(u, W_BACK, rs, "Back", FS_S, 0)) {
+        leave_key(u);
         return;
     }
     if (u->setup_msg)
         text_center(u, u->setup_msg, y + 40, FS_S, C_ERR);
 }
 
-/* --- engine screen: install, start, one-time pairing --------------------- */
+/* --- Soloist in the player: install, start, pair, stop ------------------ */
 /* Install worker finished: start Soloist on this (the main) thread. */
 static void finish_install(Ui *u)
 {
@@ -1103,96 +1241,113 @@ static void finish_install(Ui *u)
     memcpy(u->eng_err, u->inst.err, sizeof u->eng_err);
     plat_mutex_unlock(u->inst.mu);
     installer_stop(&u->inst);
-    if (rc != 0)
+    u->text_dirty = 1;
+    if (rc == 0) {
+        u->eng_err[0] = 0;
+        u->sol = soloist_start(&u->cfg, ui_wake, NULL);
+        if (!u->sol)
+            snprintf(u->eng_err, sizeof u->eng_err, "Could not start Spotify Soloist.");
+    }
+    if (!u->sol) {
+        u->auto_failed = !u->paired;
         return;
-    u->eng_err[0] = 0;
-    u->sol = soloist_start(&u->cfg, ui_wake, NULL);
-    if (!u->sol)
-        snprintf(u->eng_err, sizeof u->eng_err, "Could not start Spotify Soloist.");
+    }
+    u->sol_was_paired = u->paired;
+    u->transferred = 0;
+    if (!u->paired) /* watch for the user picking us in a Spotify app */
+        device_start(&u->dev, u->auth, NULL, u->cfg.device_name, 1);
 }
 
-/* Soloist's state drives the screen; returns 1 if it left the screen. */
-static int follow_soloist(Ui *u)
+/* Another device of the account is online: when unpaired, start Soloist
+ * (installing it first if needed) so that device can pick this one. */
+static void note_other(Ui *u, const char *name)
 {
-    SoloistState st = soloist_state(u->sol);
-    if (st == SOLOIST_READY || (st == SOLOIST_PAIRING && u->dev.found)) {
-        enter_player(u);
-        return 1;
+    if (!name[0] || strcmp(name, u->cfg.device_name) == 0)
+        return;
+    if (strcmp(u->other_dev, name) != 0) {
+        snprintf(u->other_dev, sizeof u->other_dev, "%s", name);
+        u->text_dirty = 1;
     }
-    if (st == SOLOIST_PAIRING && !u->dev.th)
-        device_start(&u->dev, u->auth, NULL, 1); /* cheap poll for our device */
+    if (!u->paired && !u->auto_failed)
+        start_engine(u, 0);
+}
+
+/* Follow the install worker and Soloist's state; runs every player frame
+ * (frames only happen on events, so this adds no wakeups). */
+static void poll_engine(Ui *u)
+{
+    if (u->inst.th) {
+        plat_mutex_lock(u->inst.mu);
+        int done = u->inst.done;
+        plat_mutex_unlock(u->inst.mu);
+        if (done)
+            finish_install(u);
+    }
+    if (!u->sol)
+        return;
+    SoloistState st = soloist_state(u->sol);
     if (st == SOLOIST_EXPIRED && !u->reinstalled) {
-        /* Expired since the check: replace the build and start once more. */
+        /* Expired mid-session: replace the build and start once more. */
         u->reinstalled = 1;
-        stop_session(u);
-        start_engine_setup(u, 1);
-        return 1;
+        stop_engine(u);
+        start_engine(u, 1);
+        return;
     }
     if (st == SOLOIST_STOPPED || st == SOLOIST_EXPIRED) {
         soloist_status(u->sol, u->eng_err, sizeof u->eng_err);
-        stop_session(u);
+        u->auto_failed = !u->paired; /* a paired one gets the Restart button */
+        stop_engine(u);
+        u->text_dirty = 1;
+        return;
     }
-    return 0;
+    if (u->paired && u->sol_was_paired && st == SOLOIST_PAIRING) {
+        /* Its stored session is gone: pair again like the first time. */
+        u->paired = u->sol_was_paired = 0;
+        (void)config_set_paired(&u->cfg, 0);
+        device_stop(&u->dev);
+        device_start(&u->dev, u->auth, NULL, u->cfg.device_name, 1);
+        u->text_dirty = 1;
+    }
+    if (!u->paired && st == SOLOIST_READY) {
+        /* "running" without "waiting for login": a stored session came
+         * back, so it is paired (from before the marker existed). */
+        device_stop(&u->dev);
+        u->paired = u->sol_was_paired = 1;
+        (void)config_set_paired(&u->cfg, 1);
+        u->text_dirty = 1;
+    }
+    if (!u->paired && u->dev.th) {
+        if (u->dev.found) {
+            /* Picked in a Spotify app: ours from now on, at every launch. */
+            device_stop(&u->dev);
+            u->paired = 1;
+            (void)config_set_paired(&u->cfg, 1);
+            u->text_dirty = 1;
+        } else if (u->dev.idle_out) {
+            stop_engine(u); /* nobody can pick us: save the battery */
+            u->text_dirty = 1;
+        } else {
+            char other[SP_NAME_LEN];
+            plat_mutex_lock(u->dev.mu);
+            memcpy(other, u->dev.other, sizeof other);
+            plat_mutex_unlock(u->dev.mu);
+            if (other[0] && strcmp(other, u->other_dev) != 0) {
+                memcpy(u->other_dev, other, sizeof u->other_dev);
+                u->text_dirty = 1;
+            }
+        }
+    } else if (u->paired && st == SOLOIST_READY && !u->transferred) {
+        u->transferred = 1;
+        device_stop(&u->dev);
+        device_start(&u->dev, u->auth, u->poller, u->cfg.device_name, 0);
+    }
 }
 
-static void draw_engine(Ui *u)
+/* Our device is paired and running: the library plays here. */
+static int local_ready(Ui *u)
 {
-    float maxw = (float)(u->w - 2 * PAD), y = 168;
-    text_center(u, "Spotify C Player", 120, FS_L, C_TEXT);
-    char line[96];
-    if (u->inst.th) {
-        plat_mutex_lock(u->inst.mu);
-        int done = u->inst.done, downloading = u->inst.downloading, pct = u->inst.percent;
-        plat_mutex_unlock(u->inst.mu);
-        if (done) {
-            finish_install(u);
-            u->redraw = 1;
-        } else {
-            if (!downloading)
-                snprintf(line, sizeof line, "Checking Spotify Soloist...");
-            else if (pct < 0)
-                snprintf(line, sizeof line, "Downloading Spotify Soloist...");
-            else
-                snprintf(line, sizeof line, "Downloading Spotify Soloist... %d%%", pct);
-            text_center(u, u->inst.cancel ? "Cancelling..." : line, y, FS_S, C_TEXT);
-            if (downloading)
-                text_center(u, "From Spotify, once every 90 days.", y + 18, FS_S, C_DIM);
-            Rectangle rc = { ((float)u->w - 100.0f) / 2.0f, y + 48, 100, 28 };
-            if (button(u, W_CANCEL, rc, "Cancel", FS_S, 0))
-                u->inst.cancel = 1;
-            return;
-        }
-    }
-    if (u->sol && follow_soloist(u))
-        return;
-
-    Rectangle rs = { ((float)u->w - 240.0f) / 2.0f, y + 96, 240, 28 };
-    if (u->sol) {
-        if (soloist_state(u->sol) == SOLOIST_PAIRING) {
-            text_center(u, "Pair once", y, FS_S, C_ACCENT);
-            text(u, "Open Spotify on your phone or computer\n(same network), open the device list\n"
-                    "and choose \"" CFG_DEVICE_NAME "\".", PAD, y + 24, FS_S, C_TEXT);
-            text_center(u, "Waiting for the device to appear...", y + 80, FS_S, C_DIM);
-            rs.y = y + 104;
-            if (button(u, W_SKIP, rs, "Skip for now", FS_S, 0))
-                enter_player(u); /* Soloist keeps running: pairing can happen later */
-        } else {
-            text_center(u, "Starting Spotify Soloist...", y, FS_S, C_TEXT);
-        }
-        return;
-    }
-
-    /* Failed or cancelled: say why, retry or go on without a local device. */
-    fit_two_lines(u, u->eng_err[0] ? u->eng_err : "Spotify Soloist stopped.", FS_S, maxw,
-                  u->status, sizeof u->status);
-    text(u, u->status, PAD, y, FS_S, C_ERR);
-    Rectangle rr = { ((float)u->w - 120.0f) / 2.0f, y + 44, 120, 32 };
-    if (button(u, W_RETRY, rr, "Retry", FS_S, 1)) {
-        start_engine_setup(u, 0);
-        return;
-    }
-    if (button(u, W_SKIP, rs, "Skip: control other devices only", FS_S, 0))
-        skip_engine(u);
+    SoloistState st = soloist_state(u->sol);
+    return u->sol && u->paired && (st == SOLOIST_READY || st == SOLOIST_PAIRING);
 }
 
 /* --- player screen ------------------------------------------------------- */
@@ -1278,22 +1433,69 @@ static void refresh_player_text(Ui *u, float maxw, float status_w)
         fit_text(u, s->track.album, FS_S, maxw, u->album, sizeof u->album);
     } else {
         fit_text(u, "Nothing playing", FS_L, maxw, u->title, sizeof u->title);
-        fit_text(u, u->sol ? "Press play, or pick this device in Spotify."
-                           : "Pick a device with the Devices button.",
+        fit_text(u, "Press play, or pick a device with Devices.",
                  FS_S, maxw, u->artists, sizeof u->artists);
         u->album[0] = 0;
     }
     sp_fmt_time(u->t_dur, sizeof u->t_dur, s->track.duration_ms);
     u->pos_sec = -1;
 
-    char raw[SP_NAME_LEN + 64 + sizeof u->sol_shown];
-    int err = u->cmd_err ? u->cmd_err : u->poll_err;
-    snprintf(raw, sizeof raw, "%s%s%s%s%s",
-             s->active && s->device_name[0] ? s->device_name : "No active device",
-             err ? " | " : "", err ? sp_strerror(err) : "",
-             u->sol_shown[0] ? " | " : "", u->sol_shown);
-    fit_two_lines(u, raw, FS_S, status_w, u->status, sizeof u->status);
+    fit_two_lines(u, u->msg_shown, FS_S, status_w, u->status, sizeof u->status);
+    fit_two_lines(u, u->hint, FS_S, status_w - 24, u->hint_fit, sizeof u->hint_fit);
     u->text_dirty = 0;
+}
+
+/* The single most relevant status line; returns 1 if it is an error. */
+static int status_message(Ui *u, char *out, size_t cap)
+{
+    const PlaybackState *s = &u->st;
+    if (u->cmd_err == SP_ERR_NODEVICE) {
+        /* Nothing at all could play: say how to get a device, kindly. */
+        if (u->sol && !u->paired)
+            snprintf(out, cap, "To play on this computer: open Spotify on your phone or computer "
+                               "and choose '%s' once.", u->cfg.device_name);
+        else
+            snprintf(out, cap, "Open Spotify on any device to start.");
+        return 0;
+    }
+    int err = u->cmd_err ? u->cmd_err : u->poll_err;
+    if (err) {
+        snprintf(out, cap, "%s", sp_strerror(err));
+        return 1;
+    }
+    if (u->paired && u->eng_err[0] && !u->sol && !u->inst.th) {
+        snprintf(out, cap, "%s%s", strncmp(u->eng_err, "Soloist", 7) ? "Soloist: " : "", u->eng_err);
+        return 1;
+    }
+    if (u->inst.th) {
+        plat_mutex_lock(u->inst.mu);
+        int downloading = u->inst.downloading, pct = u->inst.percent;
+        plat_mutex_unlock(u->inst.mu);
+        if (downloading && pct >= 0)
+            snprintf(out, cap, "Getting Spotify Soloist... %d%%", pct);
+        else if (downloading)
+            snprintf(out, cap, "Getting Spotify Soloist...");
+        else if (u->paired)
+            snprintf(out, cap, "Starting this computer's player...");
+        else
+            out[0] = 0;
+        if (out[0])
+            return 0;
+    }
+    if (u->played_on[0] && !(s->active && s->device_name[0])) {
+        snprintf(out, cap, "Playing on %s", u->played_on);
+        return 0;
+    }
+    if (u->paired && u->sol && soloist_state(u->sol) == SOLOIST_STARTING) {
+        snprintf(out, cap, "Starting this computer's player...");
+        return 0;
+    }
+    if (s->active && s->device_name[0])
+        snprintf(out, cap, "%s on %s", s->is_playing ? "Playing" : "Paused",
+                 strcmp(s->device_name, u->cfg.device_name) == 0 ? "this computer" : s->device_name);
+    else
+        snprintf(out, cap, "No active device");
+    return 0;
 }
 
 /* New image bytes: decode once, shrink to the slot, upload, drop the CPU
@@ -1414,25 +1616,40 @@ static void draw_devices(Ui *u, Rectangle area)
         cmd_post(&u->cmd, CMD_DEVICES, 0);
 
     float y = area.y + row_h + 10;
+    if (soloist_supported() && !u->cfg.soloist_key[0]) {
+        /* The only way to the key screen: nobody is nagged for it. */
+        Rectangle r = { area.x, y, area.width, row_h };
+        if (button(u, W_LIB_ROW + SP_MAX_DEVICES, r, "Enable playback on this computer", FS_S, 0)) {
+            u->setup_msg = NULL;
+            set_screen(u, SCR_KEY);
+            return;
+        }
+        y += row_h + gap;
+    }
     if (u->lib.ndev == 0) {
         text(u, u->lib.devs_loaded ? "No devices. Open Spotify on a phone or computer."
                                    : "Loading devices...", area.x, y + 4, FS_S, C_DIM);
         return;
     }
-    int local = u->sol != NULL;
-    for (int i = 0; i < u->lib.ndev && y + row_h <= area.y + area.height; i++, y += row_h + gap) {
+    /* Our own device first (once paired), then Spotify's order. */
+    int order[SP_MAX_DEVICES], n = 0;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < u->lib.ndev; i++)
+            if ((u->paired && strcmp(u->lib.devs[i].name, u->cfg.device_name) == 0) == !pass)
+                order[n++] = i;
+    for (int k = 0; k < n && y + row_h <= area.y + area.height; k++, y += row_h + gap) {
+        int i = order[k];
         const Device *d = &u->lib.devs[i];
         Rectangle r = { area.x, y, area.width, row_h };
         if (button(u, W_LIB_ROW + i, r, NULL, 0, d->is_active) && d->id[0]) {
             cmd_post_str(&u->cmd, CMD_TRANSFER, 0, d->id);
             u->panel = PANEL_NONE;
         }
-        const char *sub = d->is_active ? "active"
-                        : local && strcmp(d->name, CFG_DEVICE_NAME) == 0 ? "this computer"
-                        : d->type;
+        int ours = u->paired && strcmp(d->name, u->cfg.device_name) == 0;
+        const char *sub = d->is_active ? "active" : ours ? "" : d->type;
         char fit[SP_NAME_LEN];
         float sw = text_w(u, sub, FS_S);
-        fit_text(u, d->name, FS_S, r.width - sw - 28, fit, sizeof fit);
+        fit_text(u, ours ? "This computer" : d->name, FS_S, r.width - sw - 28, fit, sizeof fit);
         text(u, fit, r.x + 8, r.y + 9, FS_S, C_TEXT);
         text(u, sub, r.x + r.width - 8 - sw, r.y + 9, FS_S, d->is_active ? C_TEXT : C_DIM);
     }
@@ -1443,15 +1660,20 @@ static void draw_player(Ui *u)
     uint64_t now = plat_now_ms();
     PlaybackState snap;
 
-    int bg = IsWindowMinimized() || !IsWindowFocused();
+    /* Only minimized counts as background: a visible window, focused or
+     * not, keeps its 1 Hz progress tick. */
+    int bg = IsWindowMinimized();
     if (bg != u->background) {
         u->background = bg;
         poller_set_background(u->poller, bg);
     }
+    u->dev.slow = bg;
 
     if (poller_snapshot(u->poller, &snap, &u->seq)) {
         apply_snapshot(u, &snap, now);
         art_request(u->art, snap.track.art_url); /* no-op unless the URL changed */
+        if (snap.active)
+            note_other(u, snap.device_name);
     }
     if (u->pend.mask && now >= u->pend.until)
         resync(u);
@@ -1459,12 +1681,21 @@ static void draw_player(Ui *u)
     plat_mutex_lock(u->cmd.mu);
     uint64_t cseq = u->cmd.err_seq;
     int cerr = u->cmd.err;
+    char played_on[SP_NAME_LEN], other[SP_NAME_LEN] = "";
+    memcpy(played_on, u->cmd.played_on, sizeof played_on);
+    int fresh = u->cmd.lib_seq != u->dev_seq_noted;
+    u->dev_seq_noted = u->cmd.lib_seq;
+    if (fresh) /* a fresh device list names another device? */
+        for (int i = 0; i < u->cmd.lib.ndev && !other[0]; i++)
+            if (u->cmd.lib.devs[i].id[0] && strcmp(u->cmd.lib.devs[i].name, u->cfg.device_name))
+                memcpy(other, u->cmd.lib.devs[i].name, sizeof other);
     plat_mutex_unlock(u->cmd.mu);
+    note_other(u, other);
     if (cseq != u->cmd_seq) {
         u->cmd_seq = cseq;
-        if (cerr != u->cmd_err)
-            u->text_dirty = 1;
         u->cmd_err = cerr;
+        memcpy(u->played_on, played_on, sizeof u->played_on);
+        u->text_dirty = 1;
         if (cerr != SP_OK)
             resync(u);
     }
@@ -1480,22 +1711,32 @@ static void draw_player(Ui *u)
         advance_signin(u);
         return;
     }
-    /* Soloist's state only matters while it isn't simply ready. */
-    SoloistState sst = soloist_state(u->sol);
-    char sol_raw[sizeof u->sol_status - 16];
-    if (u->sol && sst != SOLOIST_READY)
-        soloist_status(u->sol, sol_raw, sizeof sol_raw);
-    else
-        sol_raw[0] = 0;
-    snprintf(u->sol_status, sizeof u->sol_status, "%s%s", sol_raw[0] ? "Soloist: " : "", sol_raw);
-    if (strcmp(u->sol_status, u->sol_shown) != 0) {
-        memcpy(u->sol_shown, u->sol_status, sizeof u->sol_shown);
+    poll_engine(u);
+    plat_mutex_lock(u->cmd.mu);
+    u->cmd.local = local_ready(u);
+    plat_mutex_unlock(u->cmd.mu);
+
+    char msg[sizeof u->msg];
+    int red = status_message(u, msg, sizeof msg);
+    if (strcmp(msg, u->msg_shown) != 0 || red != u->status_red) {
+        memcpy(u->msg_shown, msg, sizeof u->msg_shown);
+        u->status_red = red;
+        u->text_dirty = 1;
+    }
+    /* The one pairing UI: a dismissible tip while an unpaired Soloist is
+     * discoverable. */
+    char hint[sizeof u->hint] = "";
+    if (u->sol && !u->paired && !u->hint_hidden)
+        snprintf(hint, sizeof hint, "Tip: in Spotify on %s, choose '%s' to play on this computer.",
+                 u->other_dev[0] ? u->other_dev : "your phone or computer", u->cfg.device_name);
+    if (strcmp(hint, u->hint) != 0) {
+        memcpy(u->hint, hint, sizeof u->hint);
         u->text_dirty = 1;
     }
 
     /* Layout (logical pixels). The art square takes the slack height. */
     float w = (float)u->w, h = (float)u->h, cw = w - 2 * PAD;
-    float art = h - 300.0f;
+    float art = h - 300.0f - (u->hint[0] ? 30.0f : 0.0f);
     if (art > cw)
         art = cw;
     if (art < 64.0f)
@@ -1507,12 +1748,19 @@ static void draw_player(Ui *u)
     if (u->text_dirty)
         refresh_player_text(u, cw, cw);
 
-    int sol_down = u->sol && (sst == SOLOIST_STOPPED || sst == SOLOIST_EXPIRED);
-    text(u, u->status, PAD, status_y, FS_S, sol_down || u->cmd_err || u->poll_err ? C_ERR : C_DIM);
+    /* Paired, but Soloist is down (stopped, failed to start or update). */
+    int sol_down = u->paired && !u->sol && !u->inst.th && u->eng_err[0];
+    text(u, u->status, PAD, status_y, FS_S, u->status_red ? C_ERR : C_DIM);
+    if (u->hint[0]) {
+        float hy = status_y - 30;
+        text(u, u->hint_fit, PAD, hy, FS_S, C_DIM);
+        Rectangle rx = { w - PAD - 18, hy, 18, 16 };
+        if (button(u, W_HINT_CLOSE, rx, "x", FS_S, 0))
+            u->hint_hidden = 1; /* Soloist stays discoverable */
+    }
     if (button(u, W_LOGOUT, logout, "Log out", FS_S, 0)) {
         stop_session(u); /* Soloist first: logout deletes its pairing */
         auth_store_logout(u->auth);
-        u->engine_skipped = 0;
         u->reinstalled = 0;
         u->login_msg = NULL;
         advance_signin(u);
@@ -1546,6 +1794,22 @@ static void draw_player(Ui *u)
         DrawTexturePro(u->art_tex, (Rectangle){ 0, 0, (float)u->art_tex.width, (float)u->art_tex.height },
                        art_r, (Vector2){ 0, 0 }, 0.0f, WHITE);
     DrawRectangleRoundedLinesEx(art_r, 0.03f, 8, 1.0f, C_HOVER);
+    if (sol_down) {
+        /* Only on request: an automatic restart could loop forever. */
+        float by = y + (art - 62.0f) / 2.0f;
+        Rectangle rr = { (w - 140.0f) / 2.0f, by, 140, 28 };
+        Rectangle rk = { (w - 140.0f) / 2.0f, by + 34, 140, 28 };
+        if (button(u, W_RESTART, rr, "Restart Soloist", FS_S, 1)) {
+            reload_key(u); /* a key fixed in .env takes effect */
+            start_engine(u, 0);
+            return;
+        }
+        if (button(u, W_CHANGE_KEY, rk, "Change key", FS_S, 0)) {
+            u->setup_msg = NULL;
+            set_screen(u, SCR_KEY);
+            return;
+        }
+    }
     y += art + 14;
 
     text(u, u->title, PAD, y, FS_L, C_TEXT);
@@ -1650,7 +1914,6 @@ static void frame(Ui *u)
     case SCR_SETUP:  draw_setup(u); break;
     case SCR_LOGIN:  draw_login(u); break;
     case SCR_KEY:    draw_key(u); break;
-    case SCR_ENGINE: draw_engine(u); break;
     case SCR_PLAYER: draw_player(u); break;
     }
     if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT))

@@ -107,7 +107,10 @@ static int cmd_login(const Config *cfg, int argc, char **argv)
     signal(SIGINT, prev == SIG_ERR ? SIG_DFL : prev);
     auth_store_free(auth);
     if (rc != 0) {
-        fprintf(stderr, g_interrupted ? "Login cancelled.\n" : "Login failed.\n");
+        if (g_interrupted)
+            fprintf(stderr, "Login cancelled.\n");
+        else
+            fprintf(stderr, "Login failed: %s\n", auth_login_strerror(rc));
         return 1;
     }
     printf("Logged in. Token saved to %s\n", cfg->token_path);
@@ -238,15 +241,23 @@ static int parse_position(const char *s, int *ms)
     return 0;
 }
 
-/* Start playback (uri NULL = resume) on the active device; with none active,
- * fall back to our own engine if it is online so `play` works right after
- * `engine` starts. */
+/* Our device name, for the play fallback (set by cli_dispatch). */
+static const char *g_device_name;
+
+/* Start playback (uri NULL = resume) on the active device; with none
+ * active, on our own engine if it is online (so `play` works right after
+ * `engine` starts), else on any available device of the account. */
 static int play_with_fallback(HttpClient *http, const char *uri, int is_track)
 {
-    int rc = sp_play_fallback(http, uri, is_track, CFG_DEVICE_NAME);
+    Device on;
+    int where;
+    int rc = sp_play_smart(http, uri, is_track, g_device_name, 0, &on, &where);
+    if (rc == SP_OK && where == SP_ON_OTHER)
+        printf("Playing on %s\n", on.name);
     if (rc != SP_ERR_NODEVICE)
         return rc;
-    fprintf(stderr, "No active device. Start one with: " CLI_PROG " engine (or open the app)\n");
+    fprintf(stderr, "No device available. Open Spotify on any device, or run: " CLI_PROG
+                    " engine (or open the app)\n");
     return CLI_REPORTED;
 }
 
@@ -622,12 +633,15 @@ static int cmd_engine(const Config *cfg, int argc, char **argv)
         plat_event_free(wake);
         return 1;
     }
-    /* Blocking stdin read has no portable cancel; on Ctrl-C this thread is
-     * left parked in getchar() and ends with the process. */
-    plat_thread *watch = plat_thread_start(stdin_watch, wake);
+    /* EOF ends `engine` only from a terminal: with stdin /dev/null (nohup,
+     * launchd, systemd) it would stop at once, and `engine &` would be
+     * stopped by SIGTTIN. Blocking stdin read has no portable cancel; on
+     * Ctrl-C this thread is left parked in getchar() and ends with the
+     * process. */
+    plat_thread *watch = plat_stdin_is_tty() ? plat_thread_start(stdin_watch, wake) : NULL;
 
     Soloist *s = NULL;
-    if ((update || !soloist_installed_ok(cfg)) && install_engine(cfg) != 0)
+    if ((update || !soloist_up_to_date(cfg)) && install_engine(cfg) != 0)
         goto out;
     if (g_engine_stop)
         goto out;
@@ -636,8 +650,8 @@ static int cmd_engine(const Config *cfg, int argc, char **argv)
         fprintf(stderr, "error: cannot start %s\n", cfg->soloist_path);
         goto out;
     }
-    printf("Running \"%s\" as a Spotify Connect device. Ctrl-C or EOF to stop.\n",
-           CFG_DEVICE_NAME);
+    printf("Running \"%s\" as a Spotify Connect device. Ctrl-C%s to stop.\n",
+           cfg->device_name, watch ? " or EOF" : "");
     fflush(stdout);
 
     char last[512] = "", cur[512];
@@ -650,8 +664,9 @@ static int cmd_engine(const Config *cfg, int argc, char **argv)
             snprintf(last, sizeof last, "%s", cur);
         }
         if (st == SOLOIST_PAIRING && !hinted) {
-            printf("Pair once: open Spotify on your phone or computer (same network), open the "
-                   "device list and choose \"%s\".\n", CFG_DEVICE_NAME);
+            printf("Pair once: open Spotify on a phone or computer signed in to the same "
+                   "account (same network), open the device list and choose \"%s\".\n",
+                   cfg->device_name);
             hinted = 1;
         }
         fflush(stdout);
@@ -714,6 +729,7 @@ const CliCommand cli_commands[] = {
 
 int cli_dispatch(const Config *cfg, int argc, char **argv)
 {
+    g_device_name = cfg->device_name;
     for (const CliCommand *c = cli_commands; c->name; c++)
         if (!strcmp(c->name, argv[0]))
             return c->run(cfg, argc, argv);

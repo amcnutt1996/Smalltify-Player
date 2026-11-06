@@ -640,19 +640,67 @@ int sp_play_uri(HttpClient *c, const char *device_id, const char *uri, int is_tr
     return rc;
 }
 
-int sp_play_fallback(HttpClient *c, const char *uri, int is_track, const char *fallback_name)
+int sp_pick_device(const Device *devs, int n, const char *local_name, int local_first, int *where)
 {
-    Device d;
-    int rc = uri ? sp_play_uri(c, NULL, uri, is_track) : sp_play(c, NULL);
+    int local = -1, active = -1, other = -1;
+    for (int i = 0; i < n; i++) {
+        if (!devs[i].id[0])
+            continue; /* listed but not remotely controllable */
+        if (local_name && local < 0 && strcmp(devs[i].name, local_name) == 0)
+            local = i;
+        else if (devs[i].is_active && active < 0)
+            active = i;
+        else if (other < 0)
+            other = i;
+    }
+    int w = SP_ON_OTHER, pick = other;
+    if (local >= 0 && (local_first || active < 0)) {
+        w = SP_ON_LOCAL;
+        pick = local;
+    } else if (active >= 0) {
+        w = SP_ON_ACTIVE;
+        pick = active;
+    } else if (local >= 0) {
+        w = SP_ON_LOCAL;
+        pick = local;
+    }
+    if (where)
+        *where = w;
+    return pick;
+}
 
-    if (rc != SP_ERR_NODEVICE)
-        return rc;
-    rc = sp_find_device(c, fallback_name, &d);
+int sp_play_smart(HttpClient *c, const char *uri, int is_track, const char *local_name,
+                  int local_first, Device *on, int *where)
+{
+    Device devs[SP_MAX_DEVICES];
+    int n = 0, w = SP_ON_ACTIVE, rc;
+    if (!local_first) {
+        rc = uri ? sp_play_uri(c, NULL, uri, is_track) : sp_play(c, NULL);
+        if (rc != SP_ERR_NODEVICE) {
+            if (where)
+                *where = SP_ON_ACTIVE;
+            if (on)
+                memset(on, 0, sizeof *on);
+            return rc;
+        }
+    }
+    rc = sp_get_devices(c, devs, SP_MAX_DEVICES, &n);
     if (rc != SP_OK)
         return rc;
-    if (!d.id[0])
-        return SP_ERR_NODEVICE; /* listed but not remotely controllable */
-    return uri ? sp_play_uri(c, d.id, uri, is_track) : sp_play(c, d.id);
+    int i = sp_pick_device(devs, n, local_name, local_first, &w);
+    if (i < 0)
+        return SP_ERR_NODEVICE;
+    if (uri)
+        rc = sp_play_uri(c, devs[i].id, uri, is_track);
+    else if (devs[i].is_active || w == SP_ON_LOCAL)
+        rc = sp_play(c, devs[i].id);
+    else
+        rc = sp_transfer(c, devs[i].id, 1); /* resume where the account left off */
+    if (on)
+        *on = devs[i];
+    if (where)
+        *where = w;
+    return rc;
 }
 
 void sp_fmt_time(char *out, size_t cap, int ms)

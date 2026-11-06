@@ -7,7 +7,9 @@
 #include "http.h"
 #include "model.h"
 
+#ifndef SP_API /* a test build may point it at a local fake */
 #define SP_API "https://api.spotify.com/v1"
+#endif
 
 enum {
     SP_OK           = 0,
@@ -46,7 +48,7 @@ int sp_get_devices(HttpClient *c, Device *out, int cap, int *count);
  * SP_ERR_PARSE if json is not an object with a "devices" array. */
 int sp_parse_devices(const char *json, Device *out, int cap, int *count);
 int sp_transfer(HttpClient *c, const char *device_id, int play);
-/* Find device by exact name (e.g. CFG_DEVICE_NAME). SP_OK and fills out. */
+/* Find device by exact name (e.g. cfg->device_name). SP_OK and fills out. */
 int sp_find_device(HttpClient *c, const char *name, Device *out);
 
 /* --- extras ------------------------------------------------------------- */
@@ -54,10 +56,20 @@ int sp_get_playlists(HttpClient *c, Playlist *out, int cap, int *count);
 int sp_search_tracks(HttpClient *c, const char *query, Track *out, int cap, int *count);
 /* Play a context (playlist/album URI) or, if is_track, a single track URI. */
 int sp_play_uri(HttpClient *c, const char *device_id, const char *uri, int is_track);
-/* Play uri (NULL = resume) on the active device. With none active, play on
- * the device named fallback_name (our Soloist device) instead.
- * SP_ERR_NODEVICE when neither exists. */
-int sp_play_fallback(HttpClient *c, const char *uri, int is_track, const char *fallback_name);
+/* Where sp_play_smart played. */
+enum { SP_ON_ACTIVE, SP_ON_LOCAL, SP_ON_OTHER };
+/* Pure, exposed for tests: the index in devs to play on, or -1, and in
+ * *where the reason. Candidates need an id. local_first: our own device
+ * (named local_name; NULL = none) wins over the active one, else the
+ * active one wins; then any other available device (Spotify's order). */
+int sp_pick_device(const Device *devs, int n, const char *local_name, int local_first, int *where);
+/* Play uri (NULL = resume) on the device sp_pick_device picks from the
+ * device list; with local_first unset, an active device is tried first
+ * without listing. An inactive device gets the uri, or a transfer with
+ * play=true (resume). on and where (both may be NULL) say where.
+ * SP_ERR_NODEVICE when there is no device at all. */
+int sp_play_smart(HttpClient *c, const char *uri, int is_track, const char *local_name,
+                  int local_first, Device *on, int *where);
 /* Parse /me/playlists and /search?type=track bodies (no network; used by
  * tests). SP_OK, or SP_ERR_PARSE if the expected items array is missing. */
 int sp_parse_playlists(const char *json, Playlist *out, int cap, int *count);

@@ -313,8 +313,38 @@ static void test_fmt_time(void)
     assert(!strcmp(b, "1:01:01"));
 }
 
+/* Where Play goes: our device, the active one, any other, or nowhere. */
+static void test_pick_device(void)
+{
+    const char *me = "Spotify C Player (mac)";
+    Device d[3];
+    memset(d, 0, sizeof d);
+    snprintf(d[0].id, sizeof d[0].id, "phone");
+    snprintf(d[0].name, sizeof d[0].name, "iPhone");
+    snprintf(d[1].id, sizeof d[1].id, "mine");
+    snprintf(d[1].name, sizeof d[1].name, "%s", me);
+    snprintf(d[2].name, sizeof d[2].name, "No id TV"); /* not controllable */
+    int where = -1;
+
+    /* (a) paired and ready: a picked uri plays here even if the phone is active. */
+    d[0].is_active = 1;
+    assert(sp_pick_device(d, 3, me, 1, &where) == 1 && where == SP_ON_LOCAL);
+    /* (b) Play keeps an active device. */
+    assert(sp_pick_device(d, 3, me, 0, &where) == 0 && where == SP_ON_ACTIVE);
+    /* nothing active: ours */
+    d[0].is_active = 0;
+    assert(sp_pick_device(d, 3, me, 0, &where) == 1 && where == SP_ON_LOCAL);
+    /* (c) not paired (no local name): the first available device */
+    assert(sp_pick_device(d, 3, NULL, 0, &where) == 0 && where == SP_ON_OTHER);
+    assert(sp_pick_device(d + 1, 2, NULL, 1, &where) == 0 && where == SP_ON_OTHER);
+    /* (d) nothing that can play */
+    assert(sp_pick_device(d + 2, 1, me, 1, &where) == -1);
+    assert(sp_pick_device(d, 0, me, 1, &where) == -1);
+}
+
 int main(void)
 {
+    test_pick_device();
     test_track();
     test_paused_episode();
     test_missing_fields();
