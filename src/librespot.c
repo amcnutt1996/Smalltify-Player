@@ -34,39 +34,60 @@
 struct Librespot {
     plat_proc   *proc;
     plat_thread *reader;
-    plat_mutex  *lock;            /* guards status, login_url, refused */
+    void       (*on_change)(void *ud);
+    void        *ud;
+    plat_mutex  *lock;            /* guards status, login_url, refused, exited */
     char         status[STATUS_LEN];
     char         login_url[URL_LEN]; /* "" unless waiting for OAuth */
     int          refused;         /* sticky: audio keys were denied */
+    int          exited;          /* reader saw EOF */
 };
+
+/* Called without the lock, so the callback may query us. */
+static void changed(Librespot *l)
+{
+    if (l->on_change)
+        l->on_change(l->ud);
+}
 
 static void set_login_url(Librespot *l, const char *url)
 {
     plat_mutex_lock(l->lock);
-    snprintf(l->login_url, sizeof l->login_url, "%s", url);
+    int diff = strcmp(l->login_url, url) != 0;
+    if (diff)
+        snprintf(l->login_url, sizeof l->login_url, "%s", url);
     plat_mutex_unlock(l->lock);
+    if (diff)
+        changed(l);
 }
 
 static void set_status(Librespot *l, const char *s, size_t n)
 {
+    int diff = 0;
     plat_mutex_lock(l->lock);
     /* After a refusal every later line is fallout ("unable to load track",
      * skipping, ...); keep the message the user can act on. */
     if (!l->refused) {
         if (n >= sizeof l->status)
             n = sizeof l->status - 1;
+        diff = strlen(l->status) != n || memcmp(l->status, s, n) != 0;
         memcpy(l->status, s, n);
         l->status[n] = '\0';
     }
     plat_mutex_unlock(l->lock);
+    if (diff)
+        changed(l);
 }
 
 static void set_refused(Librespot *l)
 {
     plat_mutex_lock(l->lock);
+    int diff = !l->refused;
     l->refused = 1;
     snprintf(l->status, sizeof l->status, "%s", REFUSED_STATUS);
     plat_mutex_unlock(l->lock);
+    if (diff)
+        changed(l);
 }
 
 /* Keep lines a user can act on: warnings, errors, sign-in URL, login and
@@ -140,23 +161,31 @@ static void reader_main(void *arg)
     }
     if (len && !overflow)
         on_line(l, line, len);
+    /* EOF means it exited (or closed its output, which is as fatal); set
+     * before notifying, as waitpid may not report the exit quite yet. */
+    plat_mutex_lock(l->lock);
+    l->exited = 1;
+    plat_mutex_unlock(l->lock);
     set_login_url(l, ""); /* its OAuth listener died with it */
     char last[STATUS_LEN];
     librespot_status(l, last, sizeof last);
     char msg[STATUS_LEN + 32];
     int k = snprintf(msg, sizeof msg, "librespot stopped: %s", last);
-    if (k > 0)
+    if (k > 0 && !librespot_playback_refused(l))
         set_status(l, msg, (size_t)k);
+    else
+        changed(l); /* the sticky refusal keeps its text, but exiting is news */
 }
 
-Librespot *librespot_start(const Config *cfg, AuthStore *auth)
+Librespot *librespot_start(const Config *cfg, void (*on_change)(void *ud), void *ud)
 {
-    (void)auth; /* see the file comment: our Web API token cannot log it in */
     if (plat_mkdir(cfg->data_dir) != 0 || plat_mkdir(cfg->librespot_cache) != 0)
         return NULL;
     Librespot *l = calloc(1, sizeof *l);
     if (!l)
         return NULL;
+    l->on_change = on_change;
+    l->ud = ud;
     l->lock = plat_mutex_new();
     if (!l->lock) {
         free(l);
@@ -192,7 +221,12 @@ Librespot *librespot_start(const Config *cfg, AuthStore *auth)
 
 int librespot_running(Librespot *l)
 {
-    return l && plat_proc_alive(l->proc);
+    if (!l)
+        return 0;
+    plat_mutex_lock(l->lock);
+    int exited = l->exited;
+    plat_mutex_unlock(l->lock);
+    return !exited && plat_proc_alive(l->proc);
 }
 
 void librespot_status(Librespot *l, char *buf, size_t cap)

@@ -37,6 +37,22 @@ int  plat_random_bytes(void *buf, size_t len);
 /* Open a URL in the default browser. 0 ok. */
 int  plat_open_url(const char *url);
 
+/* --- process lifetime --------------------------------------------------- */
+/* Call first in main(). Win32: UTF-8 console output, and *argv rebuilt as
+ * UTF-8 from the wide command line (the CRT's argv uses the ANSI code
+ * page). POSIX: ignore SIGPIPE, since a socket closed by the peer must not
+ * kill us and curl's NOSIGNAL mode leaves that to the application.
+ * 0 ok, -1 error. */
+int  plat_startup(int *argc, char ***argv);
+/* Turn SIGINT/SIGTERM/SIGHUP (Win32: console Ctrl-C/Break/close) into a quit
+ * request instead of instant death, so the caller can stop its children.
+ * on_quit(ud) then runs on a helper thread, never in signal context, and
+ * may be NULL. Later calls only swap the callback: once a call returns, the
+ * previous callback will not run again. 0 ok, -1 error. */
+int  plat_quit_watch(void (*on_quit)(void *ud), void *ud);
+/* 1 once a quit was requested through plat_quit_watch's signals. */
+int  plat_quit_requested(void);
+
 /* --- time --------------------------------------------------------------- */
 uint64_t plat_now_ms(void);      /* monotonic */
 int64_t  plat_unix_time(void);   /* wall clock seconds */
@@ -65,7 +81,10 @@ void        plat_event_free(plat_event *e);
 typedef struct plat_proc plat_proc;
 /* Spawn argv[0] (absolute path) with NULL-terminated argv. The child's
  * stdout+stderr are merged into a pipe readable with plat_proc_read.
- * Child must not outlive us: plat_proc_kill on shutdown. NULL on error. */
+ * Stop it with plat_proc_kill on shutdown. If we die without that (crash,
+ * SIGKILL) the child is still terminated: a kill-on-close job (Win32),
+ * PR_SET_PDEATHSIG tied to the calling thread (Linux: spawn from the main
+ * thread), or a tiny watchdog process (other POSIX). NULL on error. */
 plat_proc *plat_proc_spawn(const char *const argv[]);
 /* Blocking read of child output. Returns bytes read, 0 on EOF, -1 error. */
 long       plat_proc_read(plat_proc *p, char *buf, size_t cap);

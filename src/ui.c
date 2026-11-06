@@ -105,12 +105,12 @@ typedef struct {
 } CmdWorker;
 
 /* Our own device as the fallback target, unless Spotify refused it. */
-static int find_local(CmdWorker *w, HttpClient *h, Device *d)
+static const char *local_name(CmdWorker *w)
 {
     plat_mutex_lock(w->mu);
     int no_local = w->no_local;
     plat_mutex_unlock(w->mu);
-    return no_local ? SP_ERR_NODEVICE : sp_find_device(h, CFG_DEVICE_NAME, d);
+    return no_local ? NULL : CFG_DEVICE_NAME;
 }
 
 static int fetch_devices(CmdWorker *w, HttpClient *h)
@@ -131,16 +131,12 @@ static int fetch_devices(CmdWorker *w, HttpClient *h)
 
 static int run_cmd(CmdWorker *w, HttpClient *h, const Cmd *c)
 {
-    Device d;
     int rc;
 
     switch (c->kind) {
     case CMD_PLAY:
-        rc = sp_play(h, NULL);
         /* Nothing active anywhere: start playback on our own device. */
-        if (rc == SP_ERR_NODEVICE && (rc = find_local(w, h, &d)) == SP_OK)
-            rc = sp_transfer(h, d.id, 1);
-        return rc;
+        return sp_play_fallback(h, NULL, 0, local_name(w));
     case CMD_PAUSE:   return sp_pause(h);
     case CMD_NEXT:    return sp_next(h);
     case CMD_PREV:    return sp_prev(h);
@@ -149,10 +145,7 @@ static int run_cmd(CmdWorker *w, HttpClient *h, const Cmd *c)
     case CMD_SHUFFLE: return sp_set_shuffle(h, c->arg);
     case CMD_REPEAT:  return sp_set_repeat(h, (RepeatMode)c->arg);
     case CMD_PLAY_URI:
-        rc = sp_play_uri(h, NULL, c->str, c->arg);
-        if (rc == SP_ERR_NODEVICE && (rc = find_local(w, h, &d)) == SP_OK)
-            rc = sp_play_uri(h, d.id, c->str, c->arg);
-        return rc;
+        return sp_play_fallback(h, c->str, c->arg, local_name(w));
     case CMD_DEVICES:
         return fetch_devices(w, h);
     case CMD_TRANSFER:
@@ -298,12 +291,15 @@ static void device_thread(void *arg)
             break;
         Device list[DEVICE_LIST_CAP];
         int n = 0, busy = 1;
+        /* Each call can take seconds: re-check stop before the next one. */
+        if (plat_event_wait(d->stop, 0))
+            break;
         if (sp_get_devices(http, list, DEVICE_LIST_CAP, &n) == SP_OK) {
             busy = 0;
             for (int j = 0; j < n; j++)
                 busy |= list[j].is_active;
         }
-        if (!busy && sp_transfer(http, me.id, 0) == SP_OK)
+        if (!busy && !plat_event_wait(d->stop, 0) && sp_transfer(http, me.id, 0) == SP_OK)
             poller_kick(d->poller);
         break;
     }
@@ -570,12 +566,6 @@ static void wrap_text(const Ui *u, const char *src, int fs, float maxw, char *ou
     }
 }
 
-static void fmt_time(char *out, size_t cap, int ms)
-{
-    int s = ms > 0 ? ms / 1000 : 0;
-    snprintf(out, cap, "%d:%02d", s / 60, s % 60);
-}
-
 /* --- widgets ------------------------------------------------------------- */
 static int hovered(Rectangle r)
 {
@@ -716,7 +706,7 @@ static void enter_player(Ui *u)
     engine_stop(&u->eng);
     reset_player_state(u);
     if (!u->ls)
-        u->ls = librespot_start(&u->cfg, u->auth);
+        u->ls = librespot_start(&u->cfg, ui_wake, NULL);
     u->poller = poller_start(u->auth, ui_wake, NULL);
     if (!u->poller || cmd_start(&u->cmd, u->auth, u->poller) != 0) {
         stop_session(u);
@@ -861,7 +851,7 @@ static void start_engine(Ui *u)
     u->eng_has_url = 0;
     u->eng_seq = 0;
     if (!u->ls)
-        u->ls = librespot_start(&u->cfg, u->auth);
+        u->ls = librespot_start(&u->cfg, ui_wake, NULL);
     if (!u->ls)
         u->login_msg = "Could not start librespot (missing?).";
     else if (engine_start(&u->eng, &u->cfg, u->ls) != 0) {
@@ -1036,9 +1026,15 @@ static void apply_snapshot(Ui *u, const PlaybackState *s, uint64_t now)
         p->mask &= ~PEND_REPEAT;
     if ((p->mask & PEND_VOLUME) && s->volume == p->volume)
         p->mask &= ~PEND_VOLUME;
+    /* Only text-bearing fields re-fit text; playing tracks snapshot every
+     * second for the progress bar alone. */
+    const PlaybackState *o = &u->st;
+    if (s->active != o->active || strcmp(s->track.uri, o->track.uri) ||
+        strcmp(s->track.name, o->track.name) || strcmp(s->track.artists, o->track.artists) ||
+        strcmp(s->track.album, o->track.album) || strcmp(s->device_name, o->device_name))
+        u->text_dirty = 1;
     u->st = *s;
     pend_reapply(u);
-    u->text_dirty = 1;
 }
 
 static void pend_begin(Ui *u, int bit, uint64_t now)
@@ -1069,7 +1065,7 @@ static void refresh_player_text(Ui *u, float maxw, float status_w)
                  FS_S, maxw, u->artists, sizeof u->artists);
         u->album[0] = 0;
     }
-    fmt_time(u->t_dur, sizeof u->t_dur, s->track.duration_ms);
+    sp_fmt_time(u->t_dur, sizeof u->t_dur, s->track.duration_ms);
     u->pos_sec = -1;
 
     char raw[SP_NAME_LEN + 64 + sizeof u->ls_shown];
@@ -1290,6 +1286,13 @@ static void draw_player(Ui *u)
         u->poll_err = perr;
         u->text_dirty = 1;
     }
+    /* auth.c forgets a revoked refresh token; only a new sign-in helps. */
+    if ((perr == SP_ERR_AUTH || u->cmd_err == SP_ERR_AUTH) && !auth_store_logged_in(u->auth)) {
+        stop_session(u);
+        u->login_msg = "Session expired. Please sign in again.";
+        advance_signin(u);
+        return;
+    }
     if (u->ls)
         librespot_status(u->ls, u->ls_status, sizeof u->ls_status);
     else
@@ -1387,7 +1390,7 @@ static void draw_player(Ui *u)
     int pos = can_seek ? (int)(u->seek_t * (float)dur) : 0;
     if (pos / 1000 != u->pos_sec) {
         u->pos_sec = pos / 1000;
-        fmt_time(u->t_pos, sizeof u->t_pos, pos);
+        sp_fmt_time(u->t_pos, sizeof u->t_pos, pos);
     }
     y += 12;
     text(u, u->t_pos, PAD, y, FS_S, C_DIM);
@@ -1505,6 +1508,9 @@ int ui_run(const Config *cfg)
     SetExitKey(KEY_NULL);
     SetTextLineSpacing(4);
     EnableEventWaiting();
+    /* Quit signals end the loop like closing the window does, so the
+     * cleanup below always runs; the wake breaks glfwWaitEvents. */
+    (void)plat_quit_watch(ui_wake, NULL); /* not fatal: signals then just kill us */
     u->font = GetFontDefault();
 
     int rc = 0;
@@ -1513,13 +1519,14 @@ int ui_run(const Config *cfg)
     else if (enter_app(u) != 0)
         rc = 1;
 
-    while (rc == 0 && !WindowShouldClose())
+    while (rc == 0 && !WindowShouldClose() && !plat_quit_requested())
         frame(u);
 
     /* Every thread that could call ui_wake is joined before the window goes. */
     stop_session(u);
     login_join(u);
     auth_store_free(u->auth);
+    (void)plat_quit_watch(NULL, NULL); /* no wake-ups once GLFW is gone */
     plat_mutex_free(u->mu);
     CloseWindow();
     return rc;

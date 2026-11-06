@@ -7,12 +7,14 @@
 #define LIBRESPOT_H
 
 #include "config.h"
-#include "auth.h"
 
 typedef struct Librespot Librespot;
 
-/* NULL if binary missing or spawn fails. */
-Librespot *librespot_start(const Config *cfg, AuthStore *auth);
+/* NULL if binary missing or spawn fails. Needs no Web API login: librespot
+ * signs in on its own. on_change(ud) runs on the reader thread whenever
+ * the status, login URL or refusal changes, and once more when librespot
+ * exits (on_change may be NULL). */
+Librespot *librespot_start(const Config *cfg, void (*on_change)(void *ud), void *ud);
 int        librespot_running(Librespot *l);
 /* Copy last meaningful output line (errors/status) for display. */
 void       librespot_status(Librespot *l, char *buf, size_t cap);

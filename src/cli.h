@@ -5,6 +5,8 @@
 
 #include "config.h"
 
+#define CLI_PROG "spotify-c-player"
+
 typedef struct {
     const char *name;
     const char *usage;   /* e.g. "seek <seconds>" */
@@ -15,6 +17,6 @@ typedef struct {
 extern const CliCommand cli_commands[];
 
 int  cli_dispatch(const Config *cfg, int argc, char **argv); /* argv[0] = command */
-void cli_usage(const char *prog);
+void cli_usage(void); /* always names the program CLI_PROG */
 
 #endif

@@ -5,10 +5,15 @@
 #include "cli.h"
 #include "config.h"
 #include "http.h"
+#include "platform.h"
 #include "ui.h"
 
 int main(int argc, char **argv)
 {
+    if (plat_startup(&argc, &argv) != 0) {
+        fprintf(stderr, "error: cannot initialize the process\n");
+        return 1;
+    }
     Config cfg;
     if (config_load(&cfg) != 0) {
         fprintf(stderr, "error: cannot resolve application folder\n");
@@ -23,7 +28,7 @@ int main(int argc, char **argv)
     if (argc < 2)
         rc = ui_run(&cfg);
     else if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help") || !strcmp(argv[1], "help")) {
-        cli_usage(argv[0]);
+        cli_usage();
         rc = 0;
     } else
         rc = cli_dispatch(&cfg, argc - 1, argv + 1);

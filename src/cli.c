@@ -16,10 +16,21 @@
 #include "platform.h"
 #include "spotify.h"
 
-#define CLI_PROG "spotify-c-player"
+/* Returned by helpers that already printed their own message. */
+#define CLI_REPORTED 1
 
-/* Set by SIGINT: cancels a login and ends `engine`. auth_store_login takes
- * a `const volatile int *`, which sig_atomic_t is on every supported OS. */
+static int bad_usage(const char *name)
+{
+    for (const CliCommand *c = cli_commands; c->name; c++)
+        if (!strcmp(c->name, name)) {
+            fprintf(stderr, "usage: " CLI_PROG " %s\n", c->usage);
+            break;
+        }
+    return 1;
+}
+
+/* Set by SIGINT: cancels a login. auth_store_login takes a
+ * `const volatile int *`, which sig_atomic_t is on every supported OS. */
 static volatile sig_atomic_t g_interrupted;
 
 static void on_sigint(int sig)
@@ -78,7 +89,8 @@ static int open_session(const Config *cfg, AuthStore **auth, HttpClient **http)
 
 static int cmd_login(const Config *cfg, int argc, char **argv)
 {
-    (void)argc; (void)argv;
+    if (argc != 1)
+        return bad_usage(argv[0]);
     if (!cfg->client_id[0]) {
         print_missing_client_id(cfg);
         return 1;
@@ -104,26 +116,19 @@ static int cmd_login(const Config *cfg, int argc, char **argv)
 
 static int cmd_logout(const Config *cfg, int argc, char **argv)
 {
-    (void)argc; (void)argv;
+    if (argc != 1)
+        return bad_usage(argv[0]);
     AuthStore *auth = auth_store_new(cfg);
     if (!auth) {
         fprintf(stderr, "error: out of memory\n");
         return 1;
     }
+    int had = auth_store_logged_in(auth) || librespot_has_credentials(cfg);
     auth_store_logout(auth);
     auth_store_free(auth);
-    printf("Logged out (removed saved token and playback credentials).\n");
+    printf(had ? "Logged out (removed saved token and playback credentials).\n"
+               : "Not logged in.\n");
     return 0;
-}
-
-/* m:ss, or h:mm:ss for long episodes. */
-static void fmt_time(char *out, size_t cap, int ms)
-{
-    int s = ms > 0 ? ms / 1000 : 0;
-    if (s >= 3600)
-        snprintf(out, cap, "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60);
-    else
-        snprintf(out, cap, "%d:%02d", s / 60, s % 60);
 }
 
 static void print_playback(const PlaybackState *st)
@@ -144,8 +149,8 @@ static void print_playback(const PlaybackState *st)
     if (t->album[0])
         printf("  %s\n", t->album);
 
-    fmt_time(pos, sizeof pos, st->progress_ms);
-    fmt_time(dur, sizeof dur, t->duration_ms);
+    sp_fmt_time(pos, sizeof pos, st->progress_ms);
+    sp_fmt_time(dur, sizeof dur, t->duration_ms);
     printf("  %s / %s", pos, dur);
     if (st->device_name[0])
         printf("  on %s", st->device_name);
@@ -165,7 +170,8 @@ static int cmd_now(const Config *cfg, int argc, char **argv)
     PlaybackState st;
     int rc;
 
-    (void)argc; (void)argv;
+    if (argc != 1)
+        return bad_usage(argv[0]);
     if (open_session(cfg, &auth, &http) != 0)
         return 1;
     rc = sp_get_playback(http, &st);
@@ -177,19 +183,6 @@ static int cmd_now(const Config *cfg, int argc, char **argv)
     }
     print_playback(&st);
     return 0;
-}
-
-/* Returned by helpers that already printed their own message. */
-#define CLI_REPORTED 1
-
-static int bad_usage(const char *name)
-{
-    for (const CliCommand *c = cli_commands; c->name; c++)
-        if (!strcmp(c->name, name)) {
-            fprintf(stderr, "usage: " CLI_PROG " %s\n", c->usage);
-            break;
-        }
-    return 1;
 }
 
 /* Releases the session and turns an SP_* code into an exit code. */
@@ -250,15 +243,8 @@ static int parse_position(const char *s, int *ms)
  * `engine` starts. */
 static int play_with_fallback(HttpClient *http, const char *uri, int is_track)
 {
-    Device d;
-    int rc = uri ? sp_play_uri(http, NULL, uri, is_track) : sp_play(http, NULL);
-
+    int rc = sp_play_fallback(http, uri, is_track, CFG_DEVICE_NAME);
     if (rc != SP_ERR_NODEVICE)
-        return rc;
-    rc = sp_find_device(http, CFG_DEVICE_NAME, &d);
-    if (rc == SP_OK && d.id[0])
-        return uri ? sp_play_uri(http, d.id, uri, is_track) : sp_play(http, d.id);
-    if (rc != SP_OK && rc != SP_ERR_NODEVICE)
         return rc;
     fprintf(stderr, "No active device. Start one with: " CLI_PROG " engine (or open the app)\n");
     return CLI_REPORTED;
@@ -529,8 +515,8 @@ static int cmd_search(const Config *cfg, int argc, char **argv)
     char query[SP_NAME_LEN];
     int first = 1, pick = 0, n, rc;
 
-    if (argc >= 3 && !strcmp(argv[1], "-p")) {
-        if (parse_int(argv[2], 1, CLI_MAX_RESULTS, &pick) != 0)
+    if (argc >= 2 && !strcmp(argv[1], "-p")) {
+        if (argc < 4 || parse_int(argv[2], 1, CLI_MAX_RESULTS, &pick) != 0)
             return bad_usage(argv[0]);
         first = 3;
     }
@@ -557,27 +543,41 @@ static int cmd_search(const Config *cfg, int argc, char **argv)
     return finish(auth, http, rc);
 }
 
-/* Ends `engine` on stdin EOF (Ctrl-D / closed pipe). */
+/* Set once stdin hits EOF (Ctrl-D / closed pipe): ends `engine`. */
+static volatile sig_atomic_t g_stdin_eof;
+
 static void stdin_watch(void *arg)
 {
     int ch;
     while ((ch = getchar()) != EOF) {
     }
+    g_stdin_eof = 1;
     plat_event_signal(arg);
+}
+
+static void wake_event(void *ev)
+{
+    plat_event_signal(ev);
 }
 
 static int cmd_engine(const Config *cfg, int argc, char **argv)
 {
-    (void)argc; (void)argv;
-    AuthStore *auth;
-    if (open_session(cfg, &auth, NULL) != 0)
+    if (argc != 1)
+        return bad_usage(argv[0]);
+    /* Ctrl-C, SIGTERM and SIGHUP all end the loop below, so librespot is
+     * stopped instead of orphaned. */
+    plat_event *wake = plat_event_new();
+    if (!wake || plat_quit_watch(wake_event, wake) != 0) {
+        fprintf(stderr, "error: cannot set up signal handling\n");
+        plat_quit_watch(NULL, NULL);
+        plat_event_free(wake);
         return 1;
-    plat_event *eof = plat_event_new();
-    Librespot *ls = eof ? librespot_start(cfg, auth) : NULL;
+    }
+    Librespot *ls = librespot_start(cfg, wake_event, wake);
     if (!ls) {
         fprintf(stderr, "error: cannot start %s\n", cfg->librespot_path);
-        plat_event_free(eof);
-        auth_store_free(auth);
+        plat_quit_watch(NULL, NULL);
+        plat_event_free(wake);
         return 1;
     }
     printf("Running \"%s\" as a Spotify Connect device. Ctrl-C or EOF to stop.\n",
@@ -585,14 +585,12 @@ static int cmd_engine(const Config *cfg, int argc, char **argv)
     if (!librespot_has_credentials(cfg))
         printf("First run: playback needs a one-time Spotify sign-in in the browser.\n");
     fflush(stdout);
-    g_interrupted = 0;
-    void (*prev)(int) = signal(SIGINT, on_sigint);
     /* Blocking stdin read has no portable cancel; on Ctrl-C this thread is
      * left parked in getchar() and ends with the process. */
-    plat_thread *watch = plat_thread_start(stdin_watch, eof);
+    plat_thread *watch = plat_thread_start(stdin_watch, wake);
 
     char last[1024] = "", cur[1024], url[4096];
-    int saw_eof = 0, url_shown = 0, refused_shown = 0;
+    int url_shown = 0, refused_shown = 0;
     for (;;) {
         librespot_status(ls, cur, sizeof cur);
         if (librespot_playback_refused(ls)) {
@@ -615,24 +613,21 @@ static int cmd_engine(const Config *cfg, int argc, char **argv)
             url_shown = 0;
         }
         fflush(stdout);
-        if (g_interrupted || !librespot_running(ls))
+        if (plat_quit_requested() || g_stdin_eof || !librespot_running(ls))
             break;
-        /* Wakes at once on EOF; the 500 ms tick picks up Ctrl-C and status. */
-        if (plat_event_wait(eof, 500)) {
-            saw_eof = 1;
-            break;
-        }
+        /* Signaled by librespot changes (its exit included), quit signals
+         * and stdin EOF: no polling. */
+        plat_event_wait(wake, 3600000u);
     }
-    int crashed = !g_interrupted && !saw_eof;
+    int crashed = !plat_quit_requested() && !g_stdin_eof;
     librespot_stop(ls);
-    signal(SIGINT, prev == SIG_ERR ? SIG_DFL : prev);
-    if (saw_eof || !watch) {
+    plat_quit_watch(NULL, NULL); /* a later signal must not touch `wake` */
+    if (g_stdin_eof || !watch) {
         plat_thread_join(watch);
-        plat_event_free(eof);
+        plat_event_free(wake);
     }
-    /* else the watcher still blocks in getchar() holding `eof`; both are
+    /* else the watcher still blocks in getchar() holding `wake`; both are
      * reclaimed at process exit. */
-    auth_store_free(auth);
     return crashed ? 1 : 0;
 }
 
@@ -664,15 +659,15 @@ int cli_dispatch(const Config *cfg, int argc, char **argv)
         if (!strcmp(c->name, argv[0]))
             return c->run(cfg, argc, argv);
     fprintf(stderr, "unknown command '%s'\n\n", argv[0]);
-    cli_usage(CLI_PROG);
+    cli_usage();
     return 2;
 }
 
-void cli_usage(const char *prog)
+void cli_usage(void)
 {
-    printf("Usage: %s [command]\n"
+    printf("Usage: " CLI_PROG " [command]\n"
            "Without a command the player window opens.\n\n"
-           "Commands:\n", prog);
+           "Commands:\n");
     for (const CliCommand *c = cli_commands; c->name; c++)
         printf("  %s\n", c->usage);
 }

@@ -132,7 +132,9 @@ static BOOL CALLBACK exe_dir_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
     if (from_wide(best, tmp, sizeof tmp) != 0)
         return TRUE;
     strip_last_component(tmp);
-    snprintf(g_exe_dir, sizeof g_exe_dir, "%s", tmp);
+    int k = snprintf(g_exe_dir, sizeof g_exe_dir, "%s", tmp);
+    if (k < 0 || (size_t)k >= sizeof g_exe_dir)
+        g_exe_dir[0] = '\0'; /* a cut-off path names the wrong folder: fail */
     return TRUE;
 }
 
@@ -297,6 +299,77 @@ int plat_open_url(const char *url)
     HINSTANCE r = ShellExecuteW(NULL, L"open", w, NULL, NULL, SW_SHOWNORMAL);
     free(w);
     return (INT_PTR)r > 32 ? 0 : -1;
+}
+
+int plat_startup(int *argc, char ***argv)
+{
+    SetConsoleOutputCP(CP_UTF8); /* fails harmlessly without a console */
+    int n;
+    wchar_t **wv = CommandLineToArgvW(GetCommandLineW(), &n);
+    if (!wv)
+        return -1;
+    size_t bytes = (size_t)(n + 1) * sizeof(char *);
+    for (int i = 0; i < n; i++) {
+        int k = WideCharToMultiByte(CP_UTF8, 0, wv[i], -1, NULL, 0, NULL, NULL);
+        if (k <= 0) {
+            LocalFree(wv);
+            return -1;
+        }
+        bytes += (size_t)k;
+    }
+    /* One block that lives as long as the process, like the CRT's argv. */
+    char **out = malloc(bytes);
+    if (!out) {
+        LocalFree(wv);
+        return -1;
+    }
+    char *s = (char *)(out + n + 1), *end = (char *)out + bytes;
+    for (int i = 0; i < n; i++) {
+        out[i] = s;
+        s += WideCharToMultiByte(CP_UTF8, 0, wv[i], -1, s, (int)(end - s), NULL, NULL);
+    }
+    out[n] = NULL;
+    LocalFree(wv);
+    *argc = n;
+    *argv = out;
+    return 0;
+}
+
+static volatile LONG g_quit;
+static SRWLOCK g_quit_lock = SRWLOCK_INIT;
+static void (*g_quit_fn)(void *);
+static void *g_quit_ud;
+static int g_quit_installed;
+
+/* Runs on a thread the system creates, so calling back is safe. After a
+ * close/logoff/shutdown event Windows ends the process once this returns;
+ * the kill-on-close job still takes the children down with it. */
+static BOOL WINAPI quit_ctrl(DWORD type)
+{
+    (void)type;
+    InterlockedExchange(&g_quit, 1);
+    AcquireSRWLockExclusive(&g_quit_lock);
+    if (g_quit_fn)
+        g_quit_fn(g_quit_ud);
+    ReleaseSRWLockExclusive(&g_quit_lock);
+    return TRUE;
+}
+
+int plat_quit_watch(void (*on_quit)(void *ud), void *ud)
+{
+    AcquireSRWLockExclusive(&g_quit_lock);
+    g_quit_fn = on_quit;
+    g_quit_ud = ud;
+    if (!g_quit_installed)
+        g_quit_installed = SetConsoleCtrlHandler(quit_ctrl, TRUE) != 0;
+    int ok = g_quit_installed;
+    ReleaseSRWLockExclusive(&g_quit_lock);
+    return ok ? 0 : -1;
+}
+
+int plat_quit_requested(void)
+{
+    return InterlockedCompareExchange(&g_quit, 0, 0) != 0;
 }
 
 uint64_t plat_now_ms(void)
@@ -642,6 +715,7 @@ void plat_close(plat_sock s)
 #include <mach-o/dyld.h>
 #endif
 #ifdef __linux__
+#include <sys/prctl.h>
 #include <sys/random.h>
 #endif
 
@@ -665,7 +739,9 @@ static void exe_dir_init(void)
     strip_last_component(real);
     if (!real[0]) /* executable in "/" */
         snprintf(real, sizeof real, "/");
-    snprintf(g_exe_dir, sizeof g_exe_dir, "%s", real);
+    int k = snprintf(g_exe_dir, sizeof g_exe_dir, "%s", real);
+    if (k < 0 || (size_t)k >= sizeof g_exe_dir)
+        g_exe_dir[0] = '\0'; /* a cut-off path names the wrong folder: fail */
 }
 
 const char *plat_exe_dir(void)
@@ -678,6 +754,103 @@ static int set_cloexec(int fd)
 {
     int fl = fcntl(fd, F_GETFD);
     return (fl < 0 || fcntl(fd, F_SETFD, fl | FD_CLOEXEC) < 0) ? -1 : 0;
+}
+
+int plat_startup(int *argc, char ***argv)
+{
+    (void)argc; (void)argv; /* already UTF-8 */
+    return signal(SIGPIPE, SIG_IGN) == SIG_ERR ? -1 : 0;
+}
+
+static volatile sig_atomic_t g_quit;
+static int g_quit_pipe[2] = { -1, -1 };
+static pthread_mutex_t g_quit_lock = PTHREAD_MUTEX_INITIALIZER; /* guards fn, ud */
+static void (*g_quit_fn)(void *);
+static void *g_quit_ud;
+
+/* Self-pipe: write() is async-signal-safe, waking a UI is not. The write
+ * end is non-blocking, and a full pipe already holds a pending wake-up. */
+static void quit_signal(int sig)
+{
+    (void)sig;
+    int saved = errno;
+    g_quit = 1;
+    ssize_t r = write(g_quit_pipe[1], "q", 1);
+    (void)r;
+    errno = saved;
+}
+
+/* Parked in read() (no CPU) until a quit signal arrives. */
+static void *quit_thread(void *arg)
+{
+    (void)arg;
+    char c;
+    for (;;) {
+        ssize_t n = read(g_quit_pipe[0], &c, 1);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return NULL;
+        pthread_mutex_lock(&g_quit_lock);
+        if (g_quit_fn)
+            g_quit_fn(g_quit_ud);
+        pthread_mutex_unlock(&g_quit_lock);
+    }
+}
+
+/* Caller holds g_quit_lock. */
+static int quit_install(void)
+{
+    int fds[2];
+    if (pipe(fds) != 0)
+        return -1;
+    pthread_t t;
+    if (set_cloexec(fds[0]) != 0 || set_cloexec(fds[1]) != 0 ||
+        fcntl(fds[1], F_SETFL, O_NONBLOCK) != 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return -1;
+    }
+    g_quit_pipe[0] = fds[0];
+    g_quit_pipe[1] = fds[1];
+    if (pthread_create(&t, NULL, quit_thread, NULL) != 0) {
+        close(fds[0]);
+        close(fds[1]);
+        g_quit_pipe[0] = g_quit_pipe[1] = -1;
+        return -1;
+    }
+    pthread_detach(t);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = quit_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART; /* don't fail other threads' syscalls with EINTR */
+    static const int sigs[] = { SIGINT, SIGTERM, SIGHUP };
+    int rc = 0;
+    for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
+        struct sigaction old;
+        /* Respect an inherited "ignore" (nohup, background shell jobs). */
+        if (sigaction(sigs[i], NULL, &old) == 0 && old.sa_handler == SIG_IGN)
+            continue;
+        if (sigaction(sigs[i], &sa, NULL) != 0)
+            rc = -1;
+    }
+    return rc;
+}
+
+int plat_quit_watch(void (*on_quit)(void *ud), void *ud)
+{
+    pthread_mutex_lock(&g_quit_lock);
+    g_quit_fn = on_quit;
+    g_quit_ud = ud;
+    int rc = g_quit_pipe[0] < 0 ? quit_install() : 0;
+    pthread_mutex_unlock(&g_quit_lock);
+    return rc;
+}
+
+int plat_quit_requested(void)
+{
+    return g_quit != 0;
 }
 
 int plat_mkdir(const char *path)
@@ -952,13 +1125,15 @@ struct plat_proc {
     pid_t pid;
     int out;
     int reaped;
+    pid_t guard;    /* watchdog process, 0 if none */
+    int guard_fd;   /* our end of the watchdog's pipe, -1 if none */
     pthread_mutex_t lock; /* serializes waitpid between alive/terminate */
 };
 
-/* Spawn with stdin = /dev/null and stdout+stderr = out_fd (or /dev/null when
- * out_fd < 0). Signals the child must see as default are reset because
- * ignored dispositions survive exec. */
-static int spawn_child(pid_t *pid, const char *const argv[], int search_path, int out_fd)
+/* Spawn with stdin = in_fd (or /dev/null when in_fd < 0) and stdout+stderr
+ * = out_fd (or /dev/null when out_fd < 0). Signals the child must see as
+ * default are reset because ignored dispositions survive exec. */
+static int spawn_child(pid_t *pid, const char *const argv[], int search_path, int in_fd, int out_fd)
 {
     posix_spawn_file_actions_t fa;
     posix_spawnattr_t at;
@@ -983,7 +1158,11 @@ static int spawn_child(pid_t *pid, const char *const argv[], int search_path, in
     rc = posix_spawnattr_setflags(&at, flags);
     if (!rc) rc = posix_spawnattr_setsigmask(&at, &none);
     if (!rc) rc = posix_spawnattr_setsigdefault(&at, &defs);
-    if (!rc) rc = posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    if (in_fd >= 0) {
+        if (!rc) rc = posix_spawn_file_actions_adddup2(&fa, in_fd, 0);
+    } else {
+        if (!rc) rc = posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    }
     if (out_fd >= 0) {
         if (!rc) rc = posix_spawn_file_actions_adddup2(&fa, out_fd, 1);
         if (!rc) rc = posix_spawn_file_actions_adddup2(&fa, out_fd, 2);
@@ -1001,11 +1180,89 @@ static int spawn_child(pid_t *pid, const char *const argv[], int search_path, in
     return rc;
 }
 
+#ifdef __linux__
+/* posix_spawn can't run code in the child, so fork: PR_SET_PDEATHSIG makes
+ * the kernel SIGTERM the child when the thread that forked it dies, crash
+ * and SIGKILL included. Only async-signal-safe calls between fork and exec. */
+static int spawn_tied(pid_t *pid, const char *const argv[], int out_fd)
+{
+    if (access(argv[0], X_OK) != 0)
+        return -1; /* fail here like posix_spawn would, not in the child */
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    sigset_t none;
+    sigemptyset(&none);
+    pid_t parent = getpid();
+    pid_t c = fork();
+    if (c < 0)
+        return -1;
+    if (c == 0) {
+        static const int defs[] = { SIGPIPE, SIGINT, SIGTERM, SIGHUP };
+        for (size_t i = 0; i < sizeof defs / sizeof defs[0]; i++)
+            sigaction(defs[i], &dfl, NULL);
+        sigprocmask(SIG_SETMASK, &none, NULL);
+        int nul = open("/dev/null", O_RDONLY);
+        if (nul < 0 || (nul != 0 && (dup2(nul, 0) < 0 || close(nul) != 0)) ||
+            dup2(out_fd, 1) < 0 || dup2(out_fd, 2) < 0 ||
+            prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || getppid() != parent)
+            _exit(127); /* the last check: we already died before prctl */
+        execv(argv[0], (char *const *)(uintptr_t)argv);
+        _exit(127);
+    }
+    *pid = c;
+    return 0;
+}
+#else
+/* No PR_SET_PDEATHSIG here (macOS): a /bin/sh watchdog blocks reading a
+ * pipe whose only write end we hold (close-on-exec, so the child never has
+ * it). However we die, the kernel closes it, read sees EOF and the watchdog
+ * sends the child SIGTERM. One idle process is the price; a pid file would
+ * leave a crashed session's engine playing until the next start. Not
+ * fatal if it fails: the quit signals are still handled. */
+static void start_guard(plat_proc *p)
+{
+    char script[64];
+    int fds[2];
+    int n = snprintf(script, sizeof script, "read x; kill %ld", (long)p->pid);
+    if (n < 0 || (size_t)n >= sizeof script || pipe(fds) != 0)
+        return;
+    const char *argv[] = { "/bin/sh", "-c", script, NULL };
+    if (set_cloexec(fds[0]) == 0 && set_cloexec(fds[1]) == 0 &&
+        spawn_child(&p->guard, argv, 0, fds[0], -1) == 0) {
+        close(fds[0]);
+        p->guard_fd = fds[1];
+        return;
+    }
+    p->guard = 0;
+    close(fds[0]);
+    close(fds[1]);
+}
+#endif
+
+/* Caller holds p->lock. Ends the watchdog before the child's pid is freed
+ * (or right after a natural exit), so it can never signal a reused pid. */
+static void stop_guard(plat_proc *p)
+{
+    if (p->guard > 0) {
+        kill(p->guard, SIGKILL);
+        while (waitpid(p->guard, NULL, 0) < 0 && errno == EINTR) {
+        }
+        p->guard = 0;
+    }
+    if (p->guard_fd >= 0) {
+        close(p->guard_fd);
+        p->guard_fd = -1;
+    }
+}
+
 plat_proc *plat_proc_spawn(const char *const argv[])
 {
     plat_proc *p = calloc(1, sizeof *p);
     if (!p)
         return NULL;
+    p->guard_fd = -1;
     int fds[2];
 #ifdef __linux__
     if (pipe2(fds, O_CLOEXEC) != 0) {
@@ -1021,10 +1278,17 @@ plat_proc *plat_proc_spawn(const char *const argv[])
 #endif
     if (pthread_mutex_init(&p->lock, NULL) != 0)
         goto fail;
-    if (spawn_child(&p->pid, argv, 0, fds[1]) != 0) {
+#ifdef __linux__
+    if (spawn_tied(&p->pid, argv, fds[1]) != 0) {
+#else
+    if (spawn_child(&p->pid, argv, 0, -1, fds[1]) != 0) {
+#endif
         pthread_mutex_destroy(&p->lock);
         goto fail;
     }
+#ifndef __linux__
+    start_guard(p);
+#endif
     close(fds[1]); /* EOF reaches the reader once the child exits */
     p->out = fds[0];
     return p;
@@ -1050,8 +1314,10 @@ static int reap_nohang(plat_proc *p)
 {
     if (!p->reaped) {
         pid_t r = waitpid(p->pid, NULL, WNOHANG);
-        if (r == p->pid || (r < 0 && errno == ECHILD))
+        if (r == p->pid || (r < 0 && errno == ECHILD)) {
             p->reaped = 1;
+            stop_guard(p);
+        }
     }
     return p->reaped;
 }
@@ -1072,6 +1338,7 @@ void plat_proc_terminate(plat_proc *p)
         return;
     pthread_mutex_lock(&p->lock);
     if (!reap_nohang(p)) {
+        stop_guard(p);
         kill(p->pid, SIGTERM);
         /* POSIX has no timed waitpid; back off from 1 ms to 64 ms so the
          * usual quick exit is reaped fast with only a few dozen wakeups. */
@@ -1124,7 +1391,7 @@ int plat_open_url(const char *url)
     int search = 1;
 #endif
     pid_t pid;
-    if (spawn_child(&pid, argv, search, -1) != 0)
+    if (spawn_child(&pid, argv, search, -1, -1) != 0)
         return -1;
     pthread_t t;
     if (pthread_create(&t, NULL, reap_thread, (void *)(intptr_t)pid) == 0)
