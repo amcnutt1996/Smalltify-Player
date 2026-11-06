@@ -217,8 +217,38 @@ static void test_set_env_value(void)
     assert(plat_remove_tree(root) == 0);
 }
 
+static void test_device_name(void)
+{
+    char out[CFG_DEVICE_NAME_LEN];
+    config_device_name("laptop", out, sizeof out);
+    assert(!strcmp(out, "Spotify C Player (laptop)"));
+    config_device_name("Gregs-MacBook-Pro.local", out, sizeof out);
+    assert(!strcmp(out, "Spotify C Player (Gregs-MacBook-Pro)"));
+    config_device_name("", out, sizeof out);
+    assert(!strcmp(out, "Spotify C Player"));
+    config_device_name(".local", out, sizeof out);
+    assert(!strcmp(out, "Spotify C Player"));
+    config_device_name("a\tb\nc", out, sizeof out); /* control characters dropped */
+    assert(!strcmp(out, "Spotify C Player (abc)"));
+
+    /* Long names are cut to fit, never inside a UTF-8 character. */
+    char host[200];
+    memset(host, 'x', sizeof host - 1);
+    host[sizeof host - 1] = 0;
+    config_device_name(host, out, sizeof out);
+    assert(strlen(out) == sizeof out - 1 && out[strlen(out) - 1] == ')');
+    char small[24]; /* "Spotify C Player (" is 18 bytes: room for 4 */
+    config_device_name("ab\xC3\xA9z", small, sizeof small);  /* "abéz": 5 bytes */
+    assert(!strcmp(small, "Spotify C Player (ab\xC3\xA9)"));
+    config_device_name("abc\xC3\xA9", small, sizeof small);  /* é would straddle */
+    assert(!strcmp(small, "Spotify C Player (abc)"));
+    config_device_name("x", small, 10);                   /* no room for a host */
+    assert(!strcmp(small, "Spotify C"));
+}
+
 int main(void)
 {
+    test_device_name();
     test_env();
     test_env_set();
     test_token();

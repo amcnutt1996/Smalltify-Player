@@ -168,6 +168,28 @@ static void load_setting(const char *env_text, const char *key, char *out, size_
         out[0] = '\0';
 }
 
+void config_device_name(const char *host, char *out, size_t cap)
+{
+    static const char prefix[] = CFG_DEVICE_NAME " (";
+    char h[256];
+    size_t n = 0;
+    for (; *host && *host != '.' && n + 1 < sizeof h; host++)
+        if ((unsigned char)*host >= ' ' && *host != 0x7f)
+            h[n++] = *host;
+    h[n] = '\0';
+    size_t plen = sizeof prefix - 1;
+    size_t room = cap > plen + 2 ? cap - plen - 2 : 0; /* ")" and NUL */
+    if (n > room) {
+        n = room;
+        while (n > 0 && ((unsigned char)h[n] & 0xC0) == 0x80)
+            n--; /* never end inside a UTF-8 character */
+    }
+    if (n == 0)
+        snprintf(out, cap, "%s", CFG_DEVICE_NAME);
+    else
+        snprintf(out, cap, "%s%.*s)", prefix, (int)n, h);
+}
+
 int config_load(Config *c)
 {
     memset(c, 0, sizeof *c);
@@ -190,6 +212,23 @@ int config_load(Config *c)
         return -1;
     snprintf(c->redirect_uri, sizeof c->redirect_uri, "http://127.0.0.1:%d/callback",
              CFG_REDIRECT_PORT);
+    if (plat_path_join(c->paired_path, sizeof c->paired_path, c->data_dir, "soloist-paired") != 0)
+        return -1;
+    if (plat_path_join(c->name_path, sizeof c->name_path, c->data_dir, "device-name") != 0)
+        return -1;
+    /* The name it was paired under wins: Soloist's identity must not
+     * change with the hostname. */
+    char *saved = plat_read_file(c->name_path, CFG_DEVICE_NAME_LEN, NULL);
+    size_t sl = saved ? strcspn(saved, "\r\n") : 0;
+    if (sl > 0 && sl < sizeof c->device_name) {
+        memcpy(c->device_name, saved, sl);
+        c->device_name[sl] = '\0';
+    } else {
+        char host[256];
+        plat_hostname(host, sizeof host);
+        config_device_name(host, c->device_name, sizeof c->device_name);
+    }
+    free(saved);
 
     /* Not fatal: a read-only app folder still allows `help`; the GUI says
      * to move the app, and saving the token reports the failure later. */
@@ -284,9 +323,41 @@ int config_save_token(const Config *c, const Token *t)
     return rc;
 }
 
+int config_paired(const Config *c)
+{
+    char *t = plat_read_file(c->paired_path, 64, NULL);
+    free(t);
+    return t != NULL;
+}
+
+int config_set_paired(const Config *c, int on)
+{
+    if (!on) {
+        int a = plat_remove_tree(c->paired_path), b = plat_remove_tree(c->name_path);
+        return a == 0 && b == 0 ? 0 : -1;
+    }
+    char line[CFG_DEVICE_NAME_LEN + 1];
+    int n = snprintf(line, sizeof line, "%s\n", c->device_name);
+    if (n < 0 || (size_t)n >= sizeof line ||
+        plat_write_file_atomic(c->name_path, line, (size_t)n) != 0)
+        return -1;
+    return plat_write_file_atomic(c->paired_path, "1\n", 2);
+}
+
+int config_soloist_used(const Config *c)
+{
+    char path[CFG_PATH_LEN];
+    if (plat_path_join(path, sizeof path, c->soloist_data, ".device_id") != 0)
+        return 0;
+    char *t = plat_read_file(path, 4096, NULL);
+    free(t);
+    return t != NULL;
+}
+
 int config_clear_login(const Config *c)
 {
     int a = plat_remove_tree(c->token_path);
     int b = plat_remove_tree(c->soloist_data); /* the paired Connect session */
-    return (a == 0 && b == 0) ? 0 : -1;
+    int m = config_set_paired(c, 0);
+    return (a == 0 && b == 0 && m == 0) ? 0 : -1;
 }

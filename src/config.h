@@ -17,7 +17,8 @@
 
 #define CFG_PATH_LEN 1024
 #define CFG_REDIRECT_PORT 8888
-#define CFG_DEVICE_NAME "Spotify C Player"
+#define CFG_DEVICE_NAME "Spotify C Player" /* prefix of Config.device_name */
+#define CFG_DEVICE_NAME_LEN 64
 
 typedef struct {
     char client_id[128];             /* "" if not configured yet */
@@ -34,6 +35,10 @@ typedef struct {
     char soloist_cache[CFG_PATH_LEN];/* <app>/data/soloist-cache */
     char soloist_home[CFG_PATH_LEN]; /* <app>/data/soloist-home */
     char redirect_uri[128];          /* http://127.0.0.1:8888/callback */
+    char device_name[CFG_DEVICE_NAME_LEN]; /* "Spotify C Player (<host>)": our Connect
+                                        device, unique per computer */
+    char paired_path[CFG_PATH_LEN];  /* <app>/data/soloist-paired: marker */
+    char name_path[CFG_PATH_LEN];    /* <app>/data/device-name: device_name as paired */
 } Config;
 
 typedef struct {
@@ -48,10 +53,27 @@ typedef struct {
  * error: callers check client_id[0] and soloist_key[0]. */
 int config_load(Config *c);
 
+/* Pure, exposed for tests: CFG_DEVICE_NAME + " (" + host + ")", the host
+ * cut at its first '.', control characters dropped and shortened (at a
+ * UTF-8 boundary) so the whole name fits cap; just CFG_DEVICE_NAME when
+ * host is empty. */
+void config_device_name(const char *host, char *out, size_t cap);
+
+/* The Soloist device was paired once (marker file data/soloist-paired). */
+int  config_paired(const Config *c);
+/* Create the marker and save device_name to data/device-name, so the
+ * Connect identity survives a hostname change (on), or delete both (off).
+ * 0 ok, -1 error. */
+int  config_set_paired(const Config *c, int on);
+/* Soloist has run here before (its -D dir holds a device id), so it may
+ * hold a stored session even without the marker (older builds). */
+int  config_soloist_used(const Config *c);
+
 /* 0 ok, -1 missing/corrupt. */
 int config_load_token(const Config *c, Token *t);
 int config_save_token(const Config *c, const Token *t);
-/* Remove the token file and Soloist's paired session (logout). */
+/* Remove the token file, Soloist's paired session and the paired marker
+ * (logout). */
 int config_clear_login(const Config *c);
 
 /* Look up key in .env text (KEY=VALUE lines, '#' comments, optional
