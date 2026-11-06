@@ -18,9 +18,29 @@ include(FetchContent)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 # Spotify album art is JPEG; raylib 5.5 leaves the JPEG decoder out by
-# default. CUSTOMIZE_BUILD keeps every other option at its config.h default.
+# default. CUSTOMIZE_BUILD keeps every other option at its config.h default
+# except the ones below, which this app never uses.
 set(CUSTOMIZE_BUILD ON CACHE BOOL "" FORCE)
 set(SUPPORT_FILEFORMAT_JPG ON CACHE BOOL "" FORCE)
+foreach(opt
+    SUPPORT_MODULE_RAUDIO SUPPORT_MODULE_RMODELS
+    # F12 / Ctrl+F12 would write screenshotNNN.png / .gif into the working
+    # directory, outside the portable app folder.
+    SUPPORT_SCREEN_CAPTURE SUPPORT_GIF_RECORDING SUPPORT_AUTOMATION_EVENTS
+    # Never set a target FPS (event waiting), so frame pacing is unused; on
+    # Windows the timer option would raise the system timer to 1 ms for the
+    # whole session, which costs battery.
+    SUPPORT_PARTIALBUSY_WAIT_LOOP SUPPORT_WINMM_HIGHRES_TIMER
+    SUPPORT_FILEFORMAT_GIF SUPPORT_FILEFORMAT_QOI SUPPORT_FILEFORMAT_DDS)
+  set(${opt} OFF CACHE BOOL "" FORCE)
+endforeach()
+# Drop unreferenced functions (most of raylib) from the executable.
+if(APPLE)
+  add_link_options(-Wl,-dead_strip)
+elseif(NOT MSVC)
+  add_compile_options(-ffunction-sections -fdata-sections)
+  add_link_options(-Wl,--gc-sections)
+endif()
 FetchContent_Declare(raylib
   URL https://github.com/raysan5/raylib/archive/refs/tags/5.5.tar.gz
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
