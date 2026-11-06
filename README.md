@@ -19,6 +19,15 @@ data/soloist-home/       Soloist's HOME/TMPDIR, so its OS caches stay here too
 Copy or move the folder anywhere. Delete it to uninstall.
 
 ## Install on macOS
+**Ready to install:** `build/dist/Spotify C Player.app` (built 2026-11-06 with your client ID and Soloist key; signed ad hoc, `codesign --verify` passes).
+
+First run, once:
+1. Drag `build/dist/Spotify C Player.app` to `/Applications` and open it.
+2. Click **Sign in with Spotify** and approve the request in your browser.
+3. When macOS asks whether the app may find devices on your local network, click **Allow**.
+4. With Spotify open on your phone, the app shows a tip naming this Mac's device ("Spotify C Player (<Mac name>)"). Choose that device once in the phone's Spotify device list.
+5. Done. The pairing is saved inside the app. From now on Play streams on this Mac after every restart, with no phone needed. Only **Log out** or deleting the app clears it.
+
 The macOS build is an app bundle: `build/dist/Spotify C Player.app` (macOS 13 or newer, Apple silicon for local playback). Drag it to `/Applications` and open it from there, Launchpad or the Dock. Always open the `.app`: double-clicking the bare `spotify-c-player` file inside it opens Terminal.
 
 Inside the bundle, the app folder above is `Spotify C Player.app/Contents/Resources` (`.env`, `soloist/`, `data/`). Drag the app to the Trash to uninstall everything. The build seeds that `.env` with the `SPOTIFY_CLIENT_ID` and `SOLOIST_API_KEY` lines of the repo `.env` (never the client secret). Without a key, paste it on the key screen and press **Save**, which writes it to the bundle's `.env`.
