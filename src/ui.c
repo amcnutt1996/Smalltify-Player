@@ -301,14 +301,16 @@ static int cmd_start(CmdWorker *w, AuthStore *auth, Poller *poller, const char *
 }
 
 /* Line c up: it replaces a playback command still waiting at the end, else
- * it waits its turn (a full FIFO keeps only the newest at its end). */
+ * it waits its turn. A full FIFO (the worker is stuck, e.g. offline) lets a
+ * playback command replace a playback command at its end and drops c
+ * otherwise, so a waiting queue add is never overwritten. */
 static void cmd_send(CmdWorker *w, const Cmd *c)
 {
     plat_mutex_lock(w->mu);
     Cmd *last = w->len ? &w->fifo[(w->head + w->len - 1) % CMD_FIFO] : NULL;
-    if (last && ((c->kind != CMD_QUEUE && last->kind != CMD_QUEUE) || w->len == CMD_FIFO))
+    if (last && c->kind != CMD_QUEUE && last->kind != CMD_QUEUE)
         *last = *c;
-    else
+    else if (w->len < CMD_FIFO)
         w->fifo[(w->head + w->len++) % CMD_FIFO] = *c;
     plat_mutex_unlock(w->mu);
     plat_event_signal(w->ev);
@@ -2653,6 +2655,7 @@ static void draw_settings(Ui *u, Rectangle area)
         int on = i == u->m.size;
         if (button(u, W_LIB_ROW + i, r, NULL, FS_S, on) && !on) {
             u->cfg.font_size = i; /* the next frame remakes the fonts (apply_font) */
+            u->redraw = 1;
             u->size_unsaved =
                 config_set_env_value(&u->cfg, "UI_FONT_SIZE", config_font_size_value(i)) != 0;
         }
