@@ -44,15 +44,6 @@ typedef struct {
     int  volume;              /* 0-100, -1 if unknown */
 } Device;
 
-/* Used by ui.c until the Library UI migrates to Item (sp_get_playlists);
- * delete it then. */
-typedef struct {
-    char id[SP_ID_LEN];
-    char uri[SP_URI_LEN];
-    char name[SP_NAME_LEN];
-    int  track_count;
-} Playlist;
-
 /* What an Item is (Spotify's "type" field). */
 typedef enum {
     ITEM_TRACK,

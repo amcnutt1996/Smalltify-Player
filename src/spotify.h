@@ -186,12 +186,6 @@ int sp_search(HttpClient *c, const char *query, unsigned types, SpPage *page,
  * order; null results are skipped. SP_ERR_PARSE without any result kind. */
 int sp_parse_search(const char *json, SpPage *page, Item *out, int cap, int *count);
 
-/* --- used by ui.c until the Library UI migrates to Item; delete them then --- */
-/* The first page of SP_LIST_PLAYLISTS as Playlist (track_count 0 if unknown). */
-int sp_get_playlists(HttpClient *c, Playlist *out, int cap, int *count);
-/* sp_search for tracks only (at most SP_SEARCH_LIMIT), as Track. */
-int sp_search_tracks(HttpClient *c, const char *query, Track *out, int cap, int *count);
-
 /* --- formatting --------------------------------------------------------- */
 /* Track/episode time as m:ss, or h:mm:ss from one hour; negative = 0:00. */
 void sp_fmt_time(char *out, size_t cap, int ms);

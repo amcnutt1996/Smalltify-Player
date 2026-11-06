@@ -3,7 +3,6 @@
  * parsing, so error handling stays identical across endpoints. */
 #include <limits.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "cJSON.h"
@@ -1155,67 +1154,6 @@ int sp_search(HttpClient *c, const char *query, unsigned types, SpPage *page,
         return rc;
     rc = parse_search(root, page, out, cap, count);
     cJSON_Delete(root);
-    return rc;
-}
-
-/* ======================================================================
- * Used by ui.c until the Library UI migrates to Item; delete them then
- * ====================================================================== */
-
-int sp_get_playlists(HttpClient *c, Playlist *out, int cap, int *count)
-{
-    SpPage page;
-    Item *items;
-    int n = 0, rc;
-
-    if (!count || cap < 0 || (cap > 0 && !out))
-        return SP_ERR_OTHER;
-    *count = 0;
-    if (cap == 0)
-        return SP_OK;
-    cap = cap < SP_PAGE_MAX ? cap : SP_PAGE_MAX;
-    items = malloc((size_t)cap * sizeof *items);
-    if (!items)
-        return SP_ERR_OTHER;
-    memset(&page, 0, sizeof page);
-    rc = sp_get_list(c, SP_LIST_PLAYLISTS, NULL, &page, items, cap, &n);
-    for (int i = 0; rc == SP_OK && i < n; i++) {
-        copy_utf8(out[i].id, sizeof out[i].id, items[i].id);
-        copy_utf8(out[i].uri, sizeof out[i].uri, items[i].uri);
-        copy_utf8(out[i].name, sizeof out[i].name, items[i].name);
-        out[i].track_count = items[i].count < 0 ? 0 : items[i].count;
-    }
-    if (rc == SP_OK)
-        *count = n;
-    free(items);
-    return rc;
-}
-
-int sp_search_tracks(HttpClient *c, const char *query, Track *out, int cap, int *count)
-{
-    Item hits[SP_SEARCH_LIMIT];
-    SpPage page;
-    int n = 0, rc;
-
-    if (!count || cap <= 0 || !out)
-        return SP_ERR_OTHER;
-    *count = 0;
-    memset(&page, 0, sizeof page);
-    rc = sp_search(c, query, SP_SEARCH_TRACK, &page, hits,
-                   cap < SP_SEARCH_LIMIT ? cap : SP_SEARCH_LIMIT, &n);
-    for (int i = 0; rc == SP_OK && i < n; i++) {
-        Track *t = &out[i];
-        memset(t, 0, sizeof *t);
-        copy_utf8(t->id, sizeof t->id, hits[i].id);
-        copy_utf8(t->uri, sizeof t->uri, hits[i].uri);
-        copy_utf8(t->name, sizeof t->name, hits[i].name);
-        copy_utf8(t->artists, sizeof t->artists, hits[i].sub);
-        copy_utf8(t->album, sizeof t->album, hits[i].album);
-        copy_utf8(t->art_url, sizeof t->art_url, hits[i].art_url);
-        t->duration_ms = hits[i].duration_ms;
-    }
-    if (rc == SP_OK)
-        *count = n;
     return rc;
 }
 
