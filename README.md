@@ -7,9 +7,10 @@ Everything lives in one folder. The app writes nothing outside it: no cache dire
 
 ```
 spotify-c-player[.exe]   the app (GUI with no args, CLI with a command)
-.env                     SPOTIFY_CLIENT_ID=... and SOLOIST_API_KEY=...
+.env                     SPOTIFY_CLIENT_ID=..., SOLOIST_API_KEY=..., UI_FONT_SIZE=... (Settings)
+Inter-LICENSE.txt        license of the embedded UI font (Inter, SIL OFL 1.1)
 soloist/                 Spotify Soloist, downloaded from Spotify on first use
-data/token.json          your sign-in (owner-only permissions)
+data/token.json          your sign-in and the permissions it was granted (owner-only permissions)
 data/soloist/            Soloist's device id and paired session
 data/soloist-paired      marker: this computer was paired (with data/device-name, the name it was paired under)
 data/soloist-cache/      Soloist's playback cache (capped at 100 MB)
@@ -36,6 +37,22 @@ Inside the bundle, the app folder above is `Spotify C Player.app/Contents/Resour
 - It is ad-hoc signed, not notarized. After the first run, `codesign --verify` reports the bundle as modified because of the files in `Contents/Resources`. That's expected.
 - On first pairing, macOS asks to let "Spotify C Player" find devices on your local network. Allow it, or Spotify Connect can't see the player.
 - CLI: `"/Applications/Spotify C Player.app/Contents/MacOS/spotify-c-player" now`, etc.
+
+## Using the player
+The bottom bar has **Devices**, **Library**, **Settings** and **Log out**.
+
+- **Settings:** text size (Small, Default, Large, Extra large). A pick applies at once and is saved as `UI_FONT_SIZE` in the app's `.env`. Text uses the embedded Inter font (Latin, Greek, Cyrillic, Vietnamese; Chinese, Japanese, Korean and emoji show as `?`).
+- **Library:** a stack of screens. **Back** or Esc goes up one level; Esc at the top closes the panel, and reopening it returns to where you were.
+  - Top level: a search field, then **Liked Songs** (with your total), **Playlists**, **Albums**, **Artists**, **Podcasts**, **Your Episodes**, **Recently played** and **Queue**.
+  - Search (Enter) shows up to 10 songs, artists, albums, playlists, podcasts and episodes under headings. **See all** lists more of one kind.
+  - Playlists, albums, artists (their albums) and podcasts (their episodes) open in their own screen, with **Play** in the header. Clicking a song plays it inside its playlist, album, podcast or Liked Songs, so the next songs follow. Songs in search, Recently played, Queue and Your Episodes play on their own.
+  - **+Queue** on a song or episode adds it to the queue. Lists load more as you scroll, up to 500 entries. Greyed-out rows are unavailable (local files, or not available in your country).
+  - Spotify only shows the songs of playlists you own or collaborate on. Playlists you follow still play with **Play**.
+- **Heart** at the end of the title line: shows whether the current song is in Liked Songs; click it to like or unlike.
+
+Not available, because Spotify's Web API doesn't offer them: Home, Browse, Made For You, recommendations, an artist's top songs, lyrics, Jams and friend activity.
+
+Sign-ins from before this version are missing four permissions (liking and saving, following artists, followed artists, recently played). The app asks once per launch to sign in again; **Later** keeps the player running, and Artists and Recently played show a **Sign in again** button until you do.
 
 ## Setup
 1. Create an app at https://developer.spotify.com/dashboard.
@@ -64,9 +81,15 @@ spotify-c-player seek <seconds | m:ss>     vol <0-100 | +N | -N>
 spotify-c-player shuffle on|off            repeat off|context|track
 spotify-c-player devices                   transfer <name-or-id>
 spotify-c-player playlists                 playlist <number | name>
-spotify-c-player search [-p N] <query...>
+spotify-c-player search [-p N] [--type track,album,artist,playlist,show,episode | all] <query...>
+spotify-c-player list [--all] liked|playlists|albums|artists|shows|episodes|recent|queue
+spotify-c-player list [--all] playlist|album|artist|show <id or uri>
+spotify-c-player like | unlike | saved <uri...>
+spotify-c-player queue <uri>               me
 ```
 `engine` runs Soloist in the foreground and installs or updates it first if needed. It prints the pairing hint on first use, and Ctrl-C stops it (EOF too, when stdin is a terminal, so `nohup`/launchd work). The other commands need a device: `engine`, the GUI, or any Spotify app. With nothing active, `play`, `playlist` and `search -p` start on this computer's engine if it is online, else on any available device.
+
+`list` prints one page (`--all` follows every page) as `N. name - sub (length)  uri`; `search` prints the same format. `like`/`unlike` save to or remove from your library (songs, albums, shows, episodes, artists), `saved` checks them, `queue` adds a song or episode to the queue, and `me` prints your account name and the Liked Songs URI.
 
 ## Build
 You need CMake ≥ 3.20, a C11 compiler, and libcurl (development files).
@@ -88,5 +111,6 @@ The output goes to `build/dist/`. raylib 5.5 is fetched by CMake, and cJSON is v
 | `src/soloist.c` | Downloads, updates, and supervises Spotify Soloist |
 | `src/poller.c` | Background playback-state polling: fetches every 5 s and at each track's end, UI ticks at 1 Hz locally |
 | `src/art.c` | Album art download (memory only) |
-| `src/ui.c` | raylib GUI, event-driven (≈0% CPU when idle) |
+| `src/ui.c` | raylib GUI, event-driven (≈0% CPU when idle); Library panel, Settings, embedded Inter font |
+| `src/browse.c` | Pure Library-panel helpers: what a click plays, row texts, search grouping, list cap |
 | `src/cli.c` | CLI commands |

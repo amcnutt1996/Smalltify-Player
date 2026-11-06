@@ -1,9 +1,18 @@
 # Spotify C Player: build report (2026-11-06)
 
 ## Status
-**Built, reviewed, packaged and committed.** The installable app is **`build/dist/Spotify C Player.app`** (696 KB, macOS 13+, ad-hoc signed). Your client ID and Soloist key are already in it. README.md → *Install on macOS* has the first-run steps: drag the app to /Applications → sign in with your browser → allow Local Network → pick this Mac's device once in Spotify on your phone. After that, the app streams on this Mac across restarts with no phone needed.
+**Rebuilt with the readability and library update.** The installable app is **`build/dist/Spotify C Player.app`** (836 KB, macOS 13+, ad-hoc signed, `codesign --verify` passes, empty `data/`). Your client ID and Soloist key are already in it. The old `/Applications` copy was removed at your request, so this is a fresh install: drag the app to /Applications → sign in with your browser (this sign-in grants the new permissions too) → allow Local Network → pick this Mac's device once in Spotify on your phone.
 
 Not verified on real hardware: the minimized pairing poll switching to 15 s, a clean long idle-CPU measurement on the player screen, and the Linux/Windows code paths (never compiled here).
+
+## Update: readable text, Settings, full library (2026-11-06, while you were away)
+- **Text:** the embedded Inter font replaces raylib's 10 px bitmap font; default body text is 14 px, and all layout follows the text size. **Settings** (next to Log out) offers Small / Default / Large / Extra large, applies at once, and saves `UI_FONT_SIZE` in `.env`.
+- **Library:** Liked Songs (with your total), Playlists, Albums, Artists, Podcasts, Your Episodes, Recently played and Queue; search across songs, artists, albums, playlists, podcasts and episodes; drill into playlists, albums, artists and shows; play a song inside its playlist, album or Liked Songs; +Queue; a heart for liking the current song. README → *Using the player* has the details.
+- **Spotify's Feb 2026 API limits** shape what's possible: search returns at most 10 per kind (the old GUI search asked for 20, which Spotify now refuses), followed playlists list no songs (they still play), and Home, Browse, recommendations, artist top songs, lyrics and Jams have no API.
+- **CLI:** `list`, `search --type`, `like`/`unlike`/`saved`, `queue`, `me`.
+- **Verified:** clean build, ctest 6/6; read-only calls on your account (Liked 2,434 songs, 19 playlists, 3 albums, 12 shows, own playlist contents, search); every Library screen rendered with your real data at Default and Extra large (in an instrumented copy, because the locked screen blocked real clicks); the release build launching to the new-permissions screen; idle CPU ~0.02% with the Library open. A code review found no blockers; its two small fixes (Settings redraw, queue adds under a full command queue) are in.
+- **Not verified, by design (they would have changed your account):** pressing play from a Library row, Play on a playlist/album/Liked Songs, +Queue, liking/unliking, and signing in again. Playing a podcast episode inside its show is the least certain of these.
+- Commits: `f6f077a`…`36fb51e` (API, auth, CLI), `d6ff8bb`…`2eb0ddd` (font, Settings), `e342137`, `7ad8dca` (Library UI, cleanup), plus the review fixes and docs. Decisions #12 and #40–#46 in DECISIONS.md.
 
 ## What was built
 | # | Feature (one subagent each) | Commits |
