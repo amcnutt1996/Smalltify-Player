@@ -12,8 +12,8 @@
 
 #include "auth.h"
 #include "http.h"
-#include "librespot.h"
 #include "platform.h"
+#include "soloist.h"
 #include "spotify.h"
 
 /* Returned by helpers that already printed their own message. */
@@ -123,10 +123,10 @@ static int cmd_logout(const Config *cfg, int argc, char **argv)
         fprintf(stderr, "error: out of memory\n");
         return 1;
     }
-    int had = auth_store_logged_in(auth) || librespot_has_credentials(cfg);
+    int had = auth_store_logged_in(auth);
     auth_store_logout(auth);
     auth_store_free(auth);
-    printf(had ? "Logged out (removed saved token and playback credentials).\n"
+    printf(had ? "Logged out (removed the saved token and the Soloist pairing).\n"
                : "Not logged in.\n");
     return 0;
 }
@@ -543,6 +543,8 @@ static int cmd_search(const Config *cfg, int argc, char **argv)
     return finish(auth, http, rc);
 }
 
+/* Set by a quit signal or stdin EOF: cancels an engine download. */
+static volatile int g_engine_stop;
 /* Set once stdin hits EOF (Ctrl-D / closed pipe): ends `engine`. */
 static volatile sig_atomic_t g_stdin_eof;
 
@@ -552,6 +554,7 @@ static void stdin_watch(void *arg)
     while ((ch = getchar()) != EOF) {
     }
     g_stdin_eof = 1;
+    g_engine_stop = 1;
     plat_event_signal(arg);
 }
 
@@ -560,67 +563,123 @@ static void wake_event(void *ev)
     plat_event_signal(ev);
 }
 
+static void engine_quit(void *ev)
+{
+    g_engine_stop = 1;
+    plat_event_signal(ev);
+}
+
+static void print_missing_soloist_key(const Config *cfg)
+{
+    fprintf(stderr,
+            "SOLOIST_API_KEY is not set.\n"
+            "  1. Generate a key at https://developer.spotify.com/dashboard/soloist\n"
+            "  2. Put SOLOIST_API_KEY=<your key> in %s%c.env\n"
+            "     (or set the SOLOIST_API_KEY environment variable)\n",
+            cfg->app_dir, PLAT_SEP);
+}
+
+static void print_progress(void *ud, int percent)
+{
+    (void)ud;
+    if (percent >= 0) {
+        printf("\rDownloading Spotify Soloist... %d%%", percent);
+        fflush(stdout);
+    }
+}
+
+/* 0 ok; -1 after printing why. */
+static int install_engine(const Config *cfg)
+{
+    char err[256];
+    printf("Downloading Spotify Soloist...");
+    fflush(stdout);
+    int rc = soloist_install(cfg, print_progress, NULL, &g_engine_stop, err, sizeof err);
+    printf("\n");
+    if (rc != 0) {
+        fprintf(stderr, "error: %s\n", err);
+        return -1;
+    }
+    printf("Installed in %s\n", cfg->soloist_dir);
+    return 0;
+}
+
 static int cmd_engine(const Config *cfg, int argc, char **argv)
 {
-    if (argc != 1)
+    int update = argc == 2 && !strcmp(argv[1], "--update");
+    if (argc > 2 || (argc == 2 && !update))
         return bad_usage(argv[0]);
-    /* Ctrl-C, SIGTERM and SIGHUP all end the loop below, so librespot is
+    if (!cfg->soloist_key[0]) {
+        print_missing_soloist_key(cfg);
+        return 1;
+    }
+    /* Ctrl-C, SIGTERM and SIGHUP all end the loop below, so Soloist is
      * stopped instead of orphaned. */
     plat_event *wake = plat_event_new();
-    if (!wake || plat_quit_watch(wake_event, wake) != 0) {
+    if (!wake || plat_quit_watch(engine_quit, wake) != 0) {
         fprintf(stderr, "error: cannot set up signal handling\n");
         plat_quit_watch(NULL, NULL);
         plat_event_free(wake);
         return 1;
     }
-    Librespot *ls = librespot_start(cfg, wake_event, wake);
-    if (!ls) {
-        fprintf(stderr, "error: cannot start %s\n", cfg->librespot_path);
-        plat_quit_watch(NULL, NULL);
-        plat_event_free(wake);
-        return 1;
-    }
-    printf("Running \"%s\" as a Spotify Connect device. Ctrl-C or EOF to stop.\n",
-           CFG_DEVICE_NAME);
-    if (!librespot_has_credentials(cfg))
-        printf("First run: playback needs a one-time Spotify sign-in in the browser.\n");
-    fflush(stdout);
     /* Blocking stdin read has no portable cancel; on Ctrl-C this thread is
      * left parked in getchar() and ends with the process. */
     plat_thread *watch = plat_thread_start(stdin_watch, wake);
 
-    char last[1024] = "", cur[1024], url[4096];
-    int url_shown = 0, refused_shown = 0;
+    Soloist *s = NULL;
+    if ((update || !soloist_installed_ok(cfg)) && install_engine(cfg) != 0)
+        goto out;
+    if (g_engine_stop)
+        goto out;
+    s = soloist_start(cfg, wake_event, wake);
+    if (!s) {
+        fprintf(stderr, "error: cannot start %s\n", cfg->soloist_path);
+        goto out;
+    }
+    printf("Running \"%s\" as a Spotify Connect device. Ctrl-C or EOF to stop.\n",
+           CFG_DEVICE_NAME);
+    fflush(stdout);
+
+    char last[512] = "", cur[512];
+    int hinted = 0, reinstalled = 0;
     for (;;) {
-        librespot_status(ls, cur, sizeof cur);
-        if (librespot_playback_refused(ls)) {
-            /* Sticky status: say it once with what to do instead. */
-            if (!refused_shown)
-                printf("%s\nControl another device instead: " CLI_PROG " devices, then "
-                       CLI_PROG " transfer <name>\n", cur);
-            refused_shown = 1;
-            snprintf(last, sizeof last, "%s", cur);
-        } else if (strcmp(cur, last) != 0) {
-            printf("librespot: %s\n", cur);
+        SoloistState st = soloist_state(s);
+        soloist_status(s, cur, sizeof cur);
+        if (strcmp(cur, last) != 0) {
+            printf("Soloist: %s\n", cur);
             snprintf(last, sizeof last, "%s", cur);
         }
-        /* librespot opens the browser itself; the URL is the fallback. */
-        if (librespot_login_url(ls, url, sizeof url)) {
-            if (!url_shown)
-                printf("If your browser did not open, visit this URL to enable playback:\n%s\n", url);
-            url_shown = 1;
-        } else {
-            url_shown = 0;
+        if (st == SOLOIST_PAIRING && !hinted) {
+            printf("Pair once: open Spotify on your phone or computer (same network), open the "
+                   "device list and choose \"%s\".\n", CFG_DEVICE_NAME);
+            hinted = 1;
         }
         fflush(stdout);
-        if (plat_quit_requested() || g_stdin_eof || !librespot_running(ls))
+        if (g_engine_stop)
             break;
-        /* Signaled by librespot changes (its exit included), quit signals
+        if (st == SOLOIST_EXPIRED && !reinstalled) {
+            /* Expired while running: fetch the current build, start once more. */
+            reinstalled = 1;
+            soloist_stop(s);
+            s = NULL;
+            if (install_engine(cfg) != 0 || g_engine_stop)
+                break;
+            s = soloist_start(cfg, wake_event, wake);
+            if (!s) {
+                fprintf(stderr, "error: cannot start %s\n", cfg->soloist_path);
+                break;
+            }
+            last[0] = '\0';
+            continue;
+        }
+        if (st == SOLOIST_STOPPED || st == SOLOIST_EXPIRED)
+            break;
+        /* Signaled by Soloist changes (its exit included), quit signals
          * and stdin EOF: no polling. */
         plat_event_wait(wake, 3600000u);
     }
-    int crashed = !plat_quit_requested() && !g_stdin_eof;
-    librespot_stop(ls);
+out:
+    soloist_stop(s);
     plat_quit_watch(NULL, NULL); /* a later signal must not touch `wake` */
     if (g_stdin_eof || !watch) {
         plat_thread_join(watch);
@@ -628,13 +687,13 @@ static int cmd_engine(const Config *cfg, int argc, char **argv)
     }
     /* else the watcher still blocks in getchar() holding `wake`; both are
      * reclaimed at process exit. */
-    return crashed ? 1 : 0;
+    return g_engine_stop ? 0 : 1; /* Ctrl-C/EOF is a clean stop, an exit a failure */
 }
 
 const CliCommand cli_commands[] = {
     { "login",  "login",  cmd_login  },
     { "logout", "logout", cmd_logout },
-    { "engine", "engine", cmd_engine },
+    { "engine", "engine [--update]", cmd_engine },
     { "now",    "now",    cmd_now    },
     { "play",     "play",                            cmd_play     },
     { "pause",    "pause",                           cmd_pause    },

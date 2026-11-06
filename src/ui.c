@@ -1,7 +1,8 @@
-/* raylib GUI: setup notice -> sign-in -> player. The loop sleeps inside
- * glfwWaitEvents (EnableEventWaiting) and background threads wake it with
- * glfwPostEmptyEvent, so an idle window costs no CPU. All network work runs
- * on worker threads; the UI thread only copies snapshots and draws. */
+/* raylib GUI: setup notice -> sign-in -> Soloist key / download / pairing
+ * -> player. The loop sleeps inside glfwWaitEvents (EnableEventWaiting) and
+ * background threads wake it with glfwPostEmptyEvent, so an idle window
+ * costs no CPU. All network work runs on worker threads; the UI thread only
+ * copies snapshots and draws. */
 #include "ui.h"
 
 #include <limits.h>
@@ -13,10 +14,10 @@
 #include "art.h"
 #include "auth.h"
 #include "http.h"
-#include "librespot.h"
 #include "model.h"
 #include "platform.h"
 #include "poller.h"
+#include "soloist.h"
 #include "spotify.h"
 
 /* Part of the GLFW bundled inside libraylib.a; raylib has no wrapper for it.
@@ -36,10 +37,12 @@ void glfwPostEmptyEvent(void);
  * command Spotify often still reports the old state. */
 #define PENDING_MS        3000
 #define DEVICE_WAIT_TRIES 15
-#define DEVICE_FIRST_MS   1500 /* librespot needs a moment to register */
+#define DEVICE_FIRST_MS   1500 /* Soloist needs a moment to register */
 #define DEVICE_RETRY_MS   1000
 #define DEVICE_LIST_CAP   16
+#define PAIR_POLL_MS      2000 /* pairing: look for our device this often */
 #define IDLE_WAIT_MS      3600000u
+#define SIGNIN_URL_LEN    4096 /* authorize URLs with many scopes are long */
 
 #define C_BG     CLITERAL(Color){  18,  18,  18, 255 }
 #define C_PANEL  CLITERAL(Color){  40,  40,  40, 255 }
@@ -101,17 +104,7 @@ typedef struct {
     uint64_t err_seq; /* bumped after every command */
     Library  lib;     /* latest playlists/search results */
     uint64_t lib_seq; /* bumped when lib changes */
-    int      no_local; /* Spotify refused our engine: never fall back to it */
 } CmdWorker;
-
-/* Our own device as the fallback target, unless Spotify refused it. */
-static const char *local_name(CmdWorker *w)
-{
-    plat_mutex_lock(w->mu);
-    int no_local = w->no_local;
-    plat_mutex_unlock(w->mu);
-    return no_local ? NULL : CFG_DEVICE_NAME;
-}
 
 static int fetch_devices(CmdWorker *w, HttpClient *h)
 {
@@ -136,7 +129,7 @@ static int run_cmd(CmdWorker *w, HttpClient *h, const Cmd *c)
     switch (c->kind) {
     case CMD_PLAY:
         /* Nothing active anywhere: start playback on our own device. */
-        return sp_play_fallback(h, NULL, 0, local_name(w));
+        return sp_play_fallback(h, NULL, 0, CFG_DEVICE_NAME);
     case CMD_PAUSE:   return sp_pause(h);
     case CMD_NEXT:    return sp_next(h);
     case CMD_PREV:    return sp_prev(h);
@@ -145,7 +138,7 @@ static int run_cmd(CmdWorker *w, HttpClient *h, const Cmd *c)
     case CMD_SHUFFLE: return sp_set_shuffle(h, c->arg);
     case CMD_REPEAT:  return sp_set_repeat(h, (RepeatMode)c->arg);
     case CMD_PLAY_URI:
-        return sp_play_fallback(h, c->str, c->arg, local_name(w));
+        return sp_play_fallback(h, c->str, c->arg, CFG_DEVICE_NAME);
     case CMD_DEVICES:
         return fetch_devices(w, h);
     case CMD_TRANSFER:
@@ -264,36 +257,33 @@ static void cmd_post(CmdWorker *w, CmdKind kind, int arg)
     cmd_post_str(w, kind, arg, "");
 }
 
-/* --- one-shot device worker: make our Connect device the active one ----- */
+/* --- device worker ------------------------------------------------------- */
+/* Player: one shot, make our device the active one when nothing else plays.
+ * Pairing: poll until our device shows up in the Web API, which is the only
+ * sign that the user picked it in a Spotify app. */
 typedef struct {
     AuthStore   *auth;
-    Poller      *poller;
-    Librespot   *ls;
-    plat_event  *stop; /* signaled = give up now */
+    Poller      *poller; /* NULL in pairing mode */
+    int          pair;
+    volatile int found;  /* pairing: set once our device is listed */
+    plat_event  *stop;   /* signaled = give up now */
     plat_thread *th;
 } DeviceWorker;
 
-static void device_thread(void *arg)
+static void transfer_to_us(DeviceWorker *d, HttpClient *http)
 {
-    DeviceWorker *d = arg;
-    HttpAuth ha = auth_store_http(d->auth);
-    HttpClient *http = http_client_new(&ha);
-
-    for (int i = 0; http && i < DEVICE_WAIT_TRIES; i++) {
+    for (int i = 0; i < DEVICE_WAIT_TRIES; i++) {
         if (plat_event_wait(d->stop, i ? DEVICE_RETRY_MS : DEVICE_FIRST_MS))
-            break;
+            return;
         Device me;
         if (sp_find_device(http, CFG_DEVICE_NAME, &me) != SP_OK)
             continue;
-        /* Don't pick ours once Spotify refused it, and never steal playback
-         * from another device the user is using. */
-        if (librespot_playback_refused(d->ls))
-            break;
+        /* Never steal playback from another device the user is using. */
         Device list[DEVICE_LIST_CAP];
         int n = 0, busy = 1;
         /* Each call can take seconds: re-check stop before the next one. */
         if (plat_event_wait(d->stop, 0))
-            break;
+            return;
         if (sp_get_devices(http, list, DEVICE_LIST_CAP, &n) == SP_OK) {
             busy = 0;
             for (int j = 0; j < n; j++)
@@ -301,7 +291,26 @@ static void device_thread(void *arg)
         }
         if (!busy && !plat_event_wait(d->stop, 0) && sp_transfer(http, me.id, 0) == SP_OK)
             poller_kick(d->poller);
-        break;
+        return;
+    }
+}
+
+static void device_thread(void *arg)
+{
+    DeviceWorker *d = arg;
+    HttpAuth ha = auth_store_http(d->auth);
+    HttpClient *http = http_client_new(&ha);
+    if (http && d->pair) {
+        Device me;
+        while (!plat_event_wait(d->stop, PAIR_POLL_MS)) {
+            if (sp_find_device(http, CFG_DEVICE_NAME, &me) == SP_OK) {
+                d->found = 1;
+                ui_wake(NULL);
+                break;
+            }
+        }
+    } else if (http) {
+        transfer_to_us(d, http);
     }
     http_client_free(http);
 }
@@ -316,12 +325,12 @@ static void device_stop(DeviceWorker *d)
     memset(d, 0, sizeof *d);
 }
 
-static void device_start(DeviceWorker *d, AuthStore *auth, Poller *poller, Librespot *ls)
+static void device_start(DeviceWorker *d, AuthStore *auth, Poller *poller, int pair)
 {
     memset(d, 0, sizeof *d);
     d->auth = auth;
     d->poller = poller;
-    d->ls = ls;
+    d->pair = pair;
     d->stop = plat_event_new();
     if (d->stop)
         d->th = plat_thread_start(device_thread, d);
@@ -329,85 +338,82 @@ static void device_start(DeviceWorker *d, AuthStore *auth, Poller *poller, Libre
         device_stop(d); /* not fatal: the user can still pick the device in Spotify */
 }
 
-/* --- engine sign-in worker: librespot's own one-time OAuth -------------- */
-#define ENGINE_POLL_MS 500
-#define SIGNIN_URL_LEN 4096 /* authorize URLs with many scopes are long */
-
-typedef enum { ENG_WAITING, ENG_DONE, ENG_DIED } EngineState;
+/* --- Soloist install worker: check the build, download it if needed ------ */
+#define ERR_LEN 256
 
 typedef struct {
     const Config *cfg;
-    Librespot    *ls;
+    int           force;  /* re-download even if the build is fine */
+    volatile int  cancel;
     plat_mutex   *mu;
-    plat_event   *stop;
     plat_thread  *th;
     /* Guarded by mu. */
-    char         url[SIGNIN_URL_LEN]; /* "" while no sign-in page is pending */
-    uint64_t     url_seq;
-    EngineState  state;
-} EngineLogin;
+    int           downloading, percent, done, rc;
+    char          err[ERR_LEN];
+} Installer;
 
-/* librespot only reports through files and its output, so check both at a
- * slow fixed rate and wake the UI only when something changed. */
-static void engine_thread(void *arg)
+static void install_progress(void *ud, int percent)
 {
-    EngineLogin *e = arg;
-    char url[SIGNIN_URL_LEN], last[SIGNIN_URL_LEN] = "";
-    EngineState state = ENG_WAITING;
+    Installer *in = ud;
+    plat_mutex_lock(in->mu);
+    in->percent = percent;
+    plat_mutex_unlock(in->mu);
+    ui_wake(NULL);
+}
 
-    while (state == ENG_WAITING && !plat_event_wait(e->stop, ENGINE_POLL_MS)) {
-        if (librespot_has_credentials(e->cfg))
-            state = ENG_DONE;
-        else if (!librespot_running(e->ls))
-            state = ENG_DIED;
-        if (librespot_login_url(e->ls, url, sizeof url) != 1)
-            url[0] = 0;
-        if (state == ENG_WAITING && strcmp(url, last) == 0)
-            continue;
-        memcpy(last, url, sizeof last);
-        plat_mutex_lock(e->mu);
-        memcpy(e->url, url, sizeof e->url);
-        e->url_seq++;
-        e->state = state;
-        plat_mutex_unlock(e->mu);
+static void install_thread(void *arg)
+{
+    Installer *in = arg;
+    char err[ERR_LEN] = "";
+    int rc = 0;
+    if (in->force || !soloist_installed_ok(in->cfg)) {
+        plat_mutex_lock(in->mu);
+        in->downloading = 1;
+        in->percent = -1;
+        plat_mutex_unlock(in->mu);
         ui_wake(NULL);
+        rc = soloist_install(in->cfg, install_progress, in, &in->cancel, err, sizeof err);
     }
+    plat_mutex_lock(in->mu);
+    in->done = 1;
+    in->rc = rc;
+    memcpy(in->err, err, sizeof in->err);
+    plat_mutex_unlock(in->mu);
+    ui_wake(NULL);
 }
 
-static void engine_stop(EngineLogin *e)
+static void installer_stop(Installer *in)
 {
-    if (e->th) {
-        plat_event_signal(e->stop);
-        plat_thread_join(e->th);
+    if (in->th) {
+        in->cancel = 1;
+        plat_thread_join(in->th);
     }
-    plat_event_free(e->stop);
-    plat_mutex_free(e->mu);
-    memset(e, 0, sizeof *e);
+    plat_mutex_free(in->mu);
+    memset(in, 0, sizeof *in);
 }
 
-static int engine_start(EngineLogin *e, const Config *cfg, Librespot *ls)
+static int installer_start(Installer *in, const Config *cfg, int force)
 {
-    memset(e, 0, sizeof *e);
-    e->cfg = cfg;
-    e->ls = ls;
-    e->mu = plat_mutex_new();
-    e->stop = plat_event_new();
-    if (e->mu && e->stop)
-        e->th = plat_thread_start(engine_thread, e);
-    if (!e->th) {
-        engine_stop(e);
+    memset(in, 0, sizeof *in);
+    in->cfg = cfg;
+    in->force = force;
+    in->mu = plat_mutex_new();
+    if (in->mu)
+        in->th = plat_thread_start(install_thread, in);
+    if (!in->th) {
+        installer_stop(in);
         return -1;
     }
     return 0;
 }
 
 /* --- UI state ------------------------------------------------------------ */
-typedef enum { SCR_SETUP, SCR_LOGIN, SCR_PLAYER } Screen;
+typedef enum { SCR_SETUP, SCR_LOGIN, SCR_KEY, SCR_ENGINE, SCR_PLAYER } Screen;
 typedef enum { PANEL_NONE, PANEL_LIBRARY, PANEL_DEVICES } Panel;
 
 /* Widget ids for the one widget that may hold the mouse. */
 enum {
-    W_NONE, W_RELOAD, W_SIGNIN, W_CANCEL, W_CONNECT, W_OPEN_URL,
+    W_NONE, W_RELOAD, W_SIGNIN, W_CANCEL, W_OPEN_URL, W_OPEN_KEY, W_SKIP, W_RETRY,
     W_PREV, W_PLAY, W_NEXT, W_SEEK, W_VOLUME, W_SHUFFLE, W_REPEAT, W_LOGOUT,
     W_LIBRARY, W_LIB_BACK, W_DEVICES, W_DEV_REFRESH,
     W_LIB_ROW /* + row index; library and device rows never show together */
@@ -434,25 +440,26 @@ typedef struct {
     int        w, h;
     int        text_dirty;
 
-    /* setup screen */
+    /* setup and key screens: <app>/.env, wrapped to the window */
     char env_wrapped[CFG_PATH_LEN + 64];
     const char *setup_msg;
 
-    /* sign-in screen: step 1 = our PKCE login, step 2 = librespot's OAuth */
-    int          step;
-    int          need_engine; /* step 2 is required after step 1 */
+    /* sign-in screen: our PKCE login */
     plat_mutex  *mu;
     plat_thread *login_th;
     volatile int login_cancel;
     int          login_done, login_rc;     /* guarded by mu */
     char         login_url[SIGNIN_URL_LEN]; /* guarded by mu */
     const char  *login_msg;
-    EngineLogin  eng;
-    uint64_t     eng_seq;
-    int          eng_has_url;
+
+    /* engine screen: Soloist install, start and one-time pairing */
+    Installer    inst;
+    Soloist     *sol;
+    int          engine_skipped; /* "control other devices only" this run */
+    int          reinstalled;    /* an expired build was replaced once */
+    char         eng_err[ERR_LEN]; /* "" = no error to show */
 
     /* player screen */
-    Librespot    *ls;
     Poller       *poller;
     CmdWorker     cmd;
     DeviceWorker  dev;
@@ -462,7 +469,7 @@ typedef struct {
     uint64_t      cmd_seq;
     int           cmd_err, poll_err, background;
     float         seek_t, vol_t; /* slider positions while dragged */
-    char ls_status[256], ls_shown[256];
+    char sol_status[256], sol_shown[256];
     char title[SP_NAME_LEN], artists[SP_NAME_LEN], album[SP_NAME_LEN];
     char status[SP_NAME_LEN];
     char t_pos[16], t_dur[16];
@@ -475,7 +482,6 @@ typedef struct {
 
     /* side panels over the player area (one at a time) */
     Panel    panel;
-    int      refused_seen; /* the device picker auto-opened once for a refusal */
     int      lib_scroll;
     int      lib_show_hits; /* list search results instead of playlists */
     uint64_t lib_seq;
@@ -662,11 +668,10 @@ static void reset_player_state(Ui *u)
     u->cmd_seq = 0;
     u->cmd_err = u->poll_err = 0;
     u->background = 0;
-    u->ls_status[0] = u->ls_shown[0] = 0;
+    u->sol_status[0] = u->sol_shown[0] = 0;
     u->text_dirty = 1;
     u->art_seq = 0;
     u->panel = PANEL_NONE;
-    u->refused_seen = 0;
     u->lib_scroll = u->lib_show_hits = 0;
     u->lib_seq = 0;
     memset(&u->lib, 0, sizeof u->lib);
@@ -684,7 +689,7 @@ static void set_screen(Ui *u, Screen s)
 /* Stops everything that talks to Spotify; safe to call in any state. */
 static void stop_session(Ui *u)
 {
-    engine_stop(&u->eng);
+    installer_stop(&u->inst);
     device_stop(&u->dev);
     cmd_stop(&u->cmd);
     art_stop(u->art);
@@ -694,45 +699,51 @@ static void stop_session(Ui *u)
     u->art_tex = (Texture2D){ 0 };
     poller_stop(u->poller);
     u->poller = NULL;
-    librespot_stop(u->ls); /* never leave an orphaned librespot process */
-    u->ls = NULL;
+    soloist_stop(u->sol); /* never leave an orphaned Soloist process */
+    u->sol = NULL;
 }
 
-/* Both sign-in steps are complete here; only now does the player start.
- * A librespot started for step 2 keeps running: restarting it would only
- * repeat its login. */
+/* Signed in, and Soloist is ready, pairing in the background, or skipped.
+ * A running Soloist keeps running: it is the device we play on. */
 static void enter_player(Ui *u)
 {
-    engine_stop(&u->eng);
+    installer_stop(&u->inst);
+    device_stop(&u->dev); /* the pairing poll, if any */
     reset_player_state(u);
-    if (!u->ls)
-        u->ls = librespot_start(&u->cfg, ui_wake, NULL);
     u->poller = poller_start(u->auth, ui_wake, NULL);
     if (!u->poller || cmd_start(&u->cmd, u->auth, u->poller) != 0) {
         stop_session(u);
         u->login_msg = "Could not start the player.";
-        u->step = 2;
         set_screen(u, SCR_LOGIN);
         return;
     }
-    device_start(&u->dev, u->auth, u->poller, u->ls);
+    if (u->sol)
+        device_start(&u->dev, u->auth, u->poller, 0);
     u->art = art_start(ui_wake, NULL); /* not fatal: the slot stays empty */
     set_screen(u, SCR_PLAYER);
 }
 
-/* Next unfinished sign-in step, or the player once both are done. */
+/* Check (and if needed download) Soloist on the install worker. */
+static void start_engine_setup(Ui *u, int force)
+{
+    u->eng_err[0] = 0;
+    if (installer_start(&u->inst, &u->cfg, force) != 0)
+        snprintf(u->eng_err, sizeof u->eng_err, "Could not start the Soloist setup.");
+    set_screen(u, SCR_ENGINE);
+}
+
+/* Next unfinished setup step: sign-in, Soloist key, Soloist, then the
+ * player. Once paired, later launches pass straight through. */
 static void advance_signin(Ui *u)
 {
-    u->need_engine = !librespot_has_credentials(&u->cfg);
     if (!auth_store_logged_in(u->auth))
-        u->step = 1;
-    else if (u->need_engine)
-        u->step = 2;
-    else {
+        set_screen(u, SCR_LOGIN);
+    else if (u->engine_skipped)
         enter_player(u);
-        return;
-    }
-    set_screen(u, SCR_LOGIN);
+    else if (!u->cfg.soloist_key[0])
+        set_screen(u, SCR_KEY);
+    else
+        start_engine_setup(u, 0);
 }
 
 /* Client id known: open the token store and continue with sign-in. */
@@ -745,15 +756,21 @@ static int enter_app(Ui *u)
     return 0;
 }
 
+/* <app>/.env hard-wrapped to the window (a path has no spaces). */
+static void wrap_env_path(Ui *u, float maxw)
+{
+    char env_path[CFG_PATH_LEN];
+    if (plat_path_join(env_path, sizeof env_path, u->cfg.app_dir, ".env") != 0)
+        snprintf(env_path, sizeof env_path, ".env");
+    wrap_text(u, env_path, FS_S, maxw, u->env_wrapped, sizeof u->env_wrapped);
+}
+
 /* --- setup screen (no client id) ----------------------------------------- */
 static void draw_setup(Ui *u)
 {
     float maxw = (float)(u->w - 2 * PAD);
     if (u->text_dirty) {
-        char env_path[CFG_PATH_LEN];
-        if (plat_path_join(env_path, sizeof env_path, u->cfg.app_dir, ".env") != 0)
-            snprintf(env_path, sizeof env_path, ".env");
-        wrap_text(u, env_path, FS_S, maxw, u->env_wrapped, sizeof u->env_wrapped);
+        wrap_env_path(u, maxw);
         u->text_dirty = 0;
     }
     float y = 48;
@@ -845,24 +862,11 @@ static void start_login(Ui *u)
         u->login_msg = "Could not start sign-in.";
 }
 
-static void start_engine(Ui *u)
+/* Our PKCE login for the Web API. */
+static void draw_login(Ui *u)
 {
-    u->login_msg = NULL;
-    u->eng_has_url = 0;
-    u->eng_seq = 0;
-    if (!u->ls)
-        u->ls = librespot_start(&u->cfg, ui_wake, NULL);
-    if (!u->ls)
-        u->login_msg = "Could not start librespot (missing?).";
-    else if (engine_start(&u->eng, &u->cfg, u->ls) != 0) {
-        stop_session(u);
-        u->login_msg = "Could not start sign-in.";
-    }
-}
-
-/* Step 1: our PKCE login for the Web API. */
-static void draw_step1(Ui *u, float y)
-{
+    float y = 168;
+    text_center(u, "Spotify C Player", 120, FS_L, C_TEXT);
     if (u->login_th) {
         plat_mutex_lock(u->mu);
         int done = u->login_done, rc = u->login_rc;
@@ -879,8 +883,6 @@ static void draw_step1(Ui *u, float y)
         }
     }
 
-    if (u->need_engine)
-        text_center(u, "Step 1 of 2", y, FS_S, C_DIM);
     y += 20;
     text_center(u, "Sign in to control your music.", y, FS_S, C_TEXT);
     y += 36;
@@ -910,71 +912,172 @@ static void draw_step1(Ui *u, float y)
         text_center(u, u->login_msg, by + 40, FS_S, C_ERR);
 }
 
-/* Step 2: librespot's own one-time OAuth (it opens the browser itself). */
-static void draw_step2(Ui *u, float y)
-{
-    if (u->eng.th) {
-        plat_mutex_lock(u->eng.mu);
-        uint64_t seq = u->eng.url_seq;
-        EngineState state = u->eng.state;
-        int has_url = u->eng.url[0] != 0;
-        plat_mutex_unlock(u->eng.mu);
-        if (seq != u->eng_seq) {
-            u->eng_seq = seq;
-            u->eng_has_url = has_url;
-            if (state == ENG_DONE) {
-                enter_player(u);
-                return;
-            }
-            if (state == ENG_DIED) {
-                librespot_status(u->ls, u->ls_status, sizeof u->ls_status);
-                fit_text(u, u->ls_status[0] ? u->ls_status : "librespot exited.", FS_S,
-                         (float)(u->w - 2 * PAD), u->status, sizeof u->status);
-                u->login_msg = u->status;
-                stop_session(u);
-            }
-        }
-    }
+/* --- Soloist key screen -------------------------------------------------- */
+#define SOLOIST_KEY_URL "https://developer.spotify.com/dashboard/soloist"
 
-    text_center(u, "Step 2 of 2", y, FS_S, C_DIM);
-    y += 20;
-    text_center(u, "Connect the playback engine so this", y, FS_S, C_TEXT);
-    y += 16;
-    text_center(u, "computer can play the audio itself.", y, FS_S, C_TEXT);
-    y += 20;
-    Rectangle rb = { ((float)u->w - 200.0f) / 2.0f, y, 200, 40 };
-    if (!u->eng.th) {
-        if (button(u, W_CONNECT, rb, "Connect playback engine", FS_S, 1))
-            start_engine(u);
-        if (u->login_msg)
-            text_center(u, u->login_msg, y + 56, FS_S, C_ERR);
-        return;
-    }
-    text_center(u, u->eng_has_url ? "Waiting for browser..." : "Starting playback engine...",
-                y + 12, FS_S, C_TEXT);
-    float by = y + 48;
-    if (u->eng_has_url) {
-        Rectangle ro = { ((float)u->w - 200.0f) / 2.0f, by, 200, 28 };
-        if (button(u, W_OPEN_URL, ro, "Open sign-in page again", FS_S, 0))
-            open_again(u, u->eng.mu, u->eng.url);
-        by += 36;
-    }
-    Rectangle rc = { ((float)u->w - 100.0f) / 2.0f, by, 100, 28 };
-    if (button(u, W_CANCEL, rc, "Cancel", FS_S, 0)) {
-        stop_session(u);
-        u->login_msg = "Cancelled.";
-    }
-    if (u->login_msg)
-        text_center(u, u->login_msg, by + 40, FS_S, C_ERR);
+static void skip_engine(Ui *u)
+{
+    u->engine_skipped = 1;
+    stop_session(u);
+    enter_player(u);
 }
 
-static void draw_login(Ui *u)
+static void draw_key(Ui *u)
 {
+    float maxw = (float)(u->w - 2 * PAD);
+    if (u->text_dirty) {
+        wrap_env_path(u, maxw);
+        u->text_dirty = 0;
+    }
+    float y = 48;
+    text_center(u, "Spotify C Player", y, FS_L, C_TEXT);
+    y += 48;
+    text(u, "To play music on this computer, it needs\na Spotify Soloist API key.", PAD, y,
+         FS_S, C_TEXT);
+    y += 40;
+    text(u, "1. Generate a key at", PAD, y, FS_S, C_DIM);
+    y += 16;
+    text(u, "developer.spotify.com/dashboard/soloist", PAD, y, FS_S, C_TEXT);
+    y += 18;
+    Rectangle ro = { PAD, y, 120, 24 };
+    if (button(u, W_OPEN_KEY, ro, "Open the page", FS_S, 0) && plat_open_url(SOLOIST_KEY_URL) != 0)
+        u->setup_msg = "Could not open the browser.";
+    y += 36;
+    text(u, "2. Add this line to the file:", PAD, y, FS_S, C_DIM);
+    y += 18;
+    text(u, u->env_wrapped, PAD, y, FS_S, C_TEXT);
+    y += MeasureTextEx(u->font, u->env_wrapped, FS_S, spacing(FS_S)).y + 12;
+    text(u, "SOLOIST_API_KEY=...", PAD, y, FS_S, C_ACCENT);
+    y += 24;
+    text(u, "3. Press Reload.", PAD, y, FS_S, C_DIM);
+    y += 24;
+
+    Rectangle rb = { ((float)u->w - 120.0f) / 2.0f, y, 120, 32 };
+    if (button(u, W_RELOAD, rb, "Reload", FS_S, 1)) {
+        Config c;
+        if (config_load(&c) == 0) {
+            /* Only the key changes; the AuthStore keeps its own copy. */
+            memcpy(u->cfg.soloist_key, c.soloist_key, sizeof u->cfg.soloist_key);
+            memset(c.soloist_key, 0, sizeof c.soloist_key);
+        }
+        if (!u->cfg.soloist_key[0]) {
+            u->setup_msg = "Still no SOLOIST_API_KEY in .env.";
+        } else {
+            u->setup_msg = NULL;
+            start_engine_setup(u, 0);
+            return;
+        }
+    }
+    y += 44;
+    Rectangle rs = { ((float)u->w - 240.0f) / 2.0f, y, 240, 28 };
+    if (button(u, W_SKIP, rs, "Skip: control other devices only", FS_S, 0)) {
+        u->setup_msg = NULL;
+        skip_engine(u);
+        return;
+    }
+    if (u->setup_msg)
+        text_center(u, u->setup_msg, y + 40, FS_S, C_ERR);
+}
+
+/* --- engine screen: install, start, one-time pairing --------------------- */
+/* Install worker finished: start Soloist on this (the main) thread. */
+static void finish_install(Ui *u)
+{
+    plat_mutex_lock(u->inst.mu);
+    int rc = u->inst.rc;
+    memcpy(u->eng_err, u->inst.err, sizeof u->eng_err);
+    plat_mutex_unlock(u->inst.mu);
+    installer_stop(&u->inst);
+    if (rc != 0)
+        return;
+    u->eng_err[0] = 0;
+    u->sol = soloist_start(&u->cfg, ui_wake, NULL);
+    if (!u->sol)
+        snprintf(u->eng_err, sizeof u->eng_err, "Could not start Spotify Soloist.");
+}
+
+/* Soloist's state drives the screen; returns 1 if it left the screen. */
+static int follow_soloist(Ui *u)
+{
+    SoloistState st = soloist_state(u->sol);
+    if (st == SOLOIST_READY || (st == SOLOIST_PAIRING && u->dev.found)) {
+        enter_player(u);
+        return 1;
+    }
+    if (st == SOLOIST_PAIRING && !u->dev.th)
+        device_start(&u->dev, u->auth, NULL, 1); /* cheap poll for our device */
+    if (st == SOLOIST_EXPIRED && !u->reinstalled) {
+        /* Expired since the check: replace the build and start once more. */
+        u->reinstalled = 1;
+        stop_session(u);
+        start_engine_setup(u, 1);
+        return 1;
+    }
+    if (st == SOLOIST_STOPPED || st == SOLOIST_EXPIRED) {
+        soloist_status(u->sol, u->eng_err, sizeof u->eng_err);
+        stop_session(u);
+    }
+    return 0;
+}
+
+static void draw_engine(Ui *u)
+{
+    float maxw = (float)(u->w - 2 * PAD), y = 168;
     text_center(u, "Spotify C Player", 120, FS_L, C_TEXT);
-    if (u->step == 1)
-        draw_step1(u, 168);
-    else
-        draw_step2(u, 168);
+    char line[96];
+    if (u->inst.th) {
+        plat_mutex_lock(u->inst.mu);
+        int done = u->inst.done, downloading = u->inst.downloading, pct = u->inst.percent;
+        plat_mutex_unlock(u->inst.mu);
+        if (done) {
+            finish_install(u);
+            u->redraw = 1;
+        } else {
+            if (!downloading)
+                snprintf(line, sizeof line, "Checking Spotify Soloist...");
+            else if (pct < 0)
+                snprintf(line, sizeof line, "Downloading Spotify Soloist...");
+            else
+                snprintf(line, sizeof line, "Downloading Spotify Soloist... %d%%", pct);
+            text_center(u, u->inst.cancel ? "Cancelling..." : line, y, FS_S, C_TEXT);
+            if (downloading)
+                text_center(u, "From Spotify, once every 90 days.", y + 18, FS_S, C_DIM);
+            Rectangle rc = { ((float)u->w - 100.0f) / 2.0f, y + 48, 100, 28 };
+            if (button(u, W_CANCEL, rc, "Cancel", FS_S, 0))
+                u->inst.cancel = 1;
+            return;
+        }
+    }
+    if (u->sol && follow_soloist(u))
+        return;
+
+    Rectangle rs = { ((float)u->w - 240.0f) / 2.0f, y + 96, 240, 28 };
+    if (u->sol) {
+        if (soloist_state(u->sol) == SOLOIST_PAIRING) {
+            text_center(u, "Pair once", y, FS_S, C_ACCENT);
+            text(u, "Open Spotify on your phone or computer\n(same network), open the device list\n"
+                    "and choose \"" CFG_DEVICE_NAME "\".", PAD, y + 24, FS_S, C_TEXT);
+            text_center(u, "Waiting for the device to appear...", y + 80, FS_S, C_DIM);
+            rs.y = y + 104;
+            if (button(u, W_SKIP, rs, "Skip for now", FS_S, 0))
+                enter_player(u); /* Soloist keeps running: pairing can happen later */
+        } else {
+            text_center(u, "Starting Spotify Soloist...", y, FS_S, C_TEXT);
+        }
+        return;
+    }
+
+    /* Failed or cancelled: say why, retry or go on without a local device. */
+    fit_two_lines(u, u->eng_err[0] ? u->eng_err : "Spotify Soloist stopped.", FS_S, maxw,
+                  u->status, sizeof u->status);
+    text(u, u->status, PAD, y, FS_S, C_ERR);
+    Rectangle rr = { ((float)u->w - 120.0f) / 2.0f, y + 44, 120, 32 };
+    if (button(u, W_RETRY, rr, "Retry", FS_S, 1)) {
+        start_engine_setup(u, 0);
+        return;
+    }
+    if (button(u, W_SKIP, rs, "Skip: control other devices only", FS_S, 0))
+        skip_engine(u);
 }
 
 /* --- player screen ------------------------------------------------------- */
@@ -1060,20 +1163,20 @@ static void refresh_player_text(Ui *u, float maxw, float status_w)
         fit_text(u, s->track.album, FS_S, maxw, u->album, sizeof u->album);
     } else {
         fit_text(u, "Nothing playing", FS_L, maxw, u->title, sizeof u->title);
-        fit_text(u, librespot_playback_refused(u->ls) ? "Pick a device with the Devices button."
-                                                      : "Press play, or pick this device in Spotify.",
+        fit_text(u, u->sol ? "Press play, or pick this device in Spotify."
+                           : "Pick a device with the Devices button.",
                  FS_S, maxw, u->artists, sizeof u->artists);
         u->album[0] = 0;
     }
     sp_fmt_time(u->t_dur, sizeof u->t_dur, s->track.duration_ms);
     u->pos_sec = -1;
 
-    char raw[SP_NAME_LEN + 64 + sizeof u->ls_shown];
+    char raw[SP_NAME_LEN + 64 + sizeof u->sol_shown];
     int err = u->cmd_err ? u->cmd_err : u->poll_err;
     snprintf(raw, sizeof raw, "%s%s%s%s%s",
              s->active && s->device_name[0] ? s->device_name : "No active device",
              err ? " | " : "", err ? sp_strerror(err) : "",
-             u->ls_shown[0] ? " | " : "", u->ls_shown);
+             u->sol_shown[0] ? " | " : "", u->sol_shown);
     fit_two_lines(u, raw, FS_S, status_w, u->status, sizeof u->status);
     u->text_dirty = 0;
 }
@@ -1232,7 +1335,7 @@ static void draw_devices(Ui *u, Rectangle area)
                                    : "Loading devices...", area.x, y + 4, FS_S, C_DIM);
         return;
     }
-    int refused = librespot_playback_refused(u->ls);
+    int local = u->sol != NULL;
     for (int i = 0; i < u->lib.ndev && y + row_h <= area.y + area.height; i++, y += row_h + gap) {
         const Device *d = &u->lib.devs[i];
         Rectangle r = { area.x, y, area.width, row_h };
@@ -1241,7 +1344,7 @@ static void draw_devices(Ui *u, Rectangle area)
             u->panel = PANEL_NONE;
         }
         const char *sub = d->is_active ? "active"
-                        : refused && strcmp(d->name, CFG_DEVICE_NAME) == 0 ? "can't play"
+                        : local && strcmp(d->name, CFG_DEVICE_NAME) == 0 ? "this computer"
                         : d->type;
         char fit[SP_NAME_LEN];
         float sw = text_w(u, sub, FS_S);
@@ -1293,12 +1396,16 @@ static void draw_player(Ui *u)
         advance_signin(u);
         return;
     }
-    if (u->ls)
-        librespot_status(u->ls, u->ls_status, sizeof u->ls_status);
+    /* Soloist's state only matters while it isn't simply ready. */
+    SoloistState sst = soloist_state(u->sol);
+    char sol_raw[sizeof u->sol_status - 16];
+    if (u->sol && sst != SOLOIST_READY)
+        soloist_status(u->sol, sol_raw, sizeof sol_raw);
     else
-        snprintf(u->ls_status, sizeof u->ls_status, "librespot not running");
-    if (strcmp(u->ls_status, u->ls_shown) != 0) {
-        memcpy(u->ls_shown, u->ls_status, sizeof u->ls_shown);
+        sol_raw[0] = 0;
+    snprintf(u->sol_status, sizeof u->sol_status, "%s%s", sol_raw[0] ? "Soloist: " : "", sol_raw);
+    if (strcmp(u->sol_status, u->sol_shown) != 0) {
+        memcpy(u->sol_shown, u->sol_status, sizeof u->sol_shown);
         u->text_dirty = 1;
     }
 
@@ -1316,23 +1423,13 @@ static void draw_player(Ui *u)
     if (u->text_dirty)
         refresh_player_text(u, cw, cw);
 
-    int refused = librespot_playback_refused(u->ls);
-    if (refused && !u->refused_seen) {
-        /* Once per session: this account can only drive other devices. */
-        u->refused_seen = 1;
-        plat_mutex_lock(u->cmd.mu);
-        u->cmd.no_local = 1;
-        plat_mutex_unlock(u->cmd.mu);
-        u->panel = PANEL_DEVICES;
-        cmd_post(&u->cmd, CMD_DEVICES, 0);
-        u->text_dirty = 1;
-        u->redraw = 1;
-    }
-
-    text(u, u->status, PAD, status_y, FS_S, refused || u->cmd_err || u->poll_err ? C_ERR : C_DIM);
+    int sol_down = u->sol && (sst == SOLOIST_STOPPED || sst == SOLOIST_EXPIRED);
+    text(u, u->status, PAD, status_y, FS_S, sol_down || u->cmd_err || u->poll_err ? C_ERR : C_DIM);
     if (button(u, W_LOGOUT, logout, "Log out", FS_S, 0)) {
+        stop_session(u); /* Soloist first: logout deletes its pairing */
         auth_store_logout(u->auth);
-        stop_session(u);
+        u->engine_skipped = 0;
+        u->reinstalled = 0;
         u->login_msg = NULL;
         advance_signin(u);
         return;
@@ -1406,13 +1503,6 @@ static void draw_player(Ui *u)
     }
     if (button(u, W_PLAY, rplay, NULL, 0, 1)) {
         int play = !(s->active && s->is_playing);
-        if (play && librespot_playback_refused(u->ls) &&
-            (!s->active || strcmp(s->device_name, CFG_DEVICE_NAME) == 0)) {
-            /* Playing here can't work: offer the other devices instead. */
-            u->panel = PANEL_DEVICES;
-            cmd_post(&u->cmd, CMD_DEVICES, 0);
-            return;
-        }
         u->pend.playing = play;
         u->pend.progress_ms = progress_at(s, now);
         u->pend.progress_at = now;
@@ -1474,6 +1564,8 @@ static void frame(Ui *u)
     switch (u->screen) {
     case SCR_SETUP:  draw_setup(u); break;
     case SCR_LOGIN:  draw_login(u); break;
+    case SCR_KEY:    draw_key(u); break;
+    case SCR_ENGINE: draw_engine(u); break;
     case SCR_PLAYER: draw_player(u); break;
     }
     if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT))
@@ -1498,7 +1590,12 @@ int ui_run(const Config *cfg)
         return 1;
 
     SetTraceLogLevel(LOG_WARNING);
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_HIGHDPI | FLAG_VSYNC_HINT);
+    /* ALWAYS_RUN: raylib otherwise parks a minimized window in its own
+     * glfwWaitEvents loop that our wakeups can't leave, so a quit signal
+     * would be ignored until restore. Event waiting still keeps a
+     * minimized window idle. */
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_HIGHDPI | FLAG_VSYNC_HINT |
+                   FLAG_WINDOW_ALWAYS_RUN);
     InitWindow(WIN_W, WIN_H, "Spotify C Player");
     if (!IsWindowReady()) {
         plat_mutex_free(u->mu);
