@@ -1,11 +1,11 @@
 # Spotify C Player: build report (2026-11-06)
 
 ## Status
-**Built, reviewed, optimized and committed.** Two steps need you in person:
-1. Create a **Soloist API key** at https://developer.spotify.com/dashboard/soloist. Paste it after `SOLOIST_API_KEY=` in `build/live/dist/.env`. The line is already there and empty; there's a matching one in the repo `.env`.
-2. Run `build/live/dist/spotify-c-player`. It downloads Soloist from Spotify (~11 MB, once). When it shows **"Pair once"**, open Spotify on your phone or computer on the same Wi-Fi, open the device list, and pick **"Spotify C Player"**. From then on, the app plays on this desktop as its own device and opens straight to the player.
+**Built, reviewed, packaged and committed.** The installable app is **`build/dist/Spotify C Player.app`** (696 KB, macOS 13+, ad-hoc signed). Your client ID and Soloist key are already in it. README.md → *Install on macOS* has the first-run steps: drag the app to /Applications → sign in with your browser → allow Local Network → pick this Mac's device once in Spotify on your phone. After that, the app streams on this Mac across restarts with no phone needed.
 
-`build/live/dist/` is your ready-to-run folder, and you're already signed in there. `build/dist/` is a fresh build with no sign-in. Any folder can be moved anywhere; delete it to uninstall.
+`build/live/dist/` is an older CLI-only folder from development; you can delete it.
+
+Not verified on real hardware: the minimized pairing poll switching to 15 s, a clean long idle-CPU measurement on the player screen, and the Linux/Windows code paths (never compiled here).
 
 ## What was built
 | # | Feature (one subagent each) | Commits |
