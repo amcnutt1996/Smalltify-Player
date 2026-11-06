@@ -244,14 +244,15 @@ static int parse_position(const char *s, int *ms)
 /* Our device name, for the play fallback (set by cli_dispatch). */
 static const char *g_device_name;
 
-/* Start playback (uri NULL = resume) on the active device; with none
- * active, on our own engine if it is online (so `play` works right after
- * `engine` starts), else on any available device of the account. */
-static int play_with_fallback(HttpClient *http, const char *uri, int is_track)
+/* Start playback (both URIs NULL = resume; see sp_play_uri) on the active
+ * device; with none active, on our own engine if it is online (so `play`
+ * works right after `engine` starts), else on any available device of the
+ * account. */
+static int play_with_fallback(HttpClient *http, const char *context_uri, const char *item_uri)
 {
     Device on;
     int where;
-    int rc = sp_play_smart(http, uri, is_track, g_device_name, 0, &on, &where);
+    int rc = sp_play_smart(http, context_uri, item_uri, g_device_name, 0, &on, &where);
     if (rc == SP_OK && where == SP_ON_OTHER)
         printf("Playing on %s\n", on.name);
     if (rc != SP_ERR_NODEVICE)
@@ -263,7 +264,7 @@ static int play_with_fallback(HttpClient *http, const char *uri, int is_track)
 
 static int play_or_fallback(HttpClient *http)
 {
-    return play_with_fallback(http, NULL, 0);
+    return play_with_fallback(http, NULL, NULL);
 }
 
 /* Names and queries may contain spaces, so unquoted words are joined back
@@ -511,7 +512,7 @@ static int cmd_playlist(const Config *cfg, int argc, char **argv)
         rc = CLI_REPORTED;
     }
     if (rc == SP_OK)
-        rc = play_with_fallback(http, hit->uri, 0);
+        rc = play_with_fallback(http, hit->uri, NULL);
     if (rc == SP_OK)
         printf("Playing %s\n", hit->name);
     return finish(auth, http, rc);
@@ -541,7 +542,7 @@ static int cmd_search(const Config *cfg, int argc, char **argv)
             fprintf(stderr, "Only %d result(s) for '%s'.\n", n, query);
             rc = CLI_REPORTED;
         } else {
-            rc = play_with_fallback(http, t[pick - 1].uri, 1);
+            rc = play_with_fallback(http, NULL, t[pick - 1].uri);
             if (rc == SP_OK)
                 printf("Playing %s - %s\n", t[pick - 1].name, t[pick - 1].artists);
         }

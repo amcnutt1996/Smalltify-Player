@@ -44,11 +44,57 @@ typedef struct {
     int  volume;              /* 0-100, -1 if unknown */
 } Device;
 
+/* Used by ui.c until the Library UI migrates to Item (sp_get_playlists);
+ * delete it then. */
 typedef struct {
     char id[SP_ID_LEN];
     char uri[SP_URI_LEN];
     char name[SP_NAME_LEN];
     int  track_count;
 } Playlist;
+
+/* What an Item is (Spotify's "type" field). */
+typedef enum {
+    ITEM_TRACK,
+    ITEM_EPISODE,
+    ITEM_ALBUM,
+    ITEM_ARTIST,
+    ITEM_PLAYLIST,
+    ITEM_SHOW
+} ItemKind;
+
+/* One row of any list: your library, search results, the queue, or the
+ * contents of a playlist, album, artist or show (sp_get_list, sp_search).
+ * Fields a kind doesn't have are "" (text), 0 (duration_ms) or -1 (count). */
+typedef struct {
+    ItemKind kind;
+    char id[SP_ID_LEN];          /* "" for local files */
+    char uri[SP_URI_LEN];        /* play, queue or save it with this */
+    char name[SP_NAME_LEN];
+    char sub[SP_NAME_LEN];       /* second line: artists (track, album), show
+                                    (episode, if Spotify sent it), publisher
+                                    (show; Spotify stopped sending it in Feb 2026),
+                                    owner (playlist), "" (artist) */
+    char album[SP_NAME_LEN];     /* track: its album; episode: its show */
+    char album_uri[SP_URI_LEN];  /* the same as a URI (open it with SP_LIST_ALBUM
+                                    or SP_LIST_SHOW) */
+    char artist_uri[SP_URI_LEN]; /* track, album: the first artist (SP_LIST_ARTIST) */
+    char art_url[SP_URL_LEN];    /* cover or photo, picked like Track.art_url; "" if none */
+    char date[16];               /* album, episode: release date, "YYYY[-MM[-DD]]" */
+    int  duration_ms;            /* track, episode */
+    int  count;                  /* album: tracks; playlist: items; show: episodes;
+                                    -1 unknown (Spotify shows no contents of a
+                                    playlist you neither own nor collaborate on) */
+    int  playable;               /* 0: Spotify can't play it (a local file, not
+                                    available in your country, or removed) */
+} Item;
+
+/* The signed-in account (sp_get_me). */
+typedef struct {
+    char id[SP_ID_LEN];          /* Spotify user id */
+    char name[SP_NAME_LEN];      /* display name; may be "" */
+    char liked_uri[SP_URI_LEN];  /* Liked Songs as a playable context:
+                                    "spotify:user:<id>:collection" */
+} User;
 
 #endif
