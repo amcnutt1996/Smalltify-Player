@@ -9,7 +9,7 @@
 
 typedef struct {
     const char *name;
-    const char *usage;   /* e.g. "seek <seconds>" */
+    const char *usage;   /* e.g. "seek <seconds>"; one form per line */
     int (*run)(const Config *cfg, int argc, char **argv); /* argv[0] = command */
 } CliCommand;
 
