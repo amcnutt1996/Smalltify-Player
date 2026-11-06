@@ -51,12 +51,55 @@ foreach(t ${SCP_TESTS})
   get_filename_component(n ${t} NAME_WE)
   add_executable(${n} ${t})
   target_link_libraries(${n} PRIVATE scp_core)
+  # Release flags add -DNDEBUG; tests rely on assert().
+  target_compile_options(${n} PRIVATE $<IF:$<C_COMPILER_ID:MSVC>,/UNDEBUG,-UNDEBUG>)
   add_test(NAME ${n} COMMAND ${n})
 endforeach()
 
-# Seed dist/.env from the repo's .env (never overwrite the user's copy).
-if(EXISTS ${CMAKE_SOURCE_DIR}/.env AND NOT EXISTS ${SCP_DIST_DIR}/.env)
-  file(COPY ${CMAKE_SOURCE_DIR}/.env DESTINATION ${SCP_DIST_DIR})
-elseif(NOT EXISTS ${SCP_DIST_DIR}/.env)
-  file(COPY_FILE ${CMAKE_SOURCE_DIR}/.env.example ${SCP_DIST_DIR}/.env)
+# Seed dist/.env once from .env.example (never overwrite the user's copy).
+# For dev, only the SPOTIFY_CLIENT_ID line of the repo .env is carried over:
+# any other key there (e.g. a client secret) must never reach dist/.
+if(NOT EXISTS ${SCP_DIST_DIR}/.env)
+  file(READ ${CMAKE_SOURCE_DIR}/.env.example SCP_ENV_TEXT)
+  if(EXISTS ${CMAKE_SOURCE_DIR}/.env)
+    file(STRINGS ${CMAKE_SOURCE_DIR}/.env SCP_ENV_ID REGEX "^SPOTIFY_CLIENT_ID=[A-Za-z0-9]+")
+    if(SCP_ENV_ID)
+      list(GET SCP_ENV_ID 0 SCP_ENV_ID)
+      string(STRIP "${SCP_ENV_ID}" SCP_ENV_ID)
+      string(REGEX REPLACE "SPOTIFY_CLIENT_ID=[^\n]*" "${SCP_ENV_ID}" SCP_ENV_TEXT "${SCP_ENV_TEXT}")
+    endif()
+  endif()
+  file(WRITE ${SCP_DIST_DIR}/.env "${SCP_ENV_TEXT}")
+endif()
+
+# --- librespot: bundled playback engine (the only non-C component) ----------
+# Built once with cargo; the custom command has no DEPENDS, so it only runs
+# while the binary is missing (the first build takes several minutes).
+# Features: rodio (cross-platform audio) + rustls with bundled webpki roots
+# (pure Rust TLS on ring: no OpenSSL at build or run time, no mDNS stack).
+option(SCP_BUILD_LIBRESPOT "Build the bundled librespot with cargo" ON)
+if(SCP_BUILD_LIBRESPOT)
+  find_program(SCP_CARGO cargo REQUIRED)
+  set(SCP_LIBRESPOT_VERSION 0.8.0)
+  set(SCP_LIBRESPOT_ROOT ${CMAKE_BINARY_DIR}/librespot)
+  set(SCP_LIBRESPOT_BIN ${SCP_LIBRESPOT_ROOT}/bin/librespot${CMAKE_EXECUTABLE_SUFFIX})
+  set(SCP_LIBRESPOT_DIST ${SCP_DIST_DIR}/librespot${CMAKE_EXECUTABLE_SUFFIX})
+  add_custom_command(OUTPUT ${SCP_LIBRESPOT_BIN}
+    COMMAND ${CMAKE_COMMAND} -E env
+      CARGO_PROFILE_RELEASE_LTO=true
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+      CARGO_PROFILE_RELEASE_STRIP=true
+      CARGO_PROFILE_RELEASE_PANIC=abort
+      ${SCP_CARGO} install librespot --version ${SCP_LIBRESPOT_VERSION} --locked
+        --root ${SCP_LIBRESPOT_ROOT}
+        --target-dir ${SCP_LIBRESPOT_ROOT}/target
+        --no-default-features --features rodio-backend,rustls-tls-webpki-roots
+    COMMENT "Building librespot ${SCP_LIBRESPOT_VERSION} with cargo (slow the first time)"
+    USES_TERMINAL
+    VERBATIM)
+  add_custom_command(OUTPUT ${SCP_LIBRESPOT_DIST}
+    COMMAND ${CMAKE_COMMAND} -E copy ${SCP_LIBRESPOT_BIN} ${SCP_LIBRESPOT_DIST}
+    DEPENDS ${SCP_LIBRESPOT_BIN}
+    VERBATIM)
+  add_custom_target(librespot ALL DEPENDS ${SCP_LIBRESPOT_DIST})
 endif()
