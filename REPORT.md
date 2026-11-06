@@ -3,8 +3,6 @@
 ## Status
 **Built, reviewed, packaged and committed.** The installable app is **`build/dist/Spotify C Player.app`** (696 KB, macOS 13+, ad-hoc signed). Your client ID and Soloist key are already in it. README.md → *Install on macOS* has the first-run steps: drag the app to /Applications → sign in with your browser → allow Local Network → pick this Mac's device once in Spotify on your phone. After that, the app streams on this Mac across restarts with no phone needed.
 
-`build/live/dist/` is an older CLI-only folder from development; you can delete it.
-
 Not verified on real hardware: the minimized pairing poll switching to 15 s, a clean long idle-CPU measurement on the player screen, and the Linux/Windows code paths (never compiled here).
 
 ## What was built
