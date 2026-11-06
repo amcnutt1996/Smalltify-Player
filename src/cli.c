@@ -478,6 +478,8 @@ static int cmd_engine(const Config *cfg, int argc, char **argv)
     }
     printf("Running \"%s\" as a Spotify Connect device. Ctrl-C or EOF to stop.\n",
            CFG_DEVICE_NAME);
+    if (!librespot_has_credentials(cfg))
+        printf("First run: playback needs a one-time Spotify sign-in in the browser.\n");
     fflush(stdout);
     g_interrupted = 0;
     void (*prev)(int) = signal(SIGINT, on_sigint);
@@ -485,15 +487,23 @@ static int cmd_engine(const Config *cfg, int argc, char **argv)
      * left parked in getchar() and ends with the process. */
     plat_thread *watch = plat_thread_start(stdin_watch, eof);
 
-    char last[1024] = "", cur[1024];
-    int saw_eof = 0;
+    char last[1024] = "", cur[1024], url[4096];
+    int saw_eof = 0, url_shown = 0;
     for (;;) {
         librespot_status(ls, cur, sizeof cur);
         if (strcmp(cur, last) != 0) {
             printf("librespot: %s\n", cur);
-            fflush(stdout);
             snprintf(last, sizeof last, "%s", cur);
         }
+        /* librespot opens the browser itself; the URL is the fallback. */
+        if (librespot_login_url(ls, url, sizeof url)) {
+            if (!url_shown)
+                printf("If your browser did not open, visit this URL to enable playback:\n%s\n", url);
+            url_shown = 1;
+        } else {
+            url_shown = 0;
+        }
+        fflush(stdout);
         if (g_interrupted || !librespot_running(ls))
             break;
         /* Wakes at once on EOF; the 500 ms tick picks up Ctrl-C and status. */

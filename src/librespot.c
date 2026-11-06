@@ -17,14 +17,29 @@
 
 #include "platform.h"
 
-#define LINE_MAX_LEN 1024
+#define STATUS_LEN   1024
+#define URL_LEN      4096 /* librespot requests ~20 scopes: the URL is long */
+#define LINE_MAX_LEN URL_LEN
+
+/* librespot-oauth 0.8.0 prints this on stdout (println!, not the logger)
+ * right after opening the URL in the default browser itself. */
+#define BROWSE_PREFIX "Browse to: "
+#define AUTHED_PREFIX "Authenticated as "
 
 struct Librespot {
     plat_proc   *proc;
     plat_thread *reader;
-    plat_mutex  *lock;            /* guards status */
-    char         status[LINE_MAX_LEN];
+    plat_mutex  *lock;            /* guards status, login_url */
+    char         status[STATUS_LEN];
+    char         login_url[URL_LEN]; /* "" unless waiting for OAuth */
 };
+
+static void set_login_url(Librespot *l, const char *url)
+{
+    plat_mutex_lock(l->lock);
+    snprintf(l->login_url, sizeof l->login_url, "%s", url);
+    plat_mutex_unlock(l->lock);
+}
 
 static void set_status(Librespot *l, const char *s, size_t n)
 {
@@ -48,6 +63,12 @@ static void on_line(Librespot *l, char *line, size_t n)
     if (n == 0)
         return;
     const char *msg = line, *level = "";
+    if (!strncmp(line, BROWSE_PREFIX, sizeof BROWSE_PREFIX - 1)) {
+        static const char wait[] = "waiting for Spotify sign-in in the browser";
+        set_login_url(l, line + sizeof BROWSE_PREFIX - 1);
+        set_status(l, wait, sizeof wait - 1);
+        return;
+    }
     if (line[0] == '[') {
         const char *close = strstr(line, "] ");
         if (!close)
@@ -59,8 +80,10 @@ static void on_line(Librespot *l, char *line, size_t n)
         else if (strstr(line, " ERROR "))
             level = "error: ";
         msg = close + 2;
+        if (!strncmp(msg, AUTHED_PREFIX, sizeof AUTHED_PREFIX - 1))
+            set_login_url(l, "");
     }
-    char out[LINE_MAX_LEN];
+    char out[STATUS_LEN];
     size_t ln = strlen(level), mn = strlen(msg);
     if (ln + mn >= sizeof out)
         mn = sizeof out - 1 - ln;
@@ -95,9 +118,10 @@ static void reader_main(void *arg)
     }
     if (len && !overflow)
         on_line(l, line, len);
-    char last[LINE_MAX_LEN];
+    set_login_url(l, ""); /* its OAuth listener died with it */
+    char last[STATUS_LEN];
     librespot_status(l, last, sizeof last);
-    char msg[LINE_MAX_LEN];
+    char msg[STATUS_LEN + 32];
     int k = snprintf(msg, sizeof msg, "librespot stopped: %s", last);
     if (k > 0)
         set_status(l, msg, (size_t)k);
@@ -160,6 +184,34 @@ void librespot_status(Librespot *l, char *buf, size_t cap)
     plat_mutex_lock(l->lock);
     snprintf(buf, cap, "%s", l->status);
     plat_mutex_unlock(l->lock);
+}
+
+int librespot_login_url(Librespot *l, char *buf, size_t cap)
+{
+    if (!l || !cap)
+        return 0;
+    plat_mutex_lock(l->lock);
+    size_t n = strlen(l->login_url);
+    int ok = n > 0 && n < cap;
+    if (ok)
+        memcpy(buf, l->login_url, n + 1);
+    plat_mutex_unlock(l->lock);
+    if (!ok)
+        buf[0] = '\0';
+    return ok;
+}
+
+int librespot_has_credentials(const Config *cfg)
+{
+    char path[CFG_PATH_LEN];
+    if (plat_path_join(path, sizeof path, cfg->librespot_cache, "credentials.json") != 0)
+        return 0;
+    /* Same file librespot-core's Cache reads; tiny, so reading beats adding
+     * a platform "exists" call. */
+    char *data = plat_read_file(path, 64 * 1024, NULL);
+    int ok = data && data[0];
+    free(data);
+    return ok;
 }
 
 void librespot_stop(Librespot *l)

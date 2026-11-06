@@ -132,6 +132,8 @@ struct AuthStore {
     Token       tok;
     unsigned    gen;       /* bumped on every token change */
     uint64_t    refreshed_ms;
+    AuthUrlFn   on_url;    /* optional sign-in URL observer */
+    void       *on_url_ud;
 };
 
 AuthStore *auth_store_new(const Config *cfg)
@@ -160,6 +162,12 @@ void auth_store_free(AuthStore *s)
     plat_mutex_free(s->flight);
     memset(&s->tok, 0, sizeof s->tok);
     free(s);
+}
+
+void auth_store_set_url_callback(AuthStore *s, AuthUrlFn fn, void *ud)
+{
+    s->on_url = fn;
+    s->on_url_ud = ud;
 }
 
 int auth_store_logged_in(AuthStore *s)
@@ -495,10 +503,14 @@ int auth_store_login(AuthStore *s, const volatile int *cancel)
         fprintf(stderr, "auth: cannot listen on 127.0.0.1:%d (port in use?)\n", CFG_REDIRECT_PORT);
         return -1;
     }
+    if (s->on_url) {
+        s->on_url(url, s->on_url_ud);
+    } else {
+        printf("If your browser did not open, visit this URL to sign in:\n%s\n", url);
+        fflush(stdout);
+    }
     if (plat_open_url(url) != 0)
         fprintf(stderr, "auth: could not open a browser\n");
-    printf("If your browser did not open, visit this URL to sign in:\n%s\n", url);
-    fflush(stdout);
 
     char code[1024];
     int rc = wait_for_code(ls, state, code, sizeof code, cancel);

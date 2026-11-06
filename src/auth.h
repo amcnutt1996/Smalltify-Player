@@ -27,6 +27,13 @@ int auth_store_logged_in(AuthStore *s);
  * worker thread (GUI login screen does this). 0 ok. */
 int auth_store_login(AuthStore *s, const volatile int *cancel);
 
+/* Optional: receive the authorize URL (e.g. for a "copy link" fallback).
+ * Called on the auth_store_login thread once the loopback listener is up,
+ * right before the browser is opened. Without a callback the URL is
+ * printed to stdout instead. Set before auth_store_login; fn may be NULL. */
+typedef void (*AuthUrlFn)(const char *url, void *ud);
+void auth_store_set_url_callback(AuthStore *s, AuthUrlFn fn, void *ud);
+
 /* Copy a valid access token (refreshes if expiring within 60 s). 0 ok. */
 int auth_store_access_token(AuthStore *s, char *buf, size_t cap);
 
