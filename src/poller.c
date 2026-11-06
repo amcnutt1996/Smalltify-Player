@@ -14,6 +14,10 @@
 #define POLL_BACKOFF_MAX_MS 30000
 /* Progress drift tolerated before it counts as a seek/jump. */
 #define POLL_JUMP_MS        1500
+/* While playing in the foreground the UI ticks every POLL_PLAYING_MS from a
+ * local timer (progress is interpolated), but the network is asked only this
+ * often, plus once right after the current track should end. */
+#define POLL_FETCH_PLAYING_MS 5000
 
 struct Poller {
     AuthStore   *auth;
@@ -32,6 +36,14 @@ struct Poller {
 };
 
 static int iabs(int v) { return v < 0 ? -v : v; }
+
+/* Next whole second of interpolated progress, so the shown time steps
+ * exactly once per tick. */
+static uint64_t next_tick(uint64_t now, int progress_ms, uint64_t at)
+{
+    uint64_t pos = (uint64_t)(progress_ms > 0 ? progress_ms : 0) + (now > at ? now - at : 0);
+    return now + POLL_PLAYING_MS - pos % POLL_PLAYING_MS;
+}
 
 /* Anything the UI shows, except progress that merely advanced as expected. */
 static int state_changed(const PlaybackState *a, const PlaybackState *b)
@@ -76,7 +88,8 @@ static void poll_thread(void *arg)
         if (rc == SP_OK) {
             if (cur.fetched_at_ms == 0)
                 cur.fetched_at_ms = fetched;
-            /* While playing, notify every fetch so the progress bar ticks. */
+            /* While playing, publish every fetch: it re-anchors the
+             * progress the UI interpolates between fetches. */
             if (state_changed(&p->state, &cur) || (cur.active && cur.is_playing)) {
                 p->state = cur;
                 p->seq++;
@@ -87,6 +100,8 @@ static void poll_thread(void *arg)
             }
         }
         int playing = p->state.active && p->state.is_playing;
+        int prog = p->state.progress_ms, dur = p->state.track.duration_ms;
+        uint64_t at = p->state.fetched_at_ms;
         plat_mutex_unlock(p->mu);
 
         if (notify && p->on_update)
@@ -106,8 +121,16 @@ static void poll_thread(void *arg)
         }
         kick_fetch = 0;
 
-        /* Sleep until the deadline; wake-ups for background changes just
-         * recompute it, kicks and stop end the wait. */
+        /* Fetch again right after the track should end instead of up to
+         * POLL_FETCH_PLAYING_MS late; once past the end, at most 1/s. */
+        uint64_t end_due = UINT64_MAX;
+        if (playing && dur > 0)
+            end_due = dur > prog ? at + (uint64_t)(dur - prog) + POLL_SETTLE_MS
+                                 : fetched + POLL_PLAYING_MS;
+        uint64_t tick = next_tick(fetched, prog, at);
+
+        /* Sleep until the deadline, waking the UI on each tick; wake-ups for
+         * background changes just recompute it, kicks and stop end the wait. */
         for (;;) {
             plat_mutex_lock(p->mu);
             int stop = p->stop, kicked = p->kicked, bg = p->background;
@@ -119,19 +142,27 @@ static void poll_thread(void *arg)
                 kick_fetch = 1;
                 break;
             }
-            unsigned interval;
+            int ticking = playing && !bg;
+            uint64_t due;
             if (backoff)
-                interval = backoff;
+                due = started + backoff;
             else if (settle)
-                interval = POLL_SETTLE_MS;
+                due = fetched + POLL_SETTLE_MS; /* timed from when the state arrived */
+            else if (ticking)
+                due = started + POLL_FETCH_PLAYING_MS < end_due ? started + POLL_FETCH_PLAYING_MS : end_due;
             else
-                interval = (playing && !bg) ? POLL_PLAYING_MS : POLL_IDLE_MS;
-            /* The settle re-fetch is timed from when the state arrived. */
-            uint64_t due = (settle ? fetched : started) + interval;
+                due = started + POLL_IDLE_MS;
             uint64_t now = plat_now_ms();
             if (now >= due)
                 break;
-            plat_event_wait(p->ev, (unsigned)(due - now));
+            if (ticking && now >= tick) {
+                if (p->on_update)
+                    p->on_update(p->ud);
+                tick = next_tick(now, prog, at);
+                continue;
+            }
+            uint64_t until = ticking && tick < due ? tick : due;
+            plat_event_wait(p->ev, (unsigned)(until - now));
         }
     }
 out:

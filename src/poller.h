@@ -1,6 +1,7 @@
 /* Background thread that fetches playback state and hands snapshots to the
- * UI under a mutex. Adaptive interval: fast while playing, slow while
- * paused/idle, so the app sleeps most of the time. */
+ * UI under a mutex. While playing in the foreground it wakes the UI once per
+ * second of progress (no request) and fetches every 5 s plus right after the
+ * track ends; paused, idle or in the background it fetches every 5 s. */
 #ifndef POLLER_H
 #define POLLER_H
 
@@ -8,13 +9,14 @@
 #include "auth.h"
 #include "model.h"
 
-#define POLL_PLAYING_MS 1000
+#define POLL_PLAYING_MS 1000 /* UI progress tick while playing (no fetch) */
 #define POLL_IDLE_MS    5000
 
 typedef struct Poller Poller;
 
 /* on_update (may be NULL) is called from the poller thread after each
- * snapshot change -- the GUI uses it to wake its event loop. */
+ * snapshot change and on every progress tick -- the GUI uses it to wake its
+ * event loop. */
 Poller *poller_start(AuthStore *auth, void (*on_update)(void *ud), void *ud);
 /* Copy the latest state. Returns 1 if newer than *seq (and updates *seq),
  * else 0. Pass seq NULL to always copy. */
