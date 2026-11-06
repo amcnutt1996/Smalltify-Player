@@ -23,6 +23,7 @@ struct HttpClient {
     char    *buf;
     size_t   len;
     size_t   cap;
+    size_t   max_body; /* 0 = unlimited */
 };
 
 int http_global_init(void)
@@ -41,6 +42,8 @@ static size_t on_write(char *data, size_t size, size_t nmemb, void *ud)
     size_t n = size * nmemb;
     if (n == 0)
         return 0;
+    if (c->max_body && n > c->max_body - c->len)
+        return 0; /* over the cap: aborts with CURLE_WRITE_ERROR */
     if (c->cap - c->len <= n) {  /* keep room for the NUL */
         size_t cap = c->cap ? c->cap : HTTP_BUF_INITIAL;
         while (cap - c->len <= n) {
@@ -103,6 +106,12 @@ void http_client_free(HttpClient *c)
     curl_easy_cleanup(c->h);
     free(c->buf);
     free(c);
+}
+
+void http_client_set_max_body(HttpClient *c, size_t max)
+{
+    if (c)
+        c->max_body = max;
 }
 
 void http_response_free(HttpResponse *r)

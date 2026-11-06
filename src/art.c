@@ -13,6 +13,9 @@
 #include "platform.h"
 
 #define ART_MAX_BYTES (2u * 1024u * 1024u) /* album art is ~5-60 KB; cap junk */
+/* Nothing to do until art_request/art_stop signal: effectively no timeout
+ * (plat_event_wait computes its deadline in 64 bits). */
+#define ART_IDLE_WAIT_MS 0xFFFFFFFFu
 
 typedef struct {
     unsigned char *data;
@@ -70,7 +73,7 @@ static void fetch(ArtLoader *a, HttpClient *http, const char *url)
     size_t len = 0;
 
     if (url[0] && http_request(http, "GET", url, NULL, NULL, &r) == 0) {
-        if (r.status == 200 && r.body && r.len > 0 && r.len <= ART_MAX_BYTES) {
+        if (r.status == 200 && r.body && r.len > 0) {
             /* Take over the receive buffer: no copy needed. */
             copy = (unsigned char *)r.body;
             len = r.len;
@@ -87,12 +90,14 @@ static void worker(void *arg)
 {
     ArtLoader *a = arg;
     HttpClient *http = http_client_new(NULL);
+    /* Junk larger than any cover aborts mid-download, not after it. */
+    http_client_set_max_body(http, ART_MAX_BYTES);
 
     for (;;) {
         char url[SP_URL_LEN];
         int have = 0;
 
-        plat_event_wait(a->wake, 60000);
+        plat_event_wait(a->wake, ART_IDLE_WAIT_MS);
         plat_mutex_lock(a->lock);
         if (a->quit) {
             plat_mutex_unlock(a->lock);

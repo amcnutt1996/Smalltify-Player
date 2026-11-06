@@ -29,6 +29,9 @@ void http_global_cleanup(void);
 /* auth may be NULL (unauthenticated requests, e.g. token endpoint). */
 HttpClient *http_client_new(const HttpAuth *auth);
 void        http_client_free(HttpClient *c);
+/* Abort any response body larger than max bytes while it downloads
+ * (http_request then returns -1). 0 = no limit, the default. */
+void        http_client_set_max_body(HttpClient *c, size_t max);
 
 /* method: "GET" "PUT" "POST" "DELETE". body/content_type may be NULL.
  * With auth: adds "Authorization: Bearer", on 401 calls refresh once and

@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "http.h"
@@ -10,6 +11,34 @@ static void expect(const char *src, size_t cap, int rc, const char *want)
     memset(out, 'x', sizeof out);
     assert(http_urlencode(src, out, cap) == rc);
     assert(strcmp(out, want) == 0);
+}
+
+/* The body cap, exercised offline: this source file served via file://. */
+static void test_max_body(void)
+{
+    FILE *f = fopen(__FILE__, "rb");
+    assert(f && fseek(f, 0, SEEK_END) == 0);
+    long size = ftell(f);
+    assert(size > 0);
+    fclose(f);
+
+    char url[1024];
+    int n = snprintf(url, sizeof url, "file://%s", __FILE__);
+    assert(n > 0 && (size_t)n < sizeof url && __FILE__[0] == '/');
+
+    HttpClient *c = http_client_new(NULL);
+    assert(c);
+    HttpResponse r;
+    const size_t caps[] = { 0, (size_t)size, (size_t)size - 1, 16 };
+    const int rcs[] = { 0, 0, -1, -1 };
+    for (size_t i = 0; i < sizeof caps / sizeof caps[0]; i++) {
+        http_client_set_max_body(c, caps[i]);
+        assert(http_request(c, "GET", url, NULL, NULL, &r) == rcs[i]);
+        assert(rcs[i] != 0 || (r.len == (size_t)size && r.body));
+        assert(rcs[i] == 0 || (!r.body && r.len == 0));
+        http_response_free(&r);
+    }
+    http_client_free(c);
 }
 
 int main(void)
@@ -50,5 +79,9 @@ int main(void)
         assert(out[0] == '\0');
         assert(http_urlencode("a", NULL, 8) == -1);
     }
+
+    assert(http_global_init() == 0);
+    test_max_body();
+    http_global_cleanup();
     return 0;
 }
