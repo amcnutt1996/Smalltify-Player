@@ -190,6 +190,29 @@ void config_device_name(const char *host, char *out, size_t cap)
         snprintf(out, cap, "%s%.*s)", prefix, (int)n, h);
 }
 
+static const char *const font_size_values[CFG_FONT_SIZES] = {
+    "small", "default", "large", "extra-large",
+};
+
+int config_font_size(const char *value)
+{
+    for (int i = 0; value && i < CFG_FONT_SIZES; i++) {
+        const char *a = value, *b = font_size_values[i];
+        while (*a && (*a >= 'A' && *a <= 'Z' ? *a - 'A' + 'a' : *a) == *b) {
+            a++;
+            b++;
+        }
+        if (!*a && !*b)
+            return i;
+    }
+    return CFG_FONT_DEFAULT;
+}
+
+const char *config_font_size_value(int size)
+{
+    return size >= 0 && size < CFG_FONT_SIZES ? font_size_values[size] : NULL;
+}
+
 int config_load(Config *c)
 {
     memset(c, 0, sizeof *c);
@@ -234,11 +257,14 @@ int config_load(Config *c)
      * to move the app, and saving the token reports the failure later. */
     c->read_only = plat_mkdir(c->data_dir) != 0;
 
-    /* Only these two keys are extracted; every other one (secrets
-     * included) is ignored and the text is released right away. */
+    /* Only these keys are extracted; every other one (secrets included)
+     * is ignored and the text is released right away. */
     char *text = plat_read_file(c->env_path, ENV_MAX_BYTES, NULL);
     load_setting(text, "SPOTIFY_CLIENT_ID", c->client_id, sizeof c->client_id);
     load_setting(text, "SOLOIST_API_KEY", c->soloist_key, sizeof c->soloist_key);
+    char size[16];
+    load_setting(text, "UI_FONT_SIZE", size, sizeof size);
+    c->font_size = config_font_size(size);
     free(text);
     return 0;
 }

@@ -6,6 +6,7 @@
 #include "ui.h"
 
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -20,18 +21,42 @@
 #include "soloist.h"
 #include "spotify.h"
 
+#include "inter_subset.h" /* inter_ranges, inter_blanks, INTER_HEIGHT */
+
 /* Part of the GLFW bundled inside libraylib.a; raylib has no wrapper for it.
  * GLFW documents it as callable from any thread. */
 void glfwPostEmptyEvent(void);
 
-#define WIN_W 360
-#define WIN_H 520
-#define MIN_W 320
-#define MIN_H 440
-#define PAD   16
-/* The default font is a 10 px bitmap font: integer multiples stay crisp. */
-#define FS_S  10
-#define FS_L  20
+/* The GUI font, third_party/inter/Inter-Regular.subset.ttf, compiled in by
+ * CMakeLists.txt (ui_font.c in the build folder). */
+extern const unsigned char ui_font_ttf[];
+extern const unsigned int ui_font_ttf_len;
+
+#define WIN_W      360
+#define WIN_ART    220 /* album art side in a new window */
+#define MIN_W      320
+#define MIN_H      440
+#define PAD        16
+#define LINE_GAP   4   /* between the lines of one text */
+#define BAR_GAP    8   /* between bottom-bar buttons */
+#define BAR_MARGIN 8   /* narrowest label margin in a bottom-bar button */
+#define GLYPH_PAD  2   /* atlas texels around each glyph: filtering stays inside */
+#define ELLIPSIS   "\xE2\x80\xA6" /* U+2026 */
+
+/* Text styles: body text and titles. Their sizes follow the font-size
+ * setting (font_sizes, Ui.m). */
+enum { FS_S, FS_L };
+
+/* Body and title text in logical pixels for each CFG_FONT_* setting. */
+static const struct {
+    int         body, title;
+    const char *label;
+} font_sizes[CFG_FONT_SIZES] = {
+    { 12, 19, "Small" }, { 14, 22, "Default" }, { 16, 25, "Large" }, { 19, 29, "Extra large" },
+};
+
+#define BAR_BUTTONS 4
+static const char *const bar_label[BAR_BUTTONS] = { "Devices", "Library", "Settings", "Log out" };
 
 /* Optimistic edits survive contradicting snapshots this long: right after a
  * command Spotify often still reports the old state. */
@@ -491,15 +516,15 @@ static int installer_start(Installer *in, const Config *cfg, int force)
 
 /* --- UI state ------------------------------------------------------------ */
 typedef enum { SCR_MOVE, SCR_SETUP, SCR_LOGIN, SCR_KEY, SCR_PLAYER } Screen;
-typedef enum { PANEL_NONE, PANEL_LIBRARY, PANEL_DEVICES } Panel;
+typedef enum { PANEL_NONE, PANEL_LIBRARY, PANEL_DEVICES, PANEL_SETTINGS } Panel;
 
 /* Widget ids for the one widget that may hold the mouse. */
 enum {
     W_NONE, W_RELOAD, W_SIGNIN, W_CANCEL, W_OPEN_URL, W_OPEN_KEY, W_BACK, W_CHANGE_KEY,
     W_RESTART, W_HINT_CLOSE,
     W_PREV, W_PLAY, W_NEXT, W_SEEK, W_VOLUME, W_SHUFFLE, W_REPEAT, W_LOGOUT,
-    W_LIBRARY, W_LIB_BACK, W_DEVICES, W_DEV_REFRESH,
-    W_LIB_ROW /* + row index; library and device rows never show together */
+    W_LIBRARY, W_LIB_BACK, W_DEVICES, W_DEV_REFRESH, W_SETTINGS,
+    W_LIB_ROW /* + row index; rows of two panels never show together */
 };
 
 enum { PEND_PLAY = 1, PEND_SEEK = 2, PEND_SHUFFLE = 4, PEND_REPEAT = 8, PEND_VOLUME = 16 };
@@ -513,15 +538,31 @@ typedef struct {
     uint64_t   until;
 } Pending;
 
+/* Text sizes and the geometry that follows from them, in logical pixels. */
+typedef struct {
+    float dpi;   /* window scale the fonts were rasterized at; 0 = none yet */
+    int   size;  /* CFG_FONT_* they were made for */
+    int   fs;    /* body text */
+    int   fl;    /* titles */
+    float line;  /* pitch of one-line texts stacked under each other */
+    float row;   /* list rows, text fields, most buttons */
+    float bar;   /* bottom-bar buttons */
+    float min_w; /* narrowest window: the bottom bar at BAR_MARGIN */
+} Metrics;
+
 typedef struct {
     Config     cfg;
     AuthStore *auth;
     Screen     screen;
-    Font       font;
+    Font       font, font_l; /* body text and titles, made by apply_font */
+    Metrics    m;
     int        active;   /* widget holding the mouse, W_NONE if free */
     int        redraw;   /* state changed mid-frame: draw one more frame */
     int        w, h;
+    int        min_w, min_h; /* window minimum last set */
+    float      need_h;   /* height the screen drawn last needs */
     int        text_dirty;
+    int        size_unsaved; /* Settings could not write UI_FONT_SIZE */
 
     /* setup and key screens: <app>/.env, wrapped to the window */
     char env_wrapped[CFG_PATH_LEN + 64];
@@ -583,17 +624,54 @@ typedef struct {
     char     key_input[sizeof(((Config *)0)->soloist_key)]; /* key screen; secret */
 } Ui;
 
-/* --- text helpers -------------------------------------------------------- */
-static float spacing(int fs) { return (float)fs / 10.0f; }
+/* --- font and text ------------------------------------------------------- */
+static Metrics metrics_for(int size)
+{
+    if (size < 0 || size >= CFG_FONT_SIZES)
+        size = CFG_FONT_DEFAULT;
+    Metrics m = { 0 };
+    m.size = size;
+    m.fs = font_sizes[size].body;
+    m.fl = font_sizes[size].title;
+    m.line = (float)m.fs + 6;
+    m.row = (float)m.fs + 18;
+    m.bar = (float)m.fs + 10;
+    return m;
+}
 
+static const Font *font_of(const Ui *u, int fs)
+{
+    return fs == FS_L ? &u->font_l : &u->font;
+}
+
+static float px_of(const Ui *u, int fs)
+{
+    return (float)(fs == FS_L ? u->m.fl : u->m.fs);
+}
+
+/* No extra letter spacing: the glyph advances alone make a text's width,
+ * so the width of a string is the sum of its characters' widths. */
 static float text_w(const Ui *u, const char *s, int fs)
 {
-    return MeasureTextEx(u->font, s, (float)fs, spacing(fs)).x;
+    return MeasureTextEx(*font_of(u, fs), s, px_of(u, fs), 0.0f).x;
+}
+
+/* Height of s, body text that may hold line breaks. */
+static float text_h(const Ui *u, const char *s)
+{
+    return MeasureTextEx(u->font, s, (float)u->m.fs, 0.0f).y;
+}
+
+/* v on the screen's pixel grid: the fonts are made at the window scale, so
+ * each glyph texel then covers exactly one pixel and text stays sharp. */
+static float snap(const Ui *u, float v)
+{
+    return roundf(v * u->m.dpi) / u->m.dpi;
 }
 
 static void text(const Ui *u, const char *s, float x, float y, int fs, Color c)
 {
-    DrawTextEx(u->font, s, (Vector2){ x, y }, (float)fs, spacing(fs), c);
+    DrawTextEx(*font_of(u, fs), s, (Vector2){ snap(u, x), snap(u, y) }, px_of(u, fs), 0.0f, c);
 }
 
 static void text_center(const Ui *u, const char *s, float y, int fs, Color c)
@@ -601,27 +679,105 @@ static void text_center(const Ui *u, const char *s, float y, int fs, Color c)
     text(u, s, ((float)u->w - text_w(u, s, fs)) / 2.0f, y, fs, c);
 }
 
-/* Copy src into out, cut at a UTF-8 boundary with "..." so it fits maxw.
- * (The default font has no U+2026 glyph.) */
+/* Top of one line of body text centered vertically in r. */
+static float mid_y(const Ui *u, Rectangle r)
+{
+    return r.y + (r.height - (float)u->m.fs) / 2.0f;
+}
+
+/* The font at px logical pixels, rasterized at window scale dpi. What
+ * LoadFontFromMemory does, minus the CPU copy of every glyph it keeps for
+ * ImageDrawText, and with the blank glyphs' widths that raylib drops. */
+static Font load_font(int px, float dpi)
+{
+    int cps[INTER_CODEPOINTS], n = 0;
+    for (size_t r = 0; r < sizeof inter_ranges / sizeof inter_ranges[0]; r++)
+        for (int c = inter_ranges[r][0]; c <= inter_ranges[r][1] && n < INTER_CODEPOINTS; c++)
+            cps[n++] = c;
+    Font f = { 0 };
+    f.baseSize = (int)lroundf((float)px * dpi);
+    f.glyphCount = n;
+    f.glyphPadding = GLYPH_PAD;
+    /* raylib warns about every glyph taller than the line ('|', U+2016,
+     * U+2295...); the skyline packer below gives them their full height. */
+    SetTraceLogLevel(LOG_ERROR);
+    f.glyphs = LoadFontData(ui_font_ttf, (int)ui_font_ttf_len, f.baseSize, cps, n, FONT_DEFAULT);
+    SetTraceLogLevel(LOG_WARNING); /* ui_run's level */
+    if (!f.glyphs)
+        return GetFontDefault();
+    Image atlas = GenImageFontAtlas(f.glyphs, &f.recs, n, f.baseSize, GLYPH_PAD, 1);
+    f.texture = LoadTextureFromImage(atlas);
+    UnloadImage(atlas);
+    SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
+    for (int i = 0; i < n; i++) {
+        UnloadImage(f.glyphs[i].image);
+        f.glyphs[i].image = (Image){ 0 };
+    }
+    for (size_t b = 0; b < sizeof inter_blanks / sizeof inter_blanks[0]; b++) {
+        int i = GetGlyphIndex(f, inter_blanks[b][0]);
+        if (f.glyphs[i].value == inter_blanks[b][0])
+            f.glyphs[i].advanceX = (int)((float)inter_blanks[b][1] * (float)f.baseSize / INTER_HEIGHT);
+    }
+    return f;
+}
+
+/* Make the fonts for the size setting at the window's scale: at start, and
+ * again whenever either changes (Settings, a reloaded .env, a display with
+ * another scale). */
+static void apply_font(Ui *u)
+{
+    float dpi = GetWindowScaleDPI().x;
+    if (dpi <= 0.0f)
+        dpi = 1.0f;
+    Metrics m = metrics_for(u->cfg.font_size);
+    if (u->m.dpi == dpi && u->m.size == m.size)
+        return;
+    if (u->m.dpi > 0.0f) {
+        UnloadFont(u->font);
+        UnloadFont(u->font_l);
+    }
+    m.dpi = dpi;
+    u->m = m;
+    u->font = load_font(m.fs, dpi);
+    u->font_l = load_font(m.fl, dpi);
+    float labels = 0;
+    for (int i = 0; i < BAR_BUTTONS; i++)
+        labels += text_w(u, bar_label[i], FS_S);
+    u->m.min_w = labels + 2 * BAR_BUTTONS * BAR_MARGIN + (BAR_BUTTONS - 1) * BAR_GAP + 2 * PAD;
+    u->text_dirty = 1;
+}
+
+/* Copy src into out, cut at a UTF-8 boundary with an ellipsis so it fits
+ * maxw. Widths add up (see text_w), so one pass finds the cut. */
 static void fit_text(const Ui *u, const char *src, int fs, float maxw, char *out, size_t cap)
 {
     snprintf(out, cap, "%s", src);
-    size_t n = strlen(out);
     if (text_w(u, out, fs) <= maxw)
         return;
-    while (n > 0) {
+    float room = maxw - text_w(u, ELLIPSIS, fs), w = 0.0f;
+    size_t n = 0;
+    while (out[n]) {
+        char ch[5];
+        size_t len = 1;
+        while (len < 4 && ((unsigned char)out[n + len] & 0xC0) == 0x80)
+            len++;
+        memcpy(ch, out + n, len);
+        ch[len] = 0;
+        if ((w += text_w(u, ch, fs)) > room)
+            break;
+        n += len;
+    }
+    while (n > 0 && n + sizeof ELLIPSIS > cap) { /* no room for the ellipsis */
         do
             n--;
         while (n > 0 && ((unsigned char)out[n] & 0xC0) == 0x80);
-        if (n + 4 > cap)
-            continue;
-        memcpy(out + n, "...", 4);
-        if (text_w(u, out, fs) <= maxw)
-            return;
     }
+    if (n + sizeof ELLIPSIS <= cap)
+        memcpy(out + n, ELLIPSIS, sizeof ELLIPSIS);
 }
 
-/* Word-wrap src onto at most two lines of maxw; the second is cut with "...". */
+/* Word-wrap src onto at most two lines of maxw; the second is cut with an
+ * ellipsis. */
 static void fit_two_lines(const Ui *u, const char *src, int fs, float maxw, char *out, size_t cap)
 {
     size_t best = 0;
@@ -666,10 +822,68 @@ static void wrap_text(const Ui *u, const char *src, int fs, float maxw, char *ou
     }
 }
 
+/* Word-wrap src into out at the spaces, so lines fit maxw where a word
+ * break allows; src's own line breaks stay. */
+static void wrap_words(const Ui *u, const char *src, float maxw, char *out, size_t cap)
+{
+    snprintf(out, cap, "%s", src);
+    size_t line = 0, space = 0; /* start of the current line; its last space if > line */
+    for (size_t i = 0;; i++) {
+        char c = out[i];
+        if (c && c != ' ' && c != '\n')
+            continue;
+        out[i] = 0;
+        int over = text_w(u, out + line, FS_S) > maxw;
+        out[i] = c;
+        if (over && space > line) { /* the word just ended starts a new line */
+            out[space] = '\n';
+            line = space + 1;
+        }
+        if (!c)
+            return;
+        if (c == '\n')
+            line = i + 1;
+        else
+            space = i;
+    }
+}
+
+/* src in body text, word-wrapped to maxw at (x, y); returns its height. */
+static float para(const Ui *u, const char *src, float x, float y, float maxw, Color c)
+{
+    char buf[512];
+    wrap_words(u, src, maxw, buf, sizeof buf);
+    text(u, buf, x, y, FS_S, c);
+    return text_h(u, buf);
+}
+
+/* A message in body text, wrapped to the window and centered line by line. */
+static void para_center(const Ui *u, const char *src, float y, Color c)
+{
+    char buf[512], line[512];
+    wrap_words(u, src, (float)(u->w - 2 * PAD), buf, sizeof buf);
+    for (const char *s = buf;; y += (float)u->m.fs + LINE_GAP) {
+        size_t n = strcspn(s, "\n");
+        snprintf(line, sizeof line, "%.*s", (int)n, s);
+        text_center(u, line, y, FS_S, c);
+        if (!s[n])
+            return;
+        s += n + 1;
+    }
+}
+
 /* --- widgets ------------------------------------------------------------- */
 static int hovered(Rectangle r)
 {
     return CheckCollisionPointRec(GetMousePosition(), r);
+}
+
+/* A button width that fits label: minw, or more for the label and a margin
+ * of one text height on either side. */
+static float btn_w(const Ui *u, const char *label, float minw)
+{
+    float w = text_w(u, label, FS_S) + 2.0f * (float)u->m.fs;
+    return w > minw ? w : minw;
 }
 
 /* Draws the button body; returns 1 on press-and-release inside r. */
@@ -692,7 +906,7 @@ static int button(Ui *u, int id, Rectangle r, const char *label, int fs, int on)
     DrawRectangleRounded(r, 0.3f, 6, bg);
     if (label) {
         float tw = text_w(u, label, fs);
-        text(u, label, r.x + (r.width - tw) / 2.0f, r.y + (r.height - (float)fs) / 2.0f, fs, C_TEXT);
+        text(u, label, r.x + (r.width - tw) / 2.0f, r.y + (r.height - px_of(u, fs)) / 2.0f, fs, C_TEXT);
     }
     return click;
 }
@@ -780,19 +994,22 @@ static void edit_line(char *buf, size_t cap, int key_chars)
 }
 
 /* One-line text box: s with a static caret (a blinking one would need
- * timed redraws), scrolled to its end; the placeholder when s is empty. */
+ * timed redraws), scrolled to its end; the placeholder, cut to fit, when s
+ * is empty. */
 static void draw_field(const Ui *u, Rectangle box, const char *s, const char *placeholder)
 {
     char shown[SP_NAME_LEN + 2];
+    float room = box.width - 16, ty = mid_y(u, box);
     DrawRectangleRounded(box, 0.3f, 6, C_PANEL);
     if (s[0]) {
         snprintf(shown, sizeof shown, "%s_", s);
-        float tw = text_w(u, shown, FS_S), room = box.width - 16;
+        float tw = text_w(u, shown, FS_S);
         BeginScissorMode((int)box.x + 8, (int)box.y, (int)room, (int)box.height);
-        text(u, shown, box.x + 8 + (tw > room ? room - tw : 0), box.y + 9, FS_S, C_TEXT);
+        text(u, shown, box.x + 8 + (tw > room ? room - tw : 0), ty, FS_S, C_TEXT);
         EndScissorMode();
     } else {
-        text(u, placeholder, box.x + 8, box.y + 9, FS_S, C_DIM);
+        fit_text(u, placeholder, FS_S, room, shown, sizeof shown);
+        text(u, shown, box.x + 8, ty, FS_S, C_DIM);
     }
 }
 
@@ -955,6 +1172,7 @@ static void wrap_env_path(Ui *u, float maxw)
 /* --- setup screen (no client id) ----------------------------------------- */
 static void draw_setup(Ui *u)
 {
+    const Metrics *m = &u->m;
     float maxw = (float)(u->w - 2 * PAD);
     if (u->text_dirty) {
         wrap_env_path(u, maxw);
@@ -962,23 +1180,21 @@ static void draw_setup(Ui *u)
     }
     float y = 48;
     text_center(u, "Spotify C Player", y, FS_L, C_TEXT);
-    y += 48;
-    text(u, "A Spotify client ID is needed.", PAD, y, FS_S, C_TEXT);
-    y += 24;
-    text(u, "Add this line to the file:", PAD, y, FS_S, C_DIM);
-    y += 18;
+    y += (float)m->fl + 28;
+    y += para(u, "A Spotify client ID is needed.", PAD, y, maxw, C_TEXT) + 14;
+    y += para(u, "Add this line to the file:", PAD, y, maxw, C_DIM) + 8;
     text(u, u->env_wrapped, PAD, y, FS_S, C_TEXT);
-    y += MeasureTextEx(u->font, u->env_wrapped, FS_S, spacing(FS_S)).y + 16;
+    y += text_h(u, u->env_wrapped) + 16;
     text(u, "SPOTIFY_CLIENT_ID=...", PAD, y, FS_S, C_ACCENT);
-    y += 28;
-    text(u, "Create the app at developer.spotify.com", PAD, y, FS_S, C_DIM);
-    y += 16;
-    text(u, "with this redirect URI:", PAD, y, FS_S, C_DIM);
-    y += 16;
+    y += (float)m->fs + 18;
+    y += para(u, "Create the app at developer.spotify.com\nwith this redirect URI:", PAD, y, maxw,
+              C_DIM) + 8;
     text(u, u->cfg.redirect_uri, PAD, y, FS_S, C_TEXT);
-    y += 36;
+    y += (float)m->fs + 26;
 
-    Rectangle rb = { ((float)u->w - 120.0f) / 2.0f, y, 120, 32 };
+    float bw = btn_w(u, "Reload", 120), bh = (float)m->fs + 22;
+    Rectangle rb = { ((float)u->w - bw) / 2.0f, y, bw, bh };
+    u->need_h = y + bh + 16 + (float)m->fs + PAD; /* a one-line message below */
     if (button(u, W_RELOAD, rb, "Reload", FS_S, 0)) {
         Config c;
         if (config_load(&c) == 0)
@@ -990,17 +1206,24 @@ static void draw_setup(Ui *u)
             u->setup_msg = "Out of memory.";
     }
     if (u->setup_msg && u->screen == SCR_SETUP)
-        text_center(u, u->setup_msg, y + 48, FS_S, C_ERR);
+        para_center(u, u->setup_msg, y + bh + 16, C_ERR);
 }
 
 /* --- move screen (app folder not writable) -------------------------------- */
 static void draw_move(Ui *u)
 {
-    text_center(u, "Spotify C Player", 120, FS_L, C_TEXT);
-    text_center(u, "This folder is read-only.", 176, FS_S, C_ERR);
-    text_center(u, "Move Spotify C Player to Applications", 204, FS_S, C_TEXT);
-    text_center(u, "(or another writable folder)", 220, FS_S, C_TEXT);
-    text_center(u, "and open it again.", 236, FS_S, C_TEXT);
+    const Metrics *m = &u->m;
+    float y = 120;
+    text_center(u, "Spotify C Player", y, FS_L, C_TEXT);
+    y += (float)m->fl + 36;
+    text_center(u, "This folder is read-only.", y, FS_S, C_ERR);
+    y += (float)m->fs + 18;
+    text_center(u, "Move Spotify C Player to Applications", y, FS_S, C_TEXT);
+    y += m->line;
+    text_center(u, "(or another writable folder)", y, FS_S, C_TEXT);
+    y += m->line;
+    text_center(u, "and open it again.", y, FS_S, C_TEXT);
+    u->need_h = y + (float)m->fs + PAD;
 }
 
 /* --- login screen -------------------------------------------------------- */
@@ -1062,7 +1285,7 @@ static void start_login(Ui *u)
 /* Our PKCE login for the Web API. */
 static void draw_login(Ui *u)
 {
-    float y = 168;
+    const Metrics *m = &u->m;
     text_center(u, "Spotify C Player", 120, FS_L, C_TEXT);
     if (u->login_th) {
         plat_mutex_lock(u->mu);
@@ -1080,15 +1303,18 @@ static void draw_login(Ui *u)
         }
     }
 
-    y += 20;
+    float y = 120 + (float)m->fl + 48;
     text_center(u, "Sign in to control your music.", y, FS_S, C_TEXT);
-    y += 36;
-    Rectangle rb = { ((float)u->w - 200.0f) / 2.0f, y, 200, 40 };
+    y += (float)m->fs + 26;
+    float bw = btn_w(u, "Sign in with Spotify", 200), bh = (float)m->fs + 30;
+    Rectangle rb = { ((float)u->w - bw) / 2.0f, y, bw, bh };
     if (!u->login_th) {
         if (button(u, W_SIGNIN, rb, "Sign in with Spotify", FS_S, 1))
             start_login(u);
         /* A client ID fixed in .env applies without a restart. */
-        Rectangle rr = { ((float)u->w - 120.0f) / 2.0f, y + 48, 120, 24 };
+        float rw = btn_w(u, "Reload .env", 120), rh = (float)m->fs + 14;
+        Rectangle rr = { ((float)u->w - rw) / 2.0f, y + bh + 8, rw, rh };
+        u->need_h = rr.y + rh + 12 + (float)m->fs + PAD;
         if (button(u, W_RELOAD, rr, "Reload .env", FS_S, 0)) {
             Config c;
             AuthStore *a = NULL;
@@ -1104,25 +1330,29 @@ static void draw_login(Ui *u)
             return;
         }
         if (u->login_msg)
-            text_center(u, u->login_msg, y + 84, FS_S, C_ERR);
+            para_center(u, u->login_msg, rr.y + rh + 12, C_ERR);
         return;
     }
-    text_center(u, u->login_cancel ? "Cancelling..." : "Waiting for browser...", y + 12, FS_S, C_TEXT);
-    float by = y + 48;
+    text_center(u, u->login_cancel ? "Cancelling..." : "Waiting for browser...", mid_y(u, rb), FS_S,
+                C_TEXT);
+    float by = y + bh + 8;
     plat_mutex_lock(u->mu);
     int has_url = u->login_url[0] != 0;
     plat_mutex_unlock(u->mu);
     if (has_url && !u->login_cancel) {
-        Rectangle ro = { ((float)u->w - 200.0f) / 2.0f, by, 200, 28 };
+        float ow = btn_w(u, "Open sign-in page again", 200);
+        Rectangle ro = { ((float)u->w - ow) / 2.0f, by, ow, m->row };
         if (button(u, W_OPEN_URL, ro, "Open sign-in page again", FS_S, 0))
             open_again(u);
-        by += 36;
+        by += m->row + 8;
     }
-    Rectangle rc = { ((float)u->w - 100.0f) / 2.0f, by, 100, 28 };
+    float xw = btn_w(u, "Cancel", 100);
+    Rectangle rc = { ((float)u->w - xw) / 2.0f, by, xw, m->row };
+    u->need_h = by + m->row + 12 + (float)m->fs + PAD;
     if (button(u, W_CANCEL, rc, "Cancel", FS_S, 0))
         u->login_cancel = 1;
     if (u->login_msg)
-        text_center(u, u->login_msg, by + 40, FS_S, C_ERR);
+        para_center(u, u->login_msg, by + m->row + 12, C_ERR);
 }
 
 /* --- Soloist key screen -------------------------------------------------- */
@@ -1181,6 +1411,7 @@ static void save_key(Ui *u)
 
 static void draw_key(Ui *u)
 {
+    const Metrics *m = &u->m;
     float maxw = (float)(u->w - 2 * PAD);
     if (u->text_dirty) {
         wrap_env_path(u, maxw);
@@ -1192,23 +1423,22 @@ static void draw_key(Ui *u)
 
     float y = 48;
     text_center(u, "Spotify C Player", y, FS_L, C_TEXT);
-    y += 48;
-    text(u, "To play music on this computer, it needs\na Spotify Soloist API key (optional).", PAD, y,
-         FS_S, C_TEXT);
-    y += 40;
+    y += (float)m->fl + 28;
+    y += para(u, "To play music on this computer, it needs\na Spotify Soloist API key (optional).",
+              PAD, y, maxw, C_TEXT) + 16;
     text(u, "1. Generate a key at", PAD, y, FS_S, C_DIM);
-    y += 16;
+    y += m->line;
     text(u, "developer.spotify.com/dashboard/soloist", PAD, y, FS_S, C_TEXT);
-    y += 18;
-    Rectangle ro = { PAD, y, 120, 24 };
+    y += (float)m->fs + 8;
+    Rectangle ro = { PAD, y, btn_w(u, "Open the page", 120), (float)m->fs + 14 };
     if (button(u, W_OPEN_KEY, ro, "Open the page", FS_S, 0) && plat_open_url(SOLOIST_KEY_URL) != 0)
         u->setup_msg = "Could not open the browser.";
-    y += 36;
+    y += ro.height + 12;
     text(u, "2. Paste it here and press Save:", PAD, y, FS_S, C_DIM);
-    y += 18;
-    float bw = 72, gap = 6;
-    Rectangle box = { PAD, y, maxw - bw - gap, 28 };
-    Rectangle rb = { PAD + box.width + gap, y, bw, 28 };
+    y += (float)m->fs + 8;
+    float bw = fmaxf(btn_w(u, "Save", 72), btn_w(u, "Reload", 72)), gap = 6;
+    Rectangle box = { PAD, y, maxw - bw - gap, m->row };
+    Rectangle rb = { PAD + box.width + gap, y, bw, m->row };
     char masked[SP_NAME_LEN];
     mask_secret(u->key_input, masked, sizeof masked);
     draw_field(u, box, masked, "Paste the key (it stays hidden)");
@@ -1218,19 +1448,20 @@ static void draw_key(Ui *u)
         if (u->screen != SCR_KEY)
             return;
     }
-    y += 40;
-    text(u, "Or put SOLOIST_API_KEY=... in this file\nand press Reload:", PAD, y, FS_S, C_DIM);
-    y += 30;
+    y += m->row + 12;
+    y += para(u, "Or put SOLOIST_API_KEY=... in this file\nand press Reload:", PAD, y, maxw, C_DIM) + 6;
     text(u, u->env_wrapped, PAD, y, FS_S, C_TEXT);
-    y += MeasureTextEx(u->font, u->env_wrapped, FS_S, spacing(FS_S)).y + 16;
+    y += text_h(u, u->env_wrapped) + 16;
 
-    Rectangle rs = { ((float)u->w - 100.0f) / 2.0f, y, 100, 28 };
+    float sw = btn_w(u, "Back", 100);
+    Rectangle rs = { ((float)u->w - sw) / 2.0f, y, sw, m->row };
+    u->need_h = y + m->row + 12 + (float)m->fs + PAD;
     if (button(u, W_BACK, rs, "Back", FS_S, 0)) {
         leave_key(u);
         return;
     }
     if (u->setup_msg)
-        text_center(u, u->setup_msg, y + 40, FS_S, C_ERR);
+        para_center(u, u->setup_msg, y + m->row + 12, C_ERR);
 }
 
 /* --- Soloist in the player: install, start, pair, stop ------------------ */
@@ -1425,7 +1656,7 @@ static void resync(Ui *u)
     u->text_dirty = 1;
 }
 
-static void refresh_player_text(Ui *u, float maxw, float status_w)
+static void refresh_player_text(Ui *u, float maxw, float status_w, float hint_w)
 {
     const PlaybackState *s = &u->st;
     if (s->active) {
@@ -1442,7 +1673,7 @@ static void refresh_player_text(Ui *u, float maxw, float status_w)
     u->pos_sec = -1;
 
     fit_two_lines(u, u->msg_shown, FS_S, status_w, u->status, sizeof u->status);
-    fit_two_lines(u, u->hint, FS_S, status_w - 24, u->hint_fit, sizeof u->hint_fit);
+    fit_two_lines(u, u->hint, FS_S, hint_w, u->hint_fit, sizeof u->hint_fit);
     u->text_dirty = 0;
 }
 
@@ -1554,7 +1785,7 @@ static void draw_library(Ui *u, Rectangle area)
         u->lib_scroll = 0;
     }
 
-    float bw = 72, row_h = 28, gap = 6;
+    float bw = btn_w(u, "Playlists", 72), row_h = u->m.row, gap = 6;
     Rectangle box = { area.x, area.y, area.width - bw - gap, row_h };
     Rectangle back = { box.x + box.width + gap, area.y, bw, row_h };
     draw_field(u, box, u->query, "Type to search tracks, Enter");
@@ -1588,16 +1819,16 @@ static void draw_library(Ui *u, Rectangle area)
         const char *name = hits ? u->lib.hits[i].name : u->lib.pl[i].name;
         const char *uri = hits ? u->lib.hits[i].uri : u->lib.pl[i].uri;
         char sub[SP_NAME_LEN], fit[SP_NAME_LEN];
-        if (hits)
-            snprintf(sub, sizeof sub, "%s", u->lib.hits[i].artists);
+        if (hits) /* artists may be long: they get at most about half the row */
+            fit_text(u, u->lib.hits[i].artists, FS_S, r.width * 0.45f, sub, sizeof sub);
         else
             snprintf(sub, sizeof sub, "%d tracks", u->lib.pl[i].track_count);
         if (button(u, W_LIB_ROW + i, r, NULL, 0, 0) && uri[0])
             cmd_post_str(&u->cmd, CMD_PLAY_URI, hits, uri);
         float sw = text_w(u, sub, FS_S);
         fit_text(u, name, FS_S, r.width - sw - 28, fit, sizeof fit);
-        text(u, fit, r.x + 8, r.y + 9, FS_S, C_TEXT);
-        text(u, sub, r.x + r.width - 8 - sw, r.y + 9, FS_S, C_DIM);
+        text(u, fit, r.x + 8, mid_y(u, r), FS_S, C_TEXT);
+        text(u, sub, r.x + r.width - 8 - sw, mid_y(u, r), FS_S, C_DIM);
     }
 }
 
@@ -1610,9 +1841,9 @@ static void draw_devices(Ui *u, Rectangle area)
         u->redraw = 1;
         return;
     }
-    float row_h = 28, gap = 6, bw = 72;
-    text(u, "Play on", area.x, area.y + 9, FS_S, C_TEXT);
+    float row_h = u->m.row, gap = 6, bw = btn_w(u, "Refresh", 72);
     Rectangle refresh = { area.x + area.width - bw, area.y, bw, row_h };
+    text(u, "Play on", area.x, mid_y(u, refresh), FS_S, C_TEXT);
     if (button(u, W_DEV_REFRESH, refresh, "Refresh", FS_S, 0))
         cmd_post(&u->cmd, CMD_DEVICES, 0);
 
@@ -1628,8 +1859,8 @@ static void draw_devices(Ui *u, Rectangle area)
         y += row_h + gap;
     }
     if (u->lib.ndev == 0) {
-        text(u, u->lib.devs_loaded ? "No devices. Open Spotify on a phone or computer."
-                                   : "Loading devices...", area.x, y + 4, FS_S, C_DIM);
+        para(u, u->lib.devs_loaded ? "No devices. Open Spotify on a phone or computer."
+                                   : "Loading devices...", area.x, y + 4, area.width, C_DIM);
         return;
     }
     /* Our own device first (once paired), then Spotify's order. */
@@ -1651,9 +1882,70 @@ static void draw_devices(Ui *u, Rectangle area)
         char fit[SP_NAME_LEN];
         float sw = text_w(u, sub, FS_S);
         fit_text(u, ours ? "This computer" : d->name, FS_S, r.width - sw - 28, fit, sizeof fit);
-        text(u, fit, r.x + 8, r.y + 9, FS_S, C_TEXT);
-        text(u, sub, r.x + r.width - 8 - sw, r.y + 9, FS_S, d->is_active ? C_TEXT : C_DIM);
+        text(u, fit, r.x + 8, mid_y(u, r), FS_S, C_TEXT);
+        text(u, sub, r.x + r.width - 8 - sw, mid_y(u, r), FS_S, d->is_active ? C_TEXT : C_DIM);
     }
+}
+
+/* The text size: a pick applies at once, so the window is its own preview,
+ * and is saved to .env as UI_FONT_SIZE. */
+static void draw_settings(Ui *u, Rectangle area)
+{
+    if (IsKeyPressed(KEY_ESCAPE)) {
+        u->panel = PANEL_NONE;
+        u->redraw = 1;
+        return;
+    }
+    float row_h = u->m.row, gap = 6;
+    text(u, "Text size", area.x, mid_y(u, (Rectangle){ area.x, area.y, area.width, row_h }), FS_S,
+         C_TEXT);
+    float y = area.y + row_h + 10;
+    for (int i = 0; i < CFG_FONT_SIZES && y + row_h <= area.y + area.height; i++, y += row_h + gap) {
+        Rectangle r = { area.x, y, area.width, row_h };
+        int on = i == u->m.size;
+        if (button(u, W_LIB_ROW + i, r, NULL, FS_S, on) && !on) {
+            u->cfg.font_size = i; /* the next frame remakes the fonts (apply_font) */
+            u->size_unsaved =
+                config_set_env_value(&u->cfg, "UI_FONT_SIZE", config_font_size_value(i)) != 0;
+        }
+        text(u, font_sizes[i].label, r.x + 8, mid_y(u, r), FS_S, C_TEXT);
+    }
+    if (u->size_unsaved)
+        para(u, "Could not save this in .env: it applies until the app quits.", area.x, y + 4,
+             area.width, C_ERR);
+}
+
+/* Player rows below the art, as offsets from its bottom edge. */
+typedef struct {
+    float title, artists, album, seek, times, transport, modes, volume, end;
+} PlayerRows;
+
+static PlayerRows player_rows(const Metrics *m)
+{
+    PlayerRows r;
+    r.title = 14;
+    r.artists = r.title + (float)m->fl + 6;
+    r.album = r.artists + m->line;
+    r.seek = r.album + (float)m->fs + 12;
+    r.times = r.seek + 12;
+    r.transport = r.times + (float)m->fs + 12;
+    r.modes = r.transport + 56;
+    r.volume = r.modes + m->row + 12; /* the "Vol" label; its bar is centered on it */
+    r.end = r.volume + (float)m->fs;
+    return r;
+}
+
+/* Two lines of body text: the status, or the pairing tip. */
+static float two_lines(const Metrics *m)
+{
+    return 2.0f * (float)m->fs + LINE_GAP;
+}
+
+/* The player's height without the art: padding, the rows below the art,
+ * the status lines and the bottom bar. */
+static float player_reserve(const Metrics *m)
+{
+    return PAD + player_rows(m).end + 4 + two_lines(m) + 4 + m->bar + PAD;
 }
 
 static void draw_player(Ui *u)
@@ -1736,26 +2028,42 @@ static void draw_player(Ui *u)
     }
 
     /* Layout (logical pixels). The art square takes the slack height. */
+    const Metrics *m = &u->m;
+    PlayerRows rows = player_rows(m);
     float w = (float)u->w, h = (float)u->h, cw = w - 2 * PAD;
-    float art = h - 300.0f - (u->hint[0] ? 30.0f : 0.0f);
+    float hint_h = two_lines(m) + 6, art_min = 2 * m->row + 6; /* Restart and Change key fit */
+    u->need_h = player_reserve(m) + hint_h + art_min;
+    float art = h - player_reserve(m) - (u->hint[0] ? hint_h : 0.0f);
     if (art > cw)
         art = cw;
-    if (art < 64.0f)
-        art = 64.0f;
-    Rectangle logout = { w - PAD - 64, h - PAD - 20, 64, 20 };
-    Rectangle devices = { PAD, logout.y, 64, 20 };
-    Rectangle library = { devices.x + devices.width + 8, logout.y, 64, 20 };
-    float status_y = logout.y - 28; /* up to two lines */
+    if (art < art_min)
+        art = art_min;
+    /* Bottom bar: Devices and Library on the left, Settings and Log out on
+     * the right; each button is its label plus a margin that narrows to fit. */
+    float lw[BAR_BUTTONS], labels = 0;
+    for (int i = 0; i < BAR_BUTTONS; i++) {
+        lw[i] = text_w(u, bar_label[i], FS_S);
+        labels += lw[i];
+    }
+    float margin = (cw - labels - (BAR_BUTTONS - 1) * BAR_GAP) / (2 * BAR_BUTTONS);
+    margin = fmaxf(BAR_MARGIN, fminf(margin, roundf(0.8f * (float)m->fs)));
+    float by = h - PAD - m->bar;
+    Rectangle devices = { PAD, by, lw[0] + 2 * margin, m->bar };
+    Rectangle library = { devices.x + devices.width + BAR_GAP, by, lw[1] + 2 * margin, m->bar };
+    Rectangle logout = { w - PAD - lw[3] - 2 * margin, by, lw[3] + 2 * margin, m->bar };
+    Rectangle settings = { logout.x - BAR_GAP - lw[2] - 2 * margin, by, lw[2] + 2 * margin, m->bar };
+    float status_y = by - two_lines(m) - 4; /* up to two lines */
+    float xw = (float)m->fs + 8;              /* the tip's close button */
     if (u->text_dirty)
-        refresh_player_text(u, cw, cw);
+        refresh_player_text(u, cw, cw, cw - xw - 6);
 
     /* Paired, but Soloist is down (stopped, failed to start or update). */
     int sol_down = u->paired && !u->sol && !u->inst.th && u->eng_err[0];
     text(u, u->status, PAD, status_y, FS_S, u->status_red ? C_ERR : C_DIM);
     if (u->hint[0]) {
-        float hy = status_y - 30;
+        float hy = status_y - hint_h;
         text(u, u->hint_fit, PAD, hy, FS_S, C_DIM);
-        Rectangle rx = { w - PAD - 18, hy, 18, 16 };
+        Rectangle rx = { w - PAD - xw, hy, xw, (float)m->fs + 6 };
         if (button(u, W_HINT_CLOSE, rx, "x", FS_S, 0))
             u->hint_hidden = 1; /* Soloist stays discoverable */
     }
@@ -1777,6 +2085,10 @@ static void draw_player(Ui *u)
         if (u->panel == PANEL_LIBRARY && !u->lib.pl_loaded)
             cmd_post(&u->cmd, CMD_PLAYLISTS, 0);
     }
+    if (button(u, W_SETTINGS, settings, "Settings", FS_S, u->panel == PANEL_SETTINGS)) {
+        u->panel = u->panel == PANEL_SETTINGS ? PANEL_NONE : PANEL_SETTINGS;
+        u->size_unsaved = 0;
+    }
     Rectangle panel = { PAD, PAD, cw, status_y - 8 - PAD };
     if (u->panel == PANEL_LIBRARY) {
         draw_library(u, panel);
@@ -1784,6 +2096,10 @@ static void draw_player(Ui *u)
     }
     if (u->panel == PANEL_DEVICES) {
         draw_devices(u, panel);
+        return;
+    }
+    if (u->panel == PANEL_SETTINGS) {
+        draw_settings(u, panel);
         return;
     }
 
@@ -1797,9 +2113,10 @@ static void draw_player(Ui *u)
     DrawRectangleRoundedLinesEx(art_r, 0.03f, 8, 1.0f, C_HOVER);
     if (sol_down) {
         /* Only on request: an automatic restart could loop forever. */
-        float by = y + (art - 62.0f) / 2.0f;
-        Rectangle rr = { (w - 140.0f) / 2.0f, by, 140, 28 };
-        Rectangle rk = { (w - 140.0f) / 2.0f, by + 34, 140, 28 };
+        float bw = fmaxf(btn_w(u, "Restart Soloist", 140), btn_w(u, "Change key", 140));
+        float ry = y + (art - art_min) / 2.0f;
+        Rectangle rr = { (w - bw) / 2.0f, ry, bw, m->row };
+        Rectangle rk = { (w - bw) / 2.0f, ry + m->row + 6, bw, m->row };
         if (button(u, W_RESTART, rr, "Restart Soloist", FS_S, 1)) {
             reload_key(u); /* a key fixed in .env takes effect */
             start_engine(u, 0);
@@ -1811,19 +2128,16 @@ static void draw_player(Ui *u)
             return;
         }
     }
-    y += art + 14;
+    y += art; /* the rows below are offsets from the art's bottom edge */
 
-    text(u, u->title, PAD, y, FS_L, C_TEXT);
-    y += 26;
-    text(u, u->artists, PAD, y, FS_S, C_TEXT);
-    y += 16;
-    text(u, u->album, PAD, y, FS_S, C_DIM);
-    y += 22;
+    text(u, u->title, PAD, y + rows.title, FS_L, C_TEXT);
+    text(u, u->artists, PAD, y + rows.artists, FS_S, C_TEXT);
+    text(u, u->album, PAD, y + rows.album, FS_S, C_DIM);
 
     PlaybackState *s = &u->st;
     int dur = s->track.duration_ms;
     int can_seek = s->active && dur > 0;
-    Rectangle bar = { PAD, y, cw, 6 };
+    Rectangle bar = { PAD, y + rows.seek, cw, 6 };
     if (u->active != W_SEEK)
         u->seek_t = can_seek ? (float)progress_at(s, now) / (float)dur : 0.0f;
     if (slider(u, W_SEEK, bar, &u->seek_t, can_seek)) {
@@ -1838,14 +2152,13 @@ static void draw_player(Ui *u)
         u->pos_sec = pos / 1000;
         sp_fmt_time(u->t_pos, sizeof u->t_pos, pos);
     }
-    y += 12;
-    text(u, u->t_pos, PAD, y, FS_S, C_DIM);
-    text(u, u->t_dur, w - PAD - text_w(u, u->t_dur, FS_S), y, FS_S, C_DIM);
-    y += 22;
+    text(u, u->t_pos, PAD, y + rows.times, FS_S, C_DIM);
+    text(u, u->t_dur, w - PAD - text_w(u, u->t_dur, FS_S), y + rows.times, FS_S, C_DIM);
 
-    Rectangle rprev = { w / 2.0f - 28 - 16 - 44, y + 2, 44, 44 };
-    Rectangle rplay = { w / 2.0f - 28, y, 56, 48 };
-    Rectangle rnext = { w / 2.0f + 28 + 16, y + 2, 44, 44 };
+    float ty = y + rows.transport;
+    Rectangle rprev = { w / 2.0f - 28 - 16 - 44, ty + 2, 44, 44 };
+    Rectangle rplay = { w / 2.0f - 28, ty, 56, 48 };
+    Rectangle rnext = { w / 2.0f + 28 + 16, ty + 2, 44, 44 };
     if (button(u, W_PREV, rprev, NULL, 0, 0)) {
         u->pend.mask &= ~PEND_SEEK;
         cmd_post(&u->cmd, CMD_PREV, 0);
@@ -1866,12 +2179,11 @@ static void draw_player(Ui *u)
     icon(ICON_PREV, rprev, C_TEXT);
     icon(s->active && s->is_playing ? ICON_PAUSE : ICON_PLAY, rplay, C_TEXT);
     icon(ICON_NEXT, rnext, C_TEXT);
-    y += 56;
 
     static const char *const repeat_label[] = { "Repeat: off", "Repeat: all", "Repeat: one" };
     float half = (cw - 8) / 2.0f;
-    Rectangle rshuf = { PAD, y, half, 28 };
-    Rectangle rrep = { PAD + half + 8, y, half, 28 };
+    Rectangle rshuf = { PAD, y + rows.modes, half, m->row };
+    Rectangle rrep = { PAD + half + 8, y + rows.modes, half, m->row };
     if (button(u, W_SHUFFLE, rshuf, "Shuffle", FS_S, s->shuffle)) {
         u->pend.shuffle = !s->shuffle;
         pend_begin(u, PEND_SHUFFLE, now);
@@ -1885,10 +2197,10 @@ static void draw_player(Ui *u)
         pend_reapply(u);
         cmd_post(&u->cmd, CMD_REPEAT, (int)u->pend.repeat);
     }
-    y += 42;
 
-    text(u, "Vol", PAD, y - 2, FS_S, C_DIM);
-    Rectangle rvol = { PAD + 32, y, cw - 32, 6 };
+    float vy = y + rows.volume, vx = PAD + text_w(u, "Vol", FS_S) + 14;
+    text(u, "Vol", PAD, vy, FS_S, C_DIM);
+    Rectangle rvol = { vx, vy + ((float)m->fs - 6) / 2.0f, w - PAD - vx, 6 };
     if (u->active != W_VOLUME)
         u->vol_t = s->volume >= 0 ? (float)s->volume / 100.0f : 0.0f;
     if (slider(u, W_VOLUME, rvol, &u->vol_t, s->active)) {
@@ -1900,8 +2212,26 @@ static void draw_player(Ui *u)
 }
 
 /* --- main loop ----------------------------------------------------------- */
+/* At least as wide as the bottom bar needs (Metrics.min_w) and as tall as
+ * the screen drawn last needs (Ui.need_h): grow the window if it is smaller.
+ * A height measured in a window still too narrow (text wraps more there)
+ * waits for the next frame, which the widening brings. */
+static void fit_window(Ui *u)
+{
+    int mw = (int)ceilf(fmaxf(MIN_W, u->m.min_w));
+    int mh = u->w < mw ? (u->min_h ? u->min_h : MIN_H) : (int)ceilf(fmaxf(MIN_H, u->need_h));
+    if (mw == u->min_w && mh == u->min_h)
+        return;
+    u->min_w = mw;
+    u->min_h = mh;
+    SetWindowMinSize(mw, mh);
+    if (u->w < mw || u->h < mh)
+        SetWindowSize(u->w > mw ? u->w : mw, u->h > mh ? u->h : mh);
+}
+
 static void frame(Ui *u)
 {
+    apply_font(u); /* remade only when the size setting or the window scale changed */
     int w = GetScreenWidth(), h = GetScreenHeight();
     if (w != u->w || h != u->h) {
         u->w = w;
@@ -1917,6 +2247,7 @@ static void frame(Ui *u)
     case SCR_KEY:    draw_key(u); break;
     case SCR_PLAYER: draw_player(u); break;
     }
+    fit_window(u);
     if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT))
         u->active = W_NONE;
     /* Posted before EndDrawing so its wait returns at once and the next
@@ -1945,19 +2276,20 @@ int ui_run(const Config *cfg)
      * minimized window idle. */
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_HIGHDPI | FLAG_VSYNC_HINT |
                    FLAG_WINDOW_ALWAYS_RUN);
-    InitWindow(WIN_W, WIN_H, "Spotify C Player");
+    /* A new window shows the art WIN_ART tall at the chosen text size. */
+    Metrics m0 = metrics_for(u->cfg.font_size);
+    InitWindow(WIN_W, (int)ceilf(player_reserve(&m0) + WIN_ART), "Spotify C Player");
     if (!IsWindowReady()) {
         plat_mutex_free(u->mu);
         return 1;
     }
-    SetWindowMinSize(MIN_W, MIN_H);
     SetExitKey(KEY_NULL);
-    SetTextLineSpacing(4);
+    SetTextLineSpacing(LINE_GAP);
     EnableEventWaiting();
     /* Quit signals end the loop like closing the window does, so the
      * cleanup below always runs; the wake breaks glfwWaitEvents. */
     (void)plat_quit_watch(ui_wake, NULL); /* not fatal: signals then just kill us */
-    u->font = GetFontDefault();
+    apply_font(u); /* the window's minimum size follows from it (fit_window) */
 
     int rc = 0;
     if (u->cfg.read_only)
@@ -1976,6 +2308,8 @@ int ui_run(const Config *cfg)
     auth_store_free(u->auth);
     (void)plat_quit_watch(NULL, NULL); /* no wake-ups once GLFW is gone */
     plat_mutex_free(u->mu);
+    UnloadFont(u->font);
+    UnloadFont(u->font_l);
     CloseWindow();
     return rc;
 }

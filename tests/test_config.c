@@ -93,6 +93,38 @@ static void test_env_set(void)
     free(set);
 }
 
+static void test_font_size(void)
+{
+    assert(config_font_size("small") == CFG_FONT_SMALL);
+    assert(config_font_size("default") == CFG_FONT_DEFAULT);
+    assert(config_font_size("large") == CFG_FONT_LARGE);
+    assert(config_font_size("extra-large") == CFG_FONT_XLARGE);
+    assert(config_font_size("Extra-Large") == CFG_FONT_XLARGE); /* ASCII case ignored */
+    assert(config_font_size("SMALL") == CFG_FONT_SMALL);
+    /* Missing or invalid: the default size. */
+    assert(config_font_size(NULL) == CFG_FONT_DEFAULT);
+    assert(config_font_size("") == CFG_FONT_DEFAULT);
+    assert(config_font_size("huge") == CFG_FONT_DEFAULT);
+    assert(config_font_size("larg") == CFG_FONT_DEFAULT);
+    assert(config_font_size("larger") == CFG_FONT_DEFAULT);
+    assert(config_font_size("extra large") == CFG_FONT_DEFAULT);
+    assert(config_font_size("14") == CFG_FONT_DEFAULT);
+    assert(config_font_size("sm\xC3\xA1ll") == CFG_FONT_DEFAULT);
+    /* As a .env line it parses like any other key. */
+    assert(config_font_size(lookup("UI_FONT_SIZE = \"small\" # note\n", "UI_FONT_SIZE")) == CFG_FONT_SMALL);
+    assert(config_font_size(lookup("A=1\n", "UI_FONT_SIZE")) == CFG_FONT_DEFAULT);
+    assert(config_font_size(lookup("#UI_FONT_SIZE=large\n", "UI_FONT_SIZE")) == CFG_FONT_DEFAULT);
+    /* Every size reads back from the value written for it. */
+    for (int s = 0; s < CFG_FONT_SIZES; s++) {
+        char *text = config_env_set("#UI_FONT_SIZE=default\n", "UI_FONT_SIZE", config_font_size_value(s));
+        assert(text != NULL);
+        assert(config_font_size(lookup(text, "UI_FONT_SIZE")) == s);
+        free(text);
+    }
+    assert(config_font_size_value(-1) == NULL);
+    assert(config_font_size_value(CFG_FONT_SIZES) == NULL);
+}
+
 static void make_config(Config *c, const char *root)
 {
     memset(c, 0, sizeof *c);
@@ -199,6 +231,14 @@ static void test_set_env_value(void)
     assert((st.st_mode & 0777) == 0600);
 #endif
 
+    /* The font size is saved the same way: appended, other lines kept. */
+    assert(config_set_env_value(&c, "UI_FONT_SIZE", config_font_size_value(CFG_FONT_XLARGE)) == 0);
+    text = plat_read_file(c.env_path, 4096, NULL);
+    assert(text && strcmp(text, "# keep\nSPOTIFY_CLIENT_ID=id\nSOLOIST_API_KEY=second\nZ=9\n"
+                                "UI_FONT_SIZE=extra-large\n") == 0);
+    assert(config_font_size(lookup(text, "UI_FONT_SIZE")) == CFG_FONT_XLARGE);
+    free(text);
+
     /* Values that would not read back unchanged are refused, file untouched. */
     assert(config_set_env_value(&c, "SOLOIST_API_KEY", "") == -1);
     assert(config_set_env_value(&c, "SOLOIST_API_KEY", "a b") == -1);
@@ -251,6 +291,7 @@ int main(void)
     test_device_name();
     test_env();
     test_env_set();
+    test_font_size();
     test_token();
     test_set_env_value();
     return 0;

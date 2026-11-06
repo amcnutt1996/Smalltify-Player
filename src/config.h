@@ -1,7 +1,8 @@
 /* App configuration + token persistence. Everything lives in the app folder
  * (plat_app_dir: the exe's directory, or Contents/Resources in a macOS
  * bundle):
- *   <app>/.env                 SPOTIFY_CLIENT_ID=..., SOLOIST_API_KEY=... (user-edited)
+ *   <app>/.env                 SPOTIFY_CLIENT_ID=..., SOLOIST_API_KEY=...,
+ *                              UI_FONT_SIZE=... (user-edited)
  *   <app>/soloist/             Spotify Soloist, downloaded at runtime
  *   <app>/data/token.json      OAuth tokens (owner-only perms)
  *   <app>/data/soloist/        Soloist device state + paired session
@@ -25,6 +26,7 @@ typedef struct {
     char soloist_key[256];           /* "" if not configured; secret, never log */
     int  read_only;                  /* app folder not writable (e.g. a translocated
                                         or read-only-volume .app): data can't be saved */
+    int  font_size;                  /* CFG_FONT_*, from UI_FONT_SIZE= */
     char app_dir[CFG_PATH_LEN];
     char env_path[CFG_PATH_LEN];     /* <app>/.env */
     char data_dir[CFG_PATH_LEN];
@@ -94,5 +96,15 @@ char *config_env_set(const char *text, const char *key, const char *value);
  * printable ASCII without blanks, quotes or a leading '#', so it reads back
  * unchanged. Does not reload c. Never logs the value. 0 ok, -1 error. */
 int config_set_env_value(const Config *c, const char *key, const char *value);
+
+/* GUI text size: UI_FONT_SIZE= small, default, large or extra-large in
+ * .env; like the other settings, an environment variable of that name wins. */
+enum { CFG_FONT_SMALL, CFG_FONT_DEFAULT, CFG_FONT_LARGE, CFG_FONT_XLARGE, CFG_FONT_SIZES };
+/* Pure, exposed for tests: the CFG_FONT_* that value names, ASCII case
+ * ignored; CFG_FONT_DEFAULT for NULL, "" and anything else. */
+int config_font_size(const char *value);
+/* The UI_FONT_SIZE= value for a CFG_FONT_* (NULL if out of range), which
+ * config_set_env_value accepts and config_font_size reads back. */
+const char *config_font_size_value(int size);
 
 #endif
