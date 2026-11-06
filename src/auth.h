@@ -6,11 +6,16 @@
 #include "config.h"
 #include "http.h"
 
-/* Scopes: playback read/modify, currently-playing, playlists, library.
- * No "streaming": Soloist plays with its own paired session (soloist.h). */
+/* Scopes: playback read/modify, currently-playing, playlists, the library
+ * (read, save/remove), followed artists (read, follow/unfollow) and recently
+ * played. No "streaming": Soloist plays with its own paired session
+ * (soloist.h). A scope added here makes every older sign-in ask for a new
+ * consent (auth_store_needs_reconsent). */
 #define AUTH_SCOPES "user-read-playback-state user-modify-playback-state " \
                     "user-read-currently-playing playlist-read-private " \
-                    "playlist-read-collaborative user-library-read"
+                    "playlist-read-collaborative user-library-read " \
+                    "user-library-modify user-follow-read user-follow-modify " \
+                    "user-read-recently-played"
 
 typedef struct AuthStore AuthStore;
 
@@ -20,6 +25,15 @@ void       auth_store_free(AuthStore *s);
 
 /* 1 if a refresh token is available (login not needed). */
 int auth_store_logged_in(AuthStore *s);
+
+/* 1 when the saved sign-in lacks a scope of AUTH_SCOPES; a token saved
+ * before the granted scopes were recorded counts as lacking them all. It
+ * keeps working for what it was granted (auth_store_logged_in stays 1) and
+ * calls needing the rest get SP_ERR_SCOPE, so ask the user once to sign in
+ * again (auth_store_login), saying AUTH_RECONSENT_REASON. A new sign-in (or
+ * refresh) records what Spotify granted. 0 when complete or signed out. */
+int auth_store_needs_reconsent(AuthStore *s);
+#define AUTH_RECONSENT_REASON "New features need permission. Please sign in again."
 
 /* Interactive PKCE login: opens browser, waits on the loopback redirect,
  * exchanges code, saves token. Blocks up to 5 min; returns early with -1
@@ -51,5 +65,8 @@ HttpAuth auth_store_http(AuthStore *s);
 
 /* Pure helpers (exposed for tests). */
 int auth_pkce_challenge(const char *verifier, char *out, size_t cap); /* base64url(sha256) */
+/* 1 if every space-separated scope in want is in granted (space-separated,
+ * any order; NULL = ""), else 0. */
+int auth_scopes_cover(const char *granted, const char *want);
 
 #endif

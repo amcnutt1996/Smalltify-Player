@@ -178,6 +178,41 @@ int auth_store_logged_in(AuthStore *s)
     return in;
 }
 
+/* Length of the scope word at s (up to a blank or the end). */
+static size_t scope_len(const char *s)
+{
+    return strcspn(s, " \t");
+}
+
+int auth_scopes_cover(const char *granted, const char *want)
+{
+    const char *w = want ? want : "";
+    if (!granted)
+        granted = "";
+    for (;;) {
+        w += strspn(w, " \t");
+        if (!*w)
+            return 1;
+        size_t n = scope_len(w);
+        const char *g = granted + strspn(granted, " \t");
+        while (*g && !(scope_len(g) == n && !strncmp(g, w, n))) {
+            g += scope_len(g);
+            g += strspn(g, " \t");
+        }
+        if (!*g)
+            return 0;
+        w += n;
+    }
+}
+
+int auth_store_needs_reconsent(AuthStore *s)
+{
+    plat_mutex_lock(s->lock);
+    int need = s->tok.refresh[0] && !auth_scopes_cover(s->tok.scope, AUTH_SCOPES);
+    plat_mutex_unlock(s->lock);
+    return need;
+}
+
 /* Caller holds s->flight. POST a form to the token endpoint and merge the
  * reply into a copy of the current token. 0 ok, -1 transport/HTTP error,
  * -2 when Spotify rejected the grant (revoked refresh token, bad code). */
@@ -197,12 +232,16 @@ static int token_request(AuthStore *s, const char *form, Token *out)
         const cJSON *acc = cJSON_GetObjectItemCaseSensitive(root, "access_token");
         const cJSON *ref = cJSON_GetObjectItemCaseSensitive(root, "refresh_token");
         const cJSON *exp = cJSON_GetObjectItemCaseSensitive(root, "expires_in");
+        const cJSON *scope = cJSON_GetObjectItemCaseSensitive(root, "scope");
         if (cJSON_IsString(acc) && strlen(acc->valuestring) < sizeof out->access) {
             snprintf(out->access, sizeof out->access, "%s", acc->valuestring);
             /* Spotify may rotate the refresh token; keep the old one otherwise. */
             if (cJSON_IsString(ref) && ref->valuestring[0] &&
                 strlen(ref->valuestring) < sizeof out->refresh)
                 snprintf(out->refresh, sizeof out->refresh, "%s", ref->valuestring);
+            /* What the grant covers (refreshes repeat it); kept if absent. */
+            if (cJSON_IsString(scope) && strlen(scope->valuestring) < sizeof out->scope)
+                snprintf(out->scope, sizeof out->scope, "%s", scope->valuestring);
             out->expires_at = plat_unix_time() + (cJSON_IsNumber(exp) ? (int64_t)exp->valuedouble : 3600);
             rc = out->refresh[0] ? 0 : -1;
         }
@@ -542,8 +581,11 @@ int auth_store_login(AuthStore *s, const volatile int *cancel)
     memset(&t, 0, sizeof t);
     plat_mutex_lock(s->flight);
     rc = token_request(s, form, &t) == 0 ? 0 : AUTH_ERR_TOKEN;
-    if (rc == 0)
+    if (rc == 0) {
         store_token(s, &t);
+        if (!auth_scopes_cover(t.scope, AUTH_SCOPES))
+            fprintf(stderr, "auth: Spotify granted only \"%s\"\n", t.scope);
+    }
     plat_mutex_unlock(s->flight);
     memset(&t, 0, sizeof t);
     memset(form, 0, sizeof form);

@@ -285,6 +285,7 @@ int config_load_token(const Config *c, Token *t)
     const cJSON *acc = cJSON_GetObjectItemCaseSensitive(root, "access_token");
     const cJSON *ref = cJSON_GetObjectItemCaseSensitive(root, "refresh_token");
     const cJSON *exp = cJSON_GetObjectItemCaseSensitive(root, "expires_at");
+    const cJSON *scope = cJSON_GetObjectItemCaseSensitive(root, "scope");
     int rc = -1;
     /* The refresh token is what keeps us logged in; the rest is optional. */
     if (cJSON_IsString(ref) && ref->valuestring[0] &&
@@ -295,6 +296,8 @@ int config_load_token(const Config *c, Token *t)
             snprintf(t->access, sizeof t->access, "%s", acc->valuestring);
             t->expires_at = (int64_t)exp->valuedouble;
         }
+        if (cJSON_IsString(scope) && strlen(scope->valuestring) < sizeof t->scope)
+            snprintf(t->scope, sizeof t->scope, "%s", scope->valuestring);
         rc = 0;
     }
     cJSON_Delete(root);
@@ -311,7 +314,8 @@ int config_save_token(const Config *c, const Token *t)
     int rc = -1;
     if (cJSON_AddStringToObject(root, "access_token", t->access) &&
         cJSON_AddStringToObject(root, "refresh_token", t->refresh) &&
-        cJSON_AddNumberToObject(root, "expires_at", (double)t->expires_at)) {
+        cJSON_AddNumberToObject(root, "expires_at", (double)t->expires_at) &&
+        cJSON_AddStringToObject(root, "scope", t->scope)) {
         char *json = cJSON_PrintUnformatted(root);
         if (json) {
             if (plat_mkdir(c->data_dir) == 0)
