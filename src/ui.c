@@ -1929,8 +1929,8 @@ static PlayerRows player_rows(const Metrics *m)
     r.times = r.seek + 12;
     r.transport = r.times + (float)m->fs + 12;
     r.modes = r.transport + 56;
-    r.volume = r.modes + m->row + 14;
-    r.end = r.volume + 6;
+    r.volume = r.modes + m->row + 12; /* the "Vol" label; its bar is centered on it */
+    r.end = r.volume + (float)m->fs;
     return r;
 }
 
@@ -2198,8 +2198,8 @@ static void draw_player(Ui *u)
     }
 
     float vy = y + rows.volume, vx = PAD + text_w(u, "Vol", FS_S) + 14;
-    text(u, "Vol", PAD, vy + 3 - (float)m->fs / 2.0f, FS_S, C_DIM); /* centered on the bar */
-    Rectangle rvol = { vx, vy, w - PAD - vx, 6 };
+    text(u, "Vol", PAD, vy, FS_S, C_DIM);
+    Rectangle rvol = { vx, vy + ((float)m->fs - 6) / 2.0f, w - PAD - vx, 6 };
     if (u->active != W_VOLUME)
         u->vol_t = s->volume >= 0 ? (float)s->volume / 100.0f : 0.0f;
     if (slider(u, W_VOLUME, rvol, &u->vol_t, s->active)) {
