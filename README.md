@@ -11,7 +11,9 @@ spotify-c-player[.exe]   the app (GUI with no args, CLI with a command)
 soloist/                 Spotify Soloist, downloaded from Spotify on first use
 data/token.json          your sign-in (owner-only permissions)
 data/soloist/            Soloist's device id and paired session
+data/soloist-paired      marker: this computer was paired (with data/device-name, the name it was paired under)
 data/soloist-cache/      Soloist's playback cache (capped at 100 MB)
+data/soloist-home/       Soloist's HOME/TMPDIR, so its OS caches stay here too
 ```
 
 Copy or move the folder anywhere. Delete it to uninstall.
@@ -31,18 +33,18 @@ Inside the bundle, the app folder above is `Spotify C Player.app/Contents/Resour
    - Add the redirect URI `http://127.0.0.1:8888/callback`.
    - If the app is in Development mode, add your account under User Management.
 2. Put `SPOTIFY_CLIENT_ID=<your id>` in `.env` next to the binary. No client secret is needed or used: sign-in is PKCE.
-3. Generate a Soloist API key at https://developer.spotify.com/dashboard/soloist and add `SOLOIST_API_KEY=<your key>` to `.env`. Without a key the app can still control your other devices. Keep the key secret: the app never logs it.
-4. Launch. The first launch walks you through:
-   1. **Sign in with Spotify** in the browser.
-   2. **Download**: the app fetches Soloist from Spotify's servers into `soloist/`. Spotify doesn't allow redistributing it, so it isn't bundled.
-   3. **Pair once**: open Spotify on your phone or computer (same network), open the device list and choose "Spotify C Player". The session is kept in `data/soloist/`.
+3. Generate a Soloist API key at https://developer.spotify.com/dashboard/soloist and add `SOLOIST_API_KEY=<your key>` to `.env`. Without a key the app can still control your other devices (Devices → "Enable playback on this computer" opens the key screen). Keep the key secret: the app never logs it.
+4. Launch and **sign in with Spotify** in the browser. The player opens right away.
+5. **Pair once.** This computer's device is "Spotify C Player (<hostname>)". Spotify lets Soloist sign in only when an official Spotify app on the same network picks it, once. When another device of your account is online (say your iPhone), the app quietly fetches Soloist from Spotify into `soloist/` (it can't be bundled), starts it so it appears in that device's Spotify device list, and shows one dismissible tip: "in Spotify on iPhone, choose 'Spotify C Player (…)'". Pick it there once. With no other device seen for 10 minutes, the unpaired Soloist stops again to save battery.
 
-   Later launches skip all three. Logging out also removes the pairing.
+   After pairing, Soloist starts with the app every time, under the same name and `data/soloist/`, and library picks and Play play on this computer. Restarts, rebuilds and Soloist updates keep the pairing; only **Log out** removes it.
+
+Pressing Play plays on the active device, else this computer (once paired), else any other available device of your account ("Playing on iPhone"). With nothing available the status line says how to get a device.
 
 Playback control needs Spotify Premium.
 
 ### Soloist updates
-Soloist builds expire 90 days after their build date. The app checks the build at every start and downloads a new one when it's missing or expires within 7 days. `spotify-c-player engine --update` forces a fresh download. Spotify publishes builds for macOS on Apple silicon, Windows x64, and Linux (x86_64, arm64, arm32), but not for Intel Macs or Windows on ARM. There the app controls other devices only.
+Soloist builds expire 90 days after their build date. The app checks the build at every start and downloads a new one when it's missing or expired, and when it expires within 7 days at most once a day (Spotify may still serve the same build; the check time is kept in `data/soloist-check`). A download is unpacked into `soloist.new/`, run once to check it, and only then swapped in, so a bad download never breaks a working build. A build expiring while the app runs is replaced once and restarted; if Soloist stops otherwise, the player shows **Restart Soloist** (which re-reads the key from `.env`) and **Change key**. `spotify-c-player engine --update` forces a fresh download. Spotify publishes builds for macOS on Apple silicon, Windows x64, and Linux (x86_64, arm64, arm32), but not for Intel Macs or Windows on ARM. There the app controls other devices only.
 
 ## CLI
 ```
@@ -55,7 +57,7 @@ spotify-c-player devices                   transfer <name-or-id>
 spotify-c-player playlists                 playlist <number | name>
 spotify-c-player search [-p N] <query...>
 ```
-`engine` runs Soloist in the foreground and installs or updates it first if needed. It prints the pairing hint on first use, and Ctrl-C or EOF stops it. The other commands need an active device: `engine`, the GUI, or any Spotify app. With nothing active, `play`, `playlist` and `search -p` start on "Spotify C Player".
+`engine` runs Soloist in the foreground and installs or updates it first if needed. It prints the pairing hint on first use, and Ctrl-C stops it (EOF too, when stdin is a terminal, so `nohup`/launchd work). The other commands need a device: `engine`, the GUI, or any Spotify app. With nothing active, `play`, `playlist` and `search -p` start on this computer's engine if it is online, else on any available device.
 
 ## Build
 You need CMake ≥ 3.20, a C11 compiler, and libcurl (development files).
@@ -64,7 +66,7 @@ cmake -S . -B build
 cmake --build build -j
 ctest --test-dir build
 ```
-The output goes to `build/dist/`. raylib 5.5 is fetched by CMake, and cJSON is vendored in `third_party/`. At runtime, extracting Soloist uses the OS's own `tar` (built into macOS, Linux, and Windows 10 1803+).
+The output goes to `build/dist/`. raylib 5.5 is fetched by CMake, and cJSON is vendored in `third_party/`. At runtime, extracting Soloist uses the system `tar` (part of macOS and Windows 10 1803+; on Linux `/usr/bin/tar` or `/bin/tar`).
 
 ## Layout
 | File | Role |
