@@ -408,7 +408,7 @@ static int installer_start(Installer *in, const Config *cfg, int force)
 }
 
 /* --- UI state ------------------------------------------------------------ */
-typedef enum { SCR_SETUP, SCR_LOGIN, SCR_KEY, SCR_ENGINE, SCR_PLAYER } Screen;
+typedef enum { SCR_MOVE, SCR_SETUP, SCR_LOGIN, SCR_KEY, SCR_ENGINE, SCR_PLAYER } Screen;
 typedef enum { PANEL_NONE, PANEL_LIBRARY, PANEL_DEVICES } Panel;
 
 /* Widget ids for the one widget that may hold the mouse. */
@@ -487,6 +487,7 @@ typedef struct {
     uint64_t lib_seq;
     Library  lib;
     char     query[SP_NAME_LEN];
+    char     key_input[sizeof(((Config *)0)->soloist_key)]; /* key screen; secret */
 } Ui;
 
 /* --- text helpers -------------------------------------------------------- */
@@ -629,6 +630,77 @@ static int slider(Ui *u, int id, Rectangle r, float *t, int enabled)
             DrawCircleV((Vector2){ r.x + fill, r.y + r.height / 2.0f }, r.height + 1.0f, C_TEXT);
     }
     return commit;
+}
+
+/* Remove the last UTF-8 character of s. */
+static void pop_utf8(char *s)
+{
+    size_t n = strlen(s);
+    while (n > 0 && ((unsigned char)s[--n] & 0xC0) == 0x80)
+        ;
+    s[n] = 0;
+}
+
+/* Append codepoint cp if it fits whole. key_chars keeps only what an API
+ * key holds (printable ASCII, no blanks), so a pasted line break or space
+ * is dropped. */
+static void append_cp(char *buf, size_t cap, size_t *len, int cp, int key_chars)
+{
+    if (cp < ' ' || cp == 0x7f || (key_chars && (cp == ' ' || cp > '~')))
+        return;
+    int n = 0;
+    const char *bytes = CodepointToUTF8(cp, &n);
+    if (n > 0 && *len + (size_t)n < cap) {
+        memcpy(buf + *len, bytes, (size_t)n);
+        *len += (size_t)n;
+        buf[*len] = 0;
+    }
+}
+
+/* Keyboard input for a one-line field: typing, Backspace, and paste with
+ * Cmd+V (macOS) or Ctrl+V. */
+static void edit_line(char *buf, size_t cap, int key_chars)
+{
+    size_t len = strlen(buf);
+    for (int cp = GetCharPressed(); cp > 0; cp = GetCharPressed())
+        append_cp(buf, cap, &len, cp, key_chars);
+    int mod = IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER) ||
+              IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    /* The press queue, not IsKeyPressed: a press and release that arrive in
+     * the same event wait never show up as "pressed" in the key state. */
+    for (int k = GetKeyPressed(); k > 0; k = GetKeyPressed()) {
+        if (k == KEY_BACKSPACE) {
+            pop_utf8(buf);
+            len = strlen(buf);
+        } else if (k == KEY_V && mod) {
+            const char *clip = GetClipboardText();
+            while (clip && *clip) {
+                int step = 1;
+                int cp = GetCodepointNext(clip, &step);
+                append_cp(buf, cap, &len, cp, key_chars);
+                clip += step > 0 ? step : 1;
+            }
+        }
+    }
+    if (IsKeyPressedRepeat(KEY_BACKSPACE))
+        pop_utf8(buf);
+}
+
+/* One-line text box: s with a static caret (a blinking one would need
+ * timed redraws), scrolled to its end; the placeholder when s is empty. */
+static void draw_field(const Ui *u, Rectangle box, const char *s, const char *placeholder)
+{
+    char shown[SP_NAME_LEN + 2];
+    DrawRectangleRounded(box, 0.3f, 6, C_PANEL);
+    if (s[0]) {
+        snprintf(shown, sizeof shown, "%s_", s);
+        float tw = text_w(u, shown, FS_S), room = box.width - 16;
+        BeginScissorMode((int)box.x + 8, (int)box.y, (int)room, (int)box.height);
+        text(u, shown, box.x + 8 + (tw > room ? room - tw : 0), box.y + 9, FS_S, C_TEXT);
+        EndScissorMode();
+    } else {
+        text(u, placeholder, box.x + 8, box.y + 9, FS_S, C_DIM);
+    }
 }
 
 typedef enum { ICON_PREV, ICON_PLAY, ICON_PAUSE, ICON_NEXT } Icon;
@@ -806,6 +878,16 @@ static void draw_setup(Ui *u)
         text_center(u, u->setup_msg, y + 48, FS_S, C_ERR);
 }
 
+/* --- move screen (app folder not writable) -------------------------------- */
+static void draw_move(Ui *u)
+{
+    text_center(u, "Spotify C Player", 120, FS_L, C_TEXT);
+    text_center(u, "This folder is read-only.", 176, FS_S, C_ERR);
+    text_center(u, "Move Spotify C Player to Applications", 204, FS_S, C_TEXT);
+    text_center(u, "(or another writable folder)", 220, FS_S, C_TEXT);
+    text_center(u, "and open it again.", 236, FS_S, C_TEXT);
+}
+
 /* --- login screen -------------------------------------------------------- */
 /* Called on the login thread just before auth opens the browser. */
 static void login_url_cb(const char *url, void *ud)
@@ -922,6 +1004,40 @@ static void skip_engine(Ui *u)
     enter_player(u);
 }
 
+/* '*' for all but the last 4 characters: enough to recognise the key. */
+static void mask_secret(const char *s, char *out, size_t cap)
+{
+    size_t n = strlen(s), keep = n > 4 ? 4 : 0, i = 0;
+    for (; i + keep < n && i + 1 < cap; i++)
+        out[i] = '*';
+    snprintf(out + i, cap - i, "%s", s + n - keep);
+}
+
+/* Save the pasted key into <app>/.env (if any), then read .env again. */
+static void save_key(Ui *u)
+{
+    int typed = u->key_input[0] != 0;
+    int rc = typed ? config_set_env_value(&u->cfg, "SOLOIST_API_KEY", u->key_input) : 0;
+    memset(u->key_input, 0, sizeof u->key_input);
+    if (rc != 0) {
+        u->setup_msg = "Could not save the key to .env.";
+        return;
+    }
+    Config c;
+    if (config_load(&c) == 0) {
+        /* Only the key changes; the AuthStore keeps its own copy. */
+        memcpy(u->cfg.soloist_key, c.soloist_key, sizeof u->cfg.soloist_key);
+        memset(c.soloist_key, 0, sizeof c.soloist_key);
+    }
+    if (!u->cfg.soloist_key[0]) {
+        u->setup_msg = typed ? "Could not read the key back from .env."
+                             : "Still no SOLOIST_API_KEY in .env.";
+        return;
+    }
+    u->setup_msg = NULL;
+    start_engine_setup(u, 0);
+}
+
 static void draw_key(Ui *u)
 {
     float maxw = (float)(u->w - 2 * PAD);
@@ -929,6 +1045,10 @@ static void draw_key(Ui *u)
         wrap_env_path(u, maxw);
         u->text_dirty = 0;
     }
+    /* The one field on this screen always has the keyboard. */
+    edit_line(u->key_input, sizeof u->key_input, 1);
+    int enter = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER);
+
     float y = 48;
     text_center(u, "Spotify C Player", y, FS_L, C_TEXT);
     y += 48;
@@ -943,34 +1063,29 @@ static void draw_key(Ui *u)
     if (button(u, W_OPEN_KEY, ro, "Open the page", FS_S, 0) && plat_open_url(SOLOIST_KEY_URL) != 0)
         u->setup_msg = "Could not open the browser.";
     y += 36;
-    text(u, "2. Add this line to the file:", PAD, y, FS_S, C_DIM);
+    text(u, "2. Paste it here and press Save:", PAD, y, FS_S, C_DIM);
     y += 18;
-    text(u, u->env_wrapped, PAD, y, FS_S, C_TEXT);
-    y += MeasureTextEx(u->font, u->env_wrapped, FS_S, spacing(FS_S)).y + 12;
-    text(u, "SOLOIST_API_KEY=...", PAD, y, FS_S, C_ACCENT);
-    y += 24;
-    text(u, "3. Press Reload.", PAD, y, FS_S, C_DIM);
-    y += 24;
-
-    Rectangle rb = { ((float)u->w - 120.0f) / 2.0f, y, 120, 32 };
-    if (button(u, W_RELOAD, rb, "Reload", FS_S, 1)) {
-        Config c;
-        if (config_load(&c) == 0) {
-            /* Only the key changes; the AuthStore keeps its own copy. */
-            memcpy(u->cfg.soloist_key, c.soloist_key, sizeof u->cfg.soloist_key);
-            memset(c.soloist_key, 0, sizeof c.soloist_key);
-        }
-        if (!u->cfg.soloist_key[0]) {
-            u->setup_msg = "Still no SOLOIST_API_KEY in .env.";
-        } else {
-            u->setup_msg = NULL;
-            start_engine_setup(u, 0);
+    float bw = 72, gap = 6;
+    Rectangle box = { PAD, y, maxw - bw - gap, 28 };
+    Rectangle rb = { PAD + box.width + gap, y, bw, 28 };
+    char masked[SP_NAME_LEN];
+    mask_secret(u->key_input, masked, sizeof masked);
+    draw_field(u, box, masked, "Paste the key (it stays hidden)");
+    /* Empty box: re-read a key added to .env by hand. */
+    if (button(u, W_RELOAD, rb, u->key_input[0] ? "Save" : "Reload", FS_S, 1) || enter) {
+        save_key(u);
+        if (u->screen != SCR_KEY)
             return;
-        }
     }
-    y += 44;
+    y += 40;
+    text(u, "Or put SOLOIST_API_KEY=... in this file\nand press Reload:", PAD, y, FS_S, C_DIM);
+    y += 30;
+    text(u, u->env_wrapped, PAD, y, FS_S, C_TEXT);
+    y += MeasureTextEx(u->font, u->env_wrapped, FS_S, spacing(FS_S)).y + 16;
+
     Rectangle rs = { ((float)u->w - 240.0f) / 2.0f, y, 240, 28 };
     if (button(u, W_SKIP, rs, "Skip: control other devices only", FS_S, 0)) {
+        memset(u->key_input, 0, sizeof u->key_input);
         u->setup_msg = NULL;
         skip_engine(u);
         return;
@@ -1220,15 +1335,6 @@ static void sync_library(Ui *u)
     plat_mutex_unlock(u->cmd.mu);
 }
 
-/* Remove the last UTF-8 character of s. */
-static void pop_utf8(char *s)
-{
-    size_t n = strlen(s);
-    while (n > 0 && ((unsigned char)s[--n] & 0xC0) == 0x80)
-        ;
-    s[n] = 0;
-}
-
 /* Playlists and track search over the player area; rows reuse button(). */
 static void draw_library(Ui *u, Rectangle area)
 {
@@ -1238,18 +1344,7 @@ static void draw_library(Ui *u, Rectangle area)
         u->redraw = 1;
         return;
     }
-    size_t qlen = strlen(u->query);
-    for (int cp = GetCharPressed(); cp > 0; cp = GetCharPressed()) {
-        int n = 0;
-        const char *bytes = CodepointToUTF8(cp, &n);
-        if (n > 0 && qlen + (size_t)n < sizeof u->query) {
-            memcpy(u->query + qlen, bytes, (size_t)n);
-            qlen += (size_t)n;
-            u->query[qlen] = 0;
-        }
-    }
-    if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE))
-        pop_utf8(u->query);
+    edit_line(u->query, sizeof u->query, 0);
     if ((IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) && u->query[0]) {
         cmd_post_str(&u->cmd, CMD_SEARCH, 0, u->query);
         u->lib_show_hits = 1;
@@ -1259,18 +1354,7 @@ static void draw_library(Ui *u, Rectangle area)
     float bw = 72, row_h = 28, gap = 6;
     Rectangle box = { area.x, area.y, area.width - bw - gap, row_h };
     Rectangle back = { box.x + box.width + gap, area.y, bw, row_h };
-    char shown[SP_NAME_LEN + 2];
-    DrawRectangleRounded(box, 0.3f, 6, C_PANEL);
-    if (u->query[0]) {
-        /* Static caret: a blinking one would need timed redraws. */
-        snprintf(shown, sizeof shown, "%s_", u->query);
-        float tw = text_w(u, shown, FS_S), room = box.width - 16;
-        BeginScissorMode((int)box.x + 8, (int)box.y, (int)room, (int)box.height);
-        text(u, shown, box.x + 8 + (tw > room ? room - tw : 0), box.y + 9, FS_S, C_TEXT);
-        EndScissorMode();
-    } else {
-        text(u, "Type to search tracks, Enter", box.x + 8, box.y + 9, FS_S, C_DIM);
-    }
+    draw_field(u, box, u->query, "Type to search tracks, Enter");
     if (button(u, W_LIB_BACK, back, "Playlists", FS_S, !u->lib_show_hits)) {
         u->lib_show_hits = 0;
         u->lib_scroll = 0;
@@ -1562,6 +1646,7 @@ static void frame(Ui *u)
     BeginDrawing();
     ClearBackground(C_BG);
     switch (u->screen) {
+    case SCR_MOVE:   draw_move(u); break;
     case SCR_SETUP:  draw_setup(u); break;
     case SCR_LOGIN:  draw_login(u); break;
     case SCR_KEY:    draw_key(u); break;
@@ -1611,7 +1696,9 @@ int ui_run(const Config *cfg)
     u->font = GetFontDefault();
 
     int rc = 0;
-    if (!u->cfg.client_id[0])
+    if (u->cfg.read_only)
+        set_screen(u, SCR_MOVE);
+    else if (!u->cfg.client_id[0])
         set_screen(u, SCR_SETUP);
     else if (enter_app(u) != 0)
         rc = 1;

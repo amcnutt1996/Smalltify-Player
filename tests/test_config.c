@@ -64,6 +64,35 @@ static void test_env(void)
     assert(config_env_lookup("K=abcd\n", "K", small, sizeof small) == -1);
 }
 
+static void expect_set(const char *text, const char *want)
+{
+    char *got = config_env_set(text, "SOLOIST_API_KEY", "new_Key-9");
+    assert(got != NULL);
+    assert(strcmp(got, want) == 0);
+    free(got);
+}
+
+static void test_env_set(void)
+{
+    /* Replace in place; every other line (comments, secrets) verbatim. */
+    expect_set("# c\nSPOTIFY_CLIENT_ID=id\nSPOTIFY_CLIENT_SECRET=s\nSOLOIST_API_KEY=\n# end\n",
+               "# c\nSPOTIFY_CLIENT_ID=id\nSPOTIFY_CLIENT_SECRET=s\nSOLOIST_API_KEY=new_Key-9\n# end\n");
+    expect_set("SOLOIST_API_KEY=old\r\nA=1\r\n", "SOLOIST_API_KEY=new_Key-9\r\nA=1\r\n");
+    expect_set("  export SOLOIST_API_KEY = \"old\" # note\n", "SOLOIST_API_KEY=new_Key-9\n");
+    expect_set("SOLOIST_API_KEY=a\nSOLOIST_API_KEY=b", "SOLOIST_API_KEY=new_Key-9\nSOLOIST_API_KEY=new_Key-9");
+    expect_set("\xEF\xBB\xBF" "SOLOIST_API_KEY=old\n", "\xEF\xBB\xBF" "SOLOIST_API_KEY=new_Key-9\n");
+    /* Commented-out lines and look-alike keys are left alone: append. */
+    expect_set("# SOLOIST_API_KEY=x\nSOLOIST_API_KEYS=y\n",
+               "# SOLOIST_API_KEY=x\nSOLOIST_API_KEYS=y\nSOLOIST_API_KEY=new_Key-9\n");
+    expect_set("A=1", "A=1\nSOLOIST_API_KEY=new_Key-9\n");          /* no final newline */
+    expect_set("A=1\r\nB=2", "A=1\r\nB=2\r\nSOLOIST_API_KEY=new_Key-9\r\n"); /* CRLF style kept */
+    expect_set("", "SOLOIST_API_KEY=new_Key-9\n");
+
+    char *set = config_env_set("A=1\n", "SOLOIST_API_KEY", "k");
+    assert(set && strcmp(lookup(set, "SOLOIST_API_KEY"), "k") == 0);
+    free(set);
+}
+
 static void make_config(Config *c, const char *root)
 {
     memset(c, 0, sizeof *c);
@@ -139,9 +168,60 @@ static void test_token(void)
     assert(plat_remove_tree(root) == 0);
 }
 
+/* config_set_env_value on a real file in the scratch folder. */
+static void test_set_env_value(void)
+{
+    const char *exe = plat_exe_dir();
+    assert(exe != NULL);
+    char root[CFG_PATH_LEN];
+    assert(plat_path_join(root, sizeof root, exe, "test_config_env") == 0);
+    assert(plat_remove_tree(root) == 0);
+    assert(plat_mkdir(root) == 0);
+    Config c;
+    memset(&c, 0, sizeof c);
+    assert(plat_path_join(c.env_path, sizeof c.env_path, root, ".env") == 0);
+
+    /* Missing file: created with just the line. */
+    assert(config_set_env_value(&c, "SOLOIST_API_KEY", "first") == 0);
+    char *text = plat_read_file(c.env_path, 4096, NULL);
+    assert(text && strcmp(text, "SOLOIST_API_KEY=first\n") == 0);
+    free(text);
+
+    const char *orig = "# keep\nSPOTIFY_CLIENT_ID=id\nSOLOIST_API_KEY=first\nZ=9";
+    assert(plat_write_file_atomic(c.env_path, orig, strlen(orig)) == 0);
+    assert(config_set_env_value(&c, "SOLOIST_API_KEY", "second") == 0);
+    text = plat_read_file(c.env_path, 4096, NULL);
+    assert(text && strcmp(text, "# keep\nSPOTIFY_CLIENT_ID=id\nSOLOIST_API_KEY=second\nZ=9") == 0);
+    free(text);
+#ifndef _WIN32
+    struct stat st;
+    assert(stat(c.env_path, &st) == 0);
+    assert((st.st_mode & 0777) == 0600);
+#endif
+
+    /* Values that would not read back unchanged are refused, file untouched. */
+    assert(config_set_env_value(&c, "SOLOIST_API_KEY", "") == -1);
+    assert(config_set_env_value(&c, "SOLOIST_API_KEY", "a b") == -1);
+    assert(config_set_env_value(&c, "SOLOIST_API_KEY", "x\ny") == -1);
+    assert(config_set_env_value(&c, "SOLOIST_API_KEY", "#x") == -1);
+    assert(config_set_env_value(&c, "SOLOIST_API_KEY", "\"x\"") == -1);
+    text = plat_read_file(c.env_path, 4096, NULL);
+    assert(text && strstr(text, "SOLOIST_API_KEY=second\n"));
+    free(text);
+
+    /* A folder in the way (unreadable as a file) is never clobbered. */
+    assert(plat_remove_tree(c.env_path) == 0);
+    assert(plat_mkdir(c.env_path) == 0);
+    assert(config_set_env_value(&c, "SOLOIST_API_KEY", "third") == -1);
+
+    assert(plat_remove_tree(root) == 0);
+}
+
 int main(void)
 {
     test_env();
+    test_env_set();
     test_token();
+    test_set_env_value();
     return 0;
 }
