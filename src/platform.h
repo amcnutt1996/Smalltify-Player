@@ -91,23 +91,37 @@ typedef struct plat_proc plat_proc;
  * Stop it with plat_proc_kill on shutdown. If we die without that (crash,
  * SIGKILL) the child is still terminated: a kill-on-close job (Win32),
  * PR_SET_PDEATHSIG tied to the calling thread (Linux: spawn from the main
- * thread), or a tiny watchdog process (other POSIX). NULL on error. */
+ * thread), or a tiny watchdog process (other POSIX). POSIX children get
+ * their own process group, so a terminal's Ctrl-C reaches only us and we
+ * stop them ourselves. NULL on error. */
 plat_proc *plat_proc_spawn(const char *const argv[]);
+/* plat_proc_spawn with our environment plus env (NULL-terminated
+ * "NAME=value" entries that replace same-named variables; env may be
+ * NULL). */
+plat_proc *plat_proc_spawn_env(const char *const argv[], const char *const env[]);
 /* Blocking read of child output. Returns bytes read, 0 on EOF, -1 error. */
 long       plat_proc_read(plat_proc *p, char *buf, size_t cap);
 /* Wait up to timeout_ms for the child to exit on its own. Returns its exit
- * code (0-255), or -1 if still running, killed by a signal, or on error. */
+ * code (0-255), or -1 if still running or on error; POSIX also -1 if a
+ * signal killed it (Win32: a terminated child's code is 1). */
 int        plat_proc_wait(plat_proc *p, unsigned timeout_ms);
-/* Terminate (graceful, then forced after 2 s) and reap, but keep p valid:
- * a reader thread blocked in plat_proc_read then sees EOF and can be
- * joined before plat_proc_kill frees p. Idempotent. */
+/* Stop and reap, but keep p valid: a reader thread blocked in
+ * plat_proc_read then sees EOF and can be joined before plat_proc_kill
+ * frees p. POSIX: SIGTERM, then SIGKILL after 2 s. Win32: TerminateProcess
+ * at once (a windowless console child has no graceful stop). Idempotent. */
 void       plat_proc_terminate(plat_proc *p);
-/* Terminate (graceful, then forced), reap, free. NULL-safe. */
+/* plat_proc_terminate, then free. NULL-safe. */
 void       plat_proc_kill(plat_proc *p);
-/* Extract a .tar.gz (POSIX) or .zip (Win32) into dir with the OS's own
- * tar (built into macOS, Linux and Windows 10 1803+). Blocks until tar
- * exits. 0 ok, -1 error. */
+/* Extract a .tar.gz (POSIX) or .zip (Win32) into dir with the system tar
+ * (part of macOS and Windows 10 1803+; on Linux the distribution's
+ * /usr/bin/tar or /bin/tar). Blocks until tar exits. 0 ok, -1 error. */
 int        plat_untar(const char *archive, const char *dir);
+/* Rename a file or directory on the same volume; to must not exist.
+ * 0 ok, -1 error. */
+int        plat_rename(const char *from, const char *to);
+/* This computer's short host name ("laptop", not "laptop.local"); "" if
+ * unknown. */
+void       plat_hostname(char *out, size_t cap);
 
 /* --- loopback TCP (OAuth redirect listener) ----------------------------- */
 typedef intptr_t plat_sock;

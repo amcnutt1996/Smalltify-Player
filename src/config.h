@@ -6,6 +6,8 @@
  *   <app>/data/token.json      OAuth tokens (owner-only perms)
  *   <app>/data/soloist/        Soloist device state + paired session
  *   <app>/data/soloist-cache/  Soloist playback cache (100 MB cap)
+ *   <app>/data/soloist-home/   Soloist's HOME/TMPDIR, so the OS caches it
+ *                              writes stay here too (a cache: kept on logout)
  * Nothing is ever written outside <app>. */
 #ifndef CONFIG_H
 #define CONFIG_H
@@ -30,6 +32,7 @@ typedef struct {
     char soloist_path[CFG_PATH_LEN]; /* <app>/soloist/soloist[.exe] */
     char soloist_data[CFG_PATH_LEN]; /* <app>/data/soloist */
     char soloist_cache[CFG_PATH_LEN];/* <app>/data/soloist-cache */
+    char soloist_home[CFG_PATH_LEN]; /* <app>/data/soloist-home */
     char redirect_uri[128];          /* http://127.0.0.1:8888/callback */
 } Config;
 

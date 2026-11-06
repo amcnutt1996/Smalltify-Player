@@ -67,13 +67,55 @@ long soloist_days_left(long build_day, int64_t now)
     return build_day + SOLOIST_EXPIRY_DAYS - (long)today;
 }
 
+/* Soloist (through the OS networking stack) writes caches, cookies and
+ * temp files under HOME/TMPDIR (macOS: ~/Library/Caches/soloist,
+ * ~/Library/HTTPStorages/soloist). Point them all at
+ * <app>/data/soloist-home so nothing lands outside the app folder. */
+#define HOME_ENV_LEN (CFG_PATH_LEN + 32)
+typedef struct {
+    char        buf[6][HOME_ENV_LEN];
+    const char *env[7];
+} HomeEnv;
+
+static int home_env(const Config *cfg, HomeEnv *h)
+{
+    char tmp[CFG_PATH_LEN];
+    if (plat_mkdir(cfg->data_dir) != 0 || plat_mkdir(cfg->soloist_home) != 0 ||
+        plat_path_join(tmp, sizeof tmp, cfg->soloist_home, "tmp") != 0 || plat_mkdir(tmp) != 0)
+        return -1;
+#ifdef _WIN32
+    static const char *const names[] = { "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "HOME" };
+    const char *vals[] = { cfg->soloist_home, cfg->soloist_home, cfg->soloist_home, tmp, tmp,
+                           cfg->soloist_home };
+#else
+    /* CFFIXED_USER_HOME: where macOS's CoreFoundation looks for ~. */
+    static const char *const names[] = { "HOME", "CFFIXED_USER_HOME", "TMPDIR" };
+    const char *vals[] = { cfg->soloist_home, cfg->soloist_home, tmp };
+#endif
+    size_t n = sizeof names / sizeof names[0];
+    for (size_t i = 0; i < n; i++) {
+        int k = snprintf(h->buf[i], sizeof h->buf[i], "%s=%s", names[i], vals[i]);
+        if (k < 0 || (size_t)k >= sizeof h->buf[i])
+            return -1;
+        h->env[i] = h->buf[i];
+    }
+    h->env[n] = NULL;
+    return 0;
+}
+
+static plat_proc *spawn_soloist(const Config *cfg, const char *const argv[])
+{
+    HomeEnv h;
+    return home_env(cfg, &h) == 0 ? plat_proc_spawn_env(argv, h.env) : NULL;
+}
+
 /* Run `soloist --version`: its exit code (-1 if it didn't run), output
  * in out. */
 static int read_version(const Config *cfg, char *out, size_t cap)
 {
     out[0] = '\0';
     const char *argv[] = { cfg->soloist_path, "--version", NULL };
-    plat_proc *p = plat_proc_spawn(argv);
+    plat_proc *p = spawn_soloist(cfg, argv);
     if (!p)
         return -1;
     size_t len = 0;
@@ -311,7 +353,7 @@ Soloist *soloist_start(const Config *cfg, void (*on_change)(void *ud), void *ud)
         "-z", "100",               /* MB: the smallest cap Soloist allows */
         NULL,
     };
-    s->proc = plat_proc_spawn(argv);
+    s->proc = spawn_soloist(cfg, argv);
     if (!s->proc) {
         plat_mutex_free(s->lock);
         free(s);

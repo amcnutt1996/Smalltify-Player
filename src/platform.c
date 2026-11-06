@@ -552,13 +552,68 @@ static int append_arg(wchar_t *cmd, size_t cap, size_t *pos, const wchar_t *a)
 #undef PUT
 }
 
+/* Our environment block with each env entry ("NAME=value", UTF-8)
+ * replacing its same-named variable (names are case-insensitive) or
+ * appended. malloc'd, double-NUL terminated; NULL on error. */
+static wchar_t *merge_env_block(const char *const env[])
+{
+    wchar_t *cur = GetEnvironmentStringsW();
+    if (!cur)
+        return NULL;
+    size_t cur_len = 0, k = 0, extra = 0;
+    while (cur[cur_len])
+        cur_len += wcslen(cur + cur_len) + 1;
+    wchar_t *wenv[16];
+    for (; env[k]; k++) {
+        if (k == sizeof wenv / sizeof wenv[0] || !(wenv[k] = to_wide(env[k]))) {
+            while (k > 0)
+                free(wenv[--k]);
+            FreeEnvironmentStringsW(cur);
+            return NULL;
+        }
+        extra += wcslen(wenv[k]) + 1;
+    }
+    wchar_t *out = malloc((cur_len + extra + 1) * sizeof *out);
+    size_t o = 0;
+    for (const wchar_t *e = cur; out && *e; e += wcslen(e) + 1) {
+        int replaced = 0;
+        for (size_t j = 0; j < k && !replaced; j++) {
+            size_t len = wcscspn(wenv[j], L"=");
+            replaced = e[0] != L'=' && !_wcsnicmp(e, wenv[j], len) && e[len] == L'=';
+        }
+        if (!replaced) {
+            size_t len = wcslen(e) + 1;
+            memcpy(out + o, e, len * sizeof *out);
+            o += len;
+        }
+    }
+    for (size_t j = 0; j < k; j++) {
+        if (out) {
+            size_t len = wcslen(wenv[j]) + 1;
+            memcpy(out + o, wenv[j], len * sizeof *out);
+            o += len;
+        }
+        free(wenv[j]);
+    }
+    if (out)
+        out[o] = 0;
+    FreeEnvironmentStringsW(cur);
+    return out;
+}
+
 plat_proc *plat_proc_spawn(const char *const argv[])
+{
+    return plat_proc_spawn_env(argv, NULL);
+}
+
+plat_proc *plat_proc_spawn_env(const char *const argv[], const char *const env[])
 {
     enum { CMD_CAP = 32768 };
     wchar_t *cmd = malloc(CMD_CAP * sizeof *cmd), *app = to_wide(argv[0]);
+    wchar_t *envb = env ? merge_env_block(env) : NULL;
     plat_proc *p = calloc(1, sizeof *p);
     HANDLE rd = NULL, wr = NULL, nul = INVALID_HANDLE_VALUE;
-    if (!cmd || !app || !p)
+    if (!cmd || !app || !p || (env && !envb))
         goto fail;
     size_t pos = 0;
     cmd[0] = 0;
@@ -592,8 +647,9 @@ plat_proc *plat_proc_spawn(const char *const argv[])
     si.hStdOutput = wr;
     si.hStdError = wr;
     PROCESS_INFORMATION pi;
-    if (!CreateProcessW(app, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
-                        NULL, NULL, &si, &pi))
+    if (!CreateProcessW(app, cmd, NULL, NULL, TRUE,
+                        CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                        envb, NULL, &si, &pi))
         goto fail;
     if (p->job)
         AssignProcessToJobObject(p->job, pi.hProcess);
@@ -603,6 +659,7 @@ plat_proc *plat_proc_spawn(const char *const argv[])
     CloseHandle(nul);
     free(cmd);
     free(app);
+    free(envb);
     p->process = pi.hProcess;
     p->out = rd;
     InitializeSRWLock(&p->lock);
@@ -614,6 +671,7 @@ fail:
     if (p && p->job) CloseHandle(p->job);
     free(cmd);
     free(app);
+    free(envb);
     free(p);
     return NULL;
 }
@@ -1251,10 +1309,12 @@ struct plat_proc {
     pthread_mutex_t lock; /* serializes waitpid between alive/terminate */
 };
 
-/* Spawn with stdin = in_fd (or /dev/null when in_fd < 0) and stdout+stderr
- * = out_fd (or /dev/null when out_fd < 0). Signals the child must see as
- * default are reset because ignored dispositions survive exec. */
-static int spawn_child(pid_t *pid, const char *const argv[], int search_path, int in_fd, int out_fd)
+/* Spawn with stdin = in_fd (or /dev/null when in_fd < 0), stdout+stderr
+ * = out_fd (or /dev/null when out_fd < 0) and environment envp. Signals
+ * the child must see as default are reset because ignored dispositions
+ * survive exec. */
+static int spawn_child(pid_t *pid, const char *const argv[], int search_path, int in_fd, int out_fd,
+                       char *const envp[])
 {
     posix_spawn_file_actions_t fa;
     posix_spawnattr_t at;
@@ -1293,8 +1353,8 @@ static int spawn_child(pid_t *pid, const char *const argv[], int search_path, in
     }
     if (!rc) {
         char *const *av = (char *const *)(uintptr_t)argv; /* POSIX signature lacks const */
-        rc = search_path ? posix_spawnp(pid, argv[0], &fa, &at, av, environ)
-                         : posix_spawn(pid, argv[0], &fa, &at, av, environ);
+        rc = search_path ? posix_spawnp(pid, argv[0], &fa, &at, av, envp)
+                         : posix_spawn(pid, argv[0], &fa, &at, av, envp);
     }
     posix_spawnattr_destroy(&at);
     posix_spawn_file_actions_destroy(&fa);
@@ -1305,7 +1365,7 @@ static int spawn_child(pid_t *pid, const char *const argv[], int search_path, in
 /* posix_spawn can't run code in the child, so fork: PR_SET_PDEATHSIG makes
  * the kernel SIGTERM the child when the thread that forked it dies, crash
  * and SIGKILL included. Only async-signal-safe calls between fork and exec. */
-static int spawn_tied(pid_t *pid, const char *const argv[], int out_fd)
+static int spawn_tied(pid_t *pid, const char *const argv[], int out_fd, char *const envp[])
 {
     if (access(argv[0], X_OK) != 0)
         return -1; /* fail here like posix_spawn would, not in the child */
@@ -1329,7 +1389,7 @@ static int spawn_tied(pid_t *pid, const char *const argv[], int out_fd)
             dup2(out_fd, 1) < 0 || dup2(out_fd, 2) < 0 ||
             prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || getppid() != parent)
             _exit(127); /* the last check: we already died before prctl */
-        execv(argv[0], (char *const *)(uintptr_t)argv);
+        execve(argv[0], (char *const *)(uintptr_t)argv, envp);
         _exit(127);
     }
     *pid = c;
@@ -1351,7 +1411,7 @@ static void start_guard(plat_proc *p)
         return;
     const char *argv[] = { "/bin/sh", "-c", script, NULL };
     if (set_cloexec(fds[0]) == 0 && set_cloexec(fds[1]) == 0 &&
-        spawn_child(&p->guard, argv, 0, fds[0], -1) == 0) {
+        spawn_child(&p->guard, argv, 0, fds[0], -1, environ) == 0) {
         close(fds[0]);
         p->guard_fd = fds[1];
         return;
@@ -1378,11 +1438,48 @@ static void stop_guard(plat_proc *p)
     }
 }
 
+/* environ with each env entry replacing its same-named variable (or
+ * appended). The strings are shared, only the array is malloc'd. */
+static char **merge_env(const char *const env[])
+{
+    size_t n = 0, k = 0;
+    while (environ[n])
+        n++;
+    while (env[k])
+        k++;
+    char **out = malloc((n + k + 1) * sizeof *out);
+    if (!out)
+        return NULL;
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        int replaced = 0;
+        for (size_t j = 0; j < k && !replaced; j++) {
+            size_t len = strcspn(env[j], "=");
+            replaced = !strncmp(environ[i], env[j], len) && environ[i][len] == '=';
+        }
+        if (!replaced)
+            out[o++] = environ[i];
+    }
+    for (size_t j = 0; j < k; j++)
+        out[o++] = (char *)(uintptr_t)env[j]; /* exec's signature lacks const */
+    out[o] = NULL;
+    return out;
+}
+
 plat_proc *plat_proc_spawn(const char *const argv[])
 {
-    plat_proc *p = calloc(1, sizeof *p);
-    if (!p)
+    return plat_proc_spawn_env(argv, NULL);
+}
+
+plat_proc *plat_proc_spawn_env(const char *const argv[], const char *const env[])
+{
+    char **envp = env ? merge_env(env) : environ;
+    plat_proc *p = envp ? calloc(1, sizeof *p) : NULL;
+    if (!p) {
+        if (envp != environ)
+            free(envp);
         return NULL;
+    }
     p->guard_fd = -1;
     int fds[2];
 #ifdef __linux__
@@ -1391,6 +1488,8 @@ plat_proc *plat_proc_spawn(const char *const argv[])
     if (pipe(fds) != 0) {
 #endif
         free(p);
+        if (envp != environ)
+            free(envp);
         return NULL;
     }
 #ifndef __linux__
@@ -1400,13 +1499,15 @@ plat_proc *plat_proc_spawn(const char *const argv[])
     if (pthread_mutex_init(&p->lock, NULL) != 0)
         goto fail;
 #ifdef __linux__
-    if (spawn_tied(&p->pid, argv, fds[1]) != 0) {
+    if (spawn_tied(&p->pid, argv, fds[1], envp) != 0) {
 #else
-    if (spawn_child(&p->pid, argv, 0, -1, fds[1]) != 0) {
+    if (spawn_child(&p->pid, argv, 0, -1, fds[1], envp) != 0) {
 #endif
         pthread_mutex_destroy(&p->lock);
         goto fail;
     }
+    if (envp != environ)
+        free(envp);
 #ifndef __linux__
     start_guard(p);
 #endif
@@ -1414,6 +1515,8 @@ plat_proc *plat_proc_spawn(const char *const argv[])
     p->out = fds[0];
     return p;
 fail:
+    if (envp != environ)
+        free(envp);
     close(fds[0]);
     close(fds[1]);
     free(p);
@@ -1531,7 +1634,7 @@ int plat_open_url(const char *url)
     int search = 1;
 #endif
     pid_t pid;
-    if (spawn_child(&pid, argv, search, -1, -1) != 0)
+    if (spawn_child(&pid, argv, search, -1, -1, environ) != 0)
         return -1;
     pthread_t t;
     if (pthread_create(&t, NULL, reap_thread, (void *)(intptr_t)pid) == 0)

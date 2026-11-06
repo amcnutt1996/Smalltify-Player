@@ -184,6 +184,8 @@ int config_load(Config *c)
         plat_path_join(c->soloist_data, sizeof c->soloist_data, c->data_dir, "soloist") != 0 ||
         plat_path_join(c->soloist_cache, sizeof c->soloist_cache, c->data_dir,
                        "soloist-cache") != 0 ||
+        plat_path_join(c->soloist_home, sizeof c->soloist_home, c->data_dir,
+                       "soloist-home") != 0 ||
         plat_path_join(c->env_path, sizeof c->env_path, c->app_dir, ".env") != 0)
         return -1;
     snprintf(c->redirect_uri, sizeof c->redirect_uri, "http://127.0.0.1:%d/callback",
