@@ -286,6 +286,26 @@ static void test_search(void)
     assert(sp_parse_search(NULL, t, 4, &n) == SP_ERR_PARSE);
 }
 
+static void test_fmt_time(void)
+{
+    char b[16];
+
+    sp_fmt_time(b, sizeof b, 0);
+    assert(!strcmp(b, "0:00"));
+    sp_fmt_time(b, sizeof b, -5000);
+    assert(!strcmp(b, "0:00"));
+    sp_fmt_time(b, sizeof b, 59999);
+    assert(!strcmp(b, "0:59"));
+    sp_fmt_time(b, sizeof b, 60000);
+    assert(!strcmp(b, "1:00"));
+    sp_fmt_time(b, sizeof b, 3599999);
+    assert(!strcmp(b, "59:59"));
+    sp_fmt_time(b, sizeof b, 3600000);
+    assert(!strcmp(b, "1:00:00"));
+    sp_fmt_time(b, sizeof b, 3600000 + 61000);
+    assert(!strcmp(b, "1:01:01"));
+}
+
 int main(void)
 {
     test_track();
@@ -301,5 +321,6 @@ int main(void)
     test_devices_malformed();
     test_playlists();
     test_search();
+    test_fmt_time();
     return 0;
 }

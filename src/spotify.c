@@ -628,3 +628,27 @@ int sp_play_uri(HttpClient *c, const char *device_id, const char *uri, int is_tr
     cJSON_Delete(body);
     return rc;
 }
+
+int sp_play_fallback(HttpClient *c, const char *uri, int is_track, const char *fallback_name)
+{
+    Device d;
+    int rc = uri ? sp_play_uri(c, NULL, uri, is_track) : sp_play(c, NULL);
+
+    if (rc != SP_ERR_NODEVICE || !fallback_name)
+        return rc;
+    rc = sp_find_device(c, fallback_name, &d);
+    if (rc != SP_OK)
+        return rc;
+    if (!d.id[0])
+        return SP_ERR_NODEVICE; /* listed but not remotely controllable */
+    return uri ? sp_play_uri(c, d.id, uri, is_track) : sp_play(c, d.id);
+}
+
+void sp_fmt_time(char *out, size_t cap, int ms)
+{
+    int s = ms > 0 ? ms / 1000 : 0;
+    if (s >= 3600)
+        snprintf(out, cap, "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60);
+    else
+        snprintf(out, cap, "%d:%02d", s / 60, s % 60);
+}

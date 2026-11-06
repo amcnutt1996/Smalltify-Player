@@ -54,9 +54,17 @@ int sp_get_playlists(HttpClient *c, Playlist *out, int cap, int *count);
 int sp_search_tracks(HttpClient *c, const char *query, Track *out, int cap, int *count);
 /* Play a context (playlist/album URI) or, if is_track, a single track URI. */
 int sp_play_uri(HttpClient *c, const char *device_id, const char *uri, int is_track);
+/* Play uri (NULL = resume) on the active device. With none active and
+ * fallback_name set, play on the device with that exact name instead.
+ * SP_ERR_NODEVICE when neither exists. */
+int sp_play_fallback(HttpClient *c, const char *uri, int is_track, const char *fallback_name);
 /* Parse /me/playlists and /search?type=track bodies (no network; used by
  * tests). SP_OK, or SP_ERR_PARSE if the expected items array is missing. */
 int sp_parse_playlists(const char *json, Playlist *out, int cap, int *count);
 int sp_parse_search(const char *json, Track *out, int cap, int *count);
+
+/* --- formatting --------------------------------------------------------- */
+/* Track/episode time as m:ss, or h:mm:ss from one hour; negative = 0:00. */
+void sp_fmt_time(char *out, size_t cap, int ms);
 
 #endif
