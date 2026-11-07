@@ -1,9 +1,65 @@
 # Smalltify Player
 
-A small, low-power Spotify player and remote written in C11. It has a raylib GUI and a CLI. It plays on this computer through [Spotify Soloist](https://developer.spotify.com/documentation/soloist), Spotify's official headless Connect client, and can control any other Spotify Connect device too.
+A small, low-power Spotify player and remote for the desktop, written in plain C11. It has a native GUI (raylib) and a command-line interface in one binary. It plays music on your computer through [Spotify Soloist](https://developer.spotify.com/documentation/soloist), Spotify's official headless Spotify Connect client, and it can also control any other Spotify Connect device on your account (phone, speaker, TV).
 
-## Portable folder
-Everything lives in one folder. The app writes nothing outside it: no cache directory, no AppData, no registry.
+> **Platform status:** Smalltify Player has only been tested on **macOS** (13 Ventura or newer, Apple silicon). The code has Windows and Linux paths, but they are untested.
+
+## What it's for
+The official Spotify desktop app is a large Chromium-based app that uses a lot of memory and battery. Smalltify Player covers everyday listening with a fraction of the footprint:
+
+- **Lightweight:** one native executable, event-driven UI (about 0% CPU when idle), no web runtime.
+- **Plays locally:** streams on this computer through Spotify Soloist once it is paired.
+- **Remote control:** play, pause, skip, seek, volume, shuffle, repeat and device transfer for any Spotify Connect device.
+- **Library:** Liked Songs, playlists, albums, artists, podcasts, episodes, recently played, the queue and search.
+- **Scriptable:** every action is also a CLI command (`smalltify-player now`, `next`, `vol +10`, ...).
+- **Self-contained:** everything the app stores lives inside its own folder or app bundle. Delete it to uninstall.
+
+Playback control needs a **Spotify Premium** account.
+
+## First-time setup (macOS)
+
+### 1. Prerequisites
+- macOS 13 or newer. Local playback needs Apple silicon, because Spotify publishes no Soloist build for Intel Macs. On an Intel Mac the app works as a remote only.
+- Xcode Command Line Tools (clang, `codesign`, libcurl): `xcode-select --install`
+- CMake 3.20 or newer: `brew install cmake`
+- An internet connection for the first build, because CMake downloads raylib 5.5. cJSON and the Inter font are vendored in `third_party/`.
+
+### 2. Create a Spotify developer app
+1. Go to https://developer.spotify.com/dashboard and create an app.
+2. Add the redirect URI `http://127.0.0.1:8888/callback`.
+3. If the app is in Development mode, add your Spotify account under **User Management**.
+4. Copy the app's **Client ID**. You don't need a client secret: sign-in uses PKCE.
+
+### 3. Get a Soloist API key (for playback on this Mac)
+Generate a key at https://developer.spotify.com/dashboard/soloist. Keep it secret; the app never logs it. You can skip this step. Without a key the app still controls your other devices, and you can paste a key later (Devices → "Enable playback on this computer").
+
+### 4. Configure `.env`
+```sh
+git clone https://github.com/amcnutt1996/Smalltify-Player.git
+cd Smalltify-Player
+cp .env.example .env
+```
+Edit `.env` and fill in `SPOTIFY_CLIENT_ID=` and, if you have one, `SOLOIST_API_KEY=`. `.env` is git-ignored. The build copies only these two lines into the app bundle and never copies a client secret.
+
+### 5. Build and test
+```sh
+cmake -S . -B build
+cmake --build build -j
+ctest --test-dir build
+```
+This produces `build/dist/Smalltify Player.app`, signed ad hoc.
+
+### 6. Install
+Drag `build/dist/Smalltify Player.app` to `/Applications` and open it from there, Launchpad or the Dock. Always open the `.app`, because double-clicking the bare `smalltify-player` file inside it opens Terminal.
+
+### 7. First launch
+1. Click **Sign in with Spotify** and approve the request in your browser. The player opens right away.
+2. When macOS asks whether "Smalltify Player" may find devices on your local network, click **Allow**. Otherwise Spotify Connect can't see the player.
+3. **Pair once.** Spotify lets Soloist sign in only after an official Spotify app on the same network picks it once. Open Spotify on your phone. The app downloads Soloist from Spotify into its folder (Soloist can't be bundled) and starts it. It then shows a tip naming this Mac's device, "Smalltify Player (<Mac name>)". Choose that device once in the phone's Spotify device list. If no other device of your account shows up for 10 minutes, the unpaired Soloist stops again to save battery.
+4. Done. The pairing is saved inside the app. From now on, Play streams on this Mac after every restart, with no phone needed. Restarts, rebuilds and Soloist updates keep the pairing; only **Log out** or deleting the app clears it.
+
+## Where the app keeps its files
+Everything lives in one folder, and the app writes nothing outside it (no cache directory, AppData or registry). On macOS that folder is `Smalltify Player.app/Contents/Resources`:
 
 ```
 smalltify-player[.exe]   the app (GUI with no args, CLI with a command)
@@ -17,25 +73,10 @@ data/soloist-cache/      Soloist's playback cache (capped at 100 MB)
 data/soloist-home/       Soloist's HOME/TMPDIR, so its OS caches stay here too
 ```
 
-Copy or move the folder anywhere. Delete it to uninstall.
+Drag the app to the Trash to uninstall everything. If the bundle's `.env` has no Soloist key, paste one on the key screen and press **Save**, which writes it to the bundle's `.env`.
 
-## Install on macOS
-**Ready to install:** `build/dist/Smalltify Player.app` (built 2026-11-06 with your client ID and Soloist key; signed ad hoc, `codesign --verify` passes).
-
-First run, once:
-1. Drag `build/dist/Smalltify Player.app` to `/Applications` and open it.
-2. Click **Sign in with Spotify** and approve the request in your browser.
-3. When macOS asks whether the app may find devices on your local network, click **Allow**.
-4. With Spotify open on your phone, the app shows a tip naming this Mac's device ("Smalltify Player (<Mac name>)"). Choose that device once in the phone's Spotify device list.
-5. Done. The pairing is saved inside the app. From now on Play streams on this Mac after every restart, with no phone needed. Only **Log out** or deleting the app clears it.
-
-The macOS build is an app bundle: `build/dist/Smalltify Player.app` (macOS 13 or newer, Apple silicon for local playback). Drag it to `/Applications` and open it from there, Launchpad or the Dock. Always open the `.app`: double-clicking the bare `smalltify-player` file inside it opens Terminal.
-
-Inside the bundle, the app folder above is `Smalltify Player.app/Contents/Resources` (`.env`, `soloist/`, `data/`). Drag the app to the Trash to uninstall everything. The build seeds that `.env` with the `SPOTIFY_CLIENT_ID` and `SOLOIST_API_KEY` lines of the repo `.env` (never the client secret). Without a key, paste it on the key screen and press **Save**, which writes it to the bundle's `.env`.
-
-- The app writes into its own bundle, so keep it in a folder you can write to (`/Applications` works for admin accounts). From a read-only place (a disk image, or a downloaded copy macOS runs from a temporary location), it asks you to move it first.
+- The app writes into its own bundle, so keep it in a folder you can write to (`/Applications` works for admin accounts). If it runs from a read-only place (a disk image, or a downloaded copy that macOS runs from a temporary location), it asks you to move it first.
 - It is ad-hoc signed, not notarized. After the first run, `codesign --verify` reports the bundle as modified because of the files in `Contents/Resources`. That's expected.
-- On first pairing, macOS asks to let "Smalltify Player" find devices on your local network. Allow it, or Spotify Connect can't see the player.
 - CLI: `"/Applications/Smalltify Player.app/Contents/MacOS/smalltify-player" now`, etc.
 
 ## Using the player
@@ -54,22 +95,9 @@ Not available, because Spotify's Web API doesn't offer them: Home, Browse, Made 
 
 Sign-ins from before this version are missing four permissions (liking and saving, following artists, followed artists, recently played). The app asks once per launch to sign in again; **Later** keeps the player running, and Artists and Recently played show a **Sign in again** button until you do.
 
-## Setup
-1. Create an app at https://developer.spotify.com/dashboard.
-   - Add the redirect URI `http://127.0.0.1:8888/callback`.
-   - If the app is in Development mode, add your account under User Management.
-2. Put `SPOTIFY_CLIENT_ID=<your id>` in `.env` next to the binary. No client secret is needed or used: sign-in is PKCE.
-3. Generate a Soloist API key at https://developer.spotify.com/dashboard/soloist and add `SOLOIST_API_KEY=<your key>` to `.env`. Without a key the app can still control your other devices (Devices → "Enable playback on this computer" opens the key screen). Keep the key secret: the app never logs it.
-4. Launch and **sign in with Spotify** in the browser. The player opens right away.
-5. **Pair once.** This computer's device is "Smalltify Player (<hostname>)". Spotify lets Soloist sign in only when an official Spotify app on the same network picks it, once. When another device of your account is online (say your iPhone), the app quietly fetches Soloist from Spotify into `soloist/` (it can't be bundled), starts it so it appears in that device's Spotify device list, and shows one dismissible tip: "in Spotify on iPhone, choose 'Smalltify Player (…)'". Pick it there once. With no other device seen for 10 minutes, the unpaired Soloist stops again to save battery.
-
-   After pairing, Soloist starts with the app every time, under the same name and `data/soloist/`, and library picks and Play play on this computer. Restarts, rebuilds and Soloist updates keep the pairing; only **Log out** removes it.
-
 Pressing Play plays on the active device, else this computer (once paired), else any other available device of your account ("Playing on iPhone"). With nothing available the status line says how to get a device.
 
-Playback control needs Spotify Premium.
-
-### Soloist updates
+## Soloist updates
 Soloist builds expire 90 days after their build date. The app checks the build at every start and downloads a new one when it's missing or expired, and when it expires within 7 days at most once a day (Spotify may still serve the same build; the check time is kept in `data/soloist-check`). A download is unpacked into `soloist.new/`, run once to check it, and only then swapped in, so a bad download never breaks a working build. A build expiring while the app runs is replaced once and restarted; if Soloist stops otherwise, the player shows **Restart Soloist** (which re-reads the key from `.env`) and **Change key**. `smalltify-player engine --update` forces a fresh download. Spotify publishes builds for macOS on Apple silicon, Windows x64, and Linux (x86_64, arm64, arm32), but not for Intel Macs or Windows on ARM. There the app controls other devices only.
 
 ## CLI
@@ -91,15 +119,6 @@ smalltify-player queue <uri>               me
 
 `list` prints one page (`--all` follows every page) as `N. name - sub (length)  uri`; `search` prints the same format. `like`/`unlike` save to or remove from your library (songs, albums, shows, episodes, artists), `saved` checks them, `queue` adds a song or episode to the queue, and `me` prints your account name and the Liked Songs URI.
 
-## Build
-You need CMake ≥ 3.20, a C11 compiler, and libcurl (development files).
-```
-cmake -S . -B build
-cmake --build build -j
-ctest --test-dir build
-```
-The output goes to `build/dist/`. raylib 5.5 is fetched by CMake, and cJSON is vendored in `third_party/`. At runtime, extracting Soloist uses the system `tar` (part of macOS and Windows 10 1803+; on Linux `/usr/bin/tar` or `/bin/tar`).
-
 ## Layout
 | File | Role |
 |---|---|
@@ -114,3 +133,10 @@ The output goes to `build/dist/`. raylib 5.5 is fetched by CMake, and cJSON is v
 | `src/ui.c` | raylib GUI, event-driven (≈0% CPU when idle); Library panel, Settings, embedded Inter font |
 | `src/browse.c` | Pure Library-panel helpers: what a click plays, row texts, search grouping, list cap |
 | `src/cli.c` | CLI commands |
+
+## License
+Smalltify Player is released under the [MIT License](LICENSE).
+
+Third-party components keep their own licenses: cJSON (MIT, `third_party/cjson/LICENSE`), the Inter font (SIL OFL 1.1, `third_party/inter/LICENSE.txt`) and raylib (zlib, fetched at build time). Spotify Soloist is not included; the app downloads it from Spotify, and it is covered by Spotify's own terms.
+
+Not affiliated with or endorsed by Spotify. Spotify is a trademark of Spotify AB.
