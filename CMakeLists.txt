@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(spotify_c_player VERSION 0.1.0 LANGUAGES C)
+project(smalltify_player VERSION 0.1.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -8,7 +8,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Portable output folder: everything the app needs sits next to the binary.
-set(SCP_DIST_DIR ${CMAKE_BINARY_DIR}/dist)
+set(SMP_DIST_DIR ${CMAKE_BINARY_DIR}/dist)
 
 # --- dependencies ----------------------------------------------------------
 find_package(CURL REQUIRED)
@@ -52,122 +52,122 @@ target_include_directories(cjson PUBLIC third_party/cjson)
 # GUI font: a subset of Inter (SIL OFL 1.1; third_party/inter/subset.py
 # makes it), compiled in as a byte array so the app needs no font file.
 # Regenerated at configure time whenever the .ttf changes.
-set(SCP_FONT ${CMAKE_SOURCE_DIR}/third_party/inter/Inter-Regular.subset.ttf)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${SCP_FONT})
-file(READ ${SCP_FONT} SCP_FONT_BYTES HEX)
-string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," SCP_FONT_BYTES "${SCP_FONT_BYTES}")
-string(REGEX REPLACE "((0x..,){16})" "\\1\n" SCP_FONT_BYTES "${SCP_FONT_BYTES}")
+set(SMP_FONT ${CMAKE_SOURCE_DIR}/third_party/inter/Inter-Regular.subset.ttf)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${SMP_FONT})
+file(READ ${SMP_FONT} SMP_FONT_BYTES HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," SMP_FONT_BYTES "${SMP_FONT_BYTES}")
+string(REGEX REPLACE "((0x..,){16})" "\\1\n" SMP_FONT_BYTES "${SMP_FONT_BYTES}")
 file(CONFIGURE OUTPUT ${CMAKE_BINARY_DIR}/ui_font.c CONTENT
-  "/* Generated from third_party/inter/Inter-Regular.subset.ttf by CMakeLists.txt. */\nconst unsigned char ui_font_ttf[] = {\n@SCP_FONT_BYTES@};\nconst unsigned int ui_font_ttf_len = sizeof ui_font_ttf;\n"
+  "/* Generated from third_party/inter/Inter-Regular.subset.ttf by CMakeLists.txt. */\nconst unsigned char ui_font_ttf[] = {\n@SMP_FONT_BYTES@};\nconst unsigned int ui_font_ttf_len = sizeof ui_font_ttf;\n"
   @ONLY)
 
 # --- app -------------------------------------------------------------------
-# scp_core = every module except main.c. Static lib: tests and the exe pull
+# smp_core = every module except main.c. Static lib: tests and the exe pull
 # in only the objects they reference.
-file(GLOB SCP_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.c)
-list(REMOVE_ITEM SCP_SOURCES ${CMAKE_SOURCE_DIR}/src/main.c)
-add_library(scp_core STATIC ${SCP_SOURCES} ${CMAKE_BINARY_DIR}/ui_font.c)
-target_include_directories(scp_core PUBLIC src)
-target_include_directories(scp_core PRIVATE third_party/inter)
-target_link_libraries(scp_core PUBLIC raylib cjson CURL::libcurl Threads::Threads)
+file(GLOB SMP_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.c)
+list(REMOVE_ITEM SMP_SOURCES ${CMAKE_SOURCE_DIR}/src/main.c)
+add_library(smp_core STATIC ${SMP_SOURCES} ${CMAKE_BINARY_DIR}/ui_font.c)
+target_include_directories(smp_core PUBLIC src)
+target_include_directories(smp_core PRIVATE third_party/inter)
+target_link_libraries(smp_core PUBLIC raylib cjson CURL::libcurl Threads::Threads)
 if(WIN32)
   # platform.c uses Vista+ APIs (SRW locks, condition variables); MinGW
   # headers default to an older target.
-  target_compile_definitions(scp_core PRIVATE _WIN32_WINNT=0x0601)
-  target_link_libraries(scp_core PUBLIC ws2_32 bcrypt)
+  target_compile_definitions(smp_core PRIVATE _WIN32_WINNT=0x0601)
+  target_link_libraries(smp_core PUBLIC ws2_32 bcrypt)
 endif()
 if(APPLE)
-  target_link_libraries(scp_core PUBLIC "-framework CoreServices") # quit Apple event
+  target_link_libraries(smp_core PUBLIC "-framework CoreServices") # quit Apple event
 endif()
 if(MSVC)
-  target_compile_options(scp_core PRIVATE /W4)
+  target_compile_options(smp_core PRIVATE /W4)
 else()
-  target_compile_options(scp_core PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(smp_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 # The app folder (.env, data/, soloist/; see plat_app_dir). On macOS the app
 # is a bundle with the data in Contents/Resources: drag it to Applications,
 # drag it to the Trash to uninstall everything.
-add_executable(spotify-c-player src/main.c)
-target_link_libraries(spotify-c-player PRIVATE scp_core)
+add_executable(smalltify-player src/main.c)
+target_link_libraries(smalltify-player PRIVATE smp_core)
 if(APPLE)
-  set(SCP_APP_NAME "Spotify C Player")
-  set(SCP_EXE_NAME spotify-c-player)
-  set(SCP_BUNDLE "${SCP_DIST_DIR}/${SCP_APP_NAME}.app")
-  set(SCP_APP_DIR "${SCP_BUNDLE}/Contents/Resources")
+  set(SMP_APP_NAME "Smalltify Player")
+  set(SMP_EXE_NAME smalltify-player)
+  set(SMP_BUNDLE "${SMP_DIST_DIR}/${SMP_APP_NAME}.app")
+  set(SMP_APP_DIR "${SMP_BUNDLE}/Contents/Resources")
   # Assembled by hand rather than with MACOSX_BUNDLE, which names the bundle
-  # after the executable; the app is "Spotify C Player.app" but the binary
+  # after the executable; the app is "Smalltify Player.app" but the binary
   # keeps the CLI name.
-  set_target_properties(spotify-c-player PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${SCP_BUNDLE}/Contents/MacOS")
+  set_target_properties(smalltify-player PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${SMP_BUNDLE}/Contents/MacOS")
   # CMake creates the output folder only at configure time; recreate it if
   # the bundle was deleted since.
-  add_custom_command(TARGET spotify-c-player PRE_LINK
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${SCP_BUNDLE}/Contents/MacOS"
+  add_custom_command(TARGET smalltify-player PRE_LINK
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${SMP_BUNDLE}/Contents/MacOS"
     VERBATIM)
 else()
-  set(SCP_APP_DIR ${SCP_DIST_DIR})
-  set_target_properties(spotify-c-player PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${SCP_DIST_DIR})
+  set(SMP_APP_DIR ${SMP_DIST_DIR})
+  set_target_properties(smalltify-player PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${SMP_DIST_DIR})
 endif()
 if(WIN32)
   # GUI subsystem: launching never opens a console window. CLI commands
   # attach to the parent's console (plat_startup). MSVC keeps main() as the
   # entry point; MinGW's -mwindows (added by WIN32_EXECUTABLE) already does.
-  set_target_properties(spotify-c-player PROPERTIES WIN32_EXECUTABLE ON)
+  set_target_properties(smalltify-player PROPERTIES WIN32_EXECUTABLE ON)
   if(MSVC)
-    target_link_options(spotify-c-player PRIVATE /ENTRY:mainCRTStartup)
+    target_link_options(smalltify-player PRIVATE /ENTRY:mainCRTStartup)
   endif()
 endif()
 
 # Seed <app>/.env at build time; see packaging/seed_env.cmake (only the
 # client ID and Soloist key lines of the repo .env, never the secret; a
 # rebuild refreshes them only when the repo .env changed).
-set(SCP_ENV_STAMP ${CMAKE_BINARY_DIR}/env.stamp)
-add_custom_target(scp_env ALL
-  COMMAND ${CMAKE_COMMAND} -DSRC_DIR=${CMAKE_SOURCE_DIR} -DDEST=${SCP_APP_DIR}/.env
-          -DSTAMP=${SCP_ENV_STAMP} -P ${CMAKE_SOURCE_DIR}/packaging/seed_env.cmake
-  BYPRODUCTS ${SCP_ENV_STAMP}
+set(SMP_ENV_STAMP ${CMAKE_BINARY_DIR}/env.stamp)
+add_custom_target(smp_env ALL
+  COMMAND ${CMAKE_COMMAND} -DSRC_DIR=${CMAKE_SOURCE_DIR} -DDEST=${SMP_APP_DIR}/.env
+          -DSTAMP=${SMP_ENV_STAMP} -P ${CMAKE_SOURCE_DIR}/packaging/seed_env.cmake
+  BYPRODUCTS ${SMP_ENV_STAMP}
   VERBATIM)
 
 # The font's license goes with the app, as the OFL asks.
-set(SCP_FONT_LICENSE "${SCP_APP_DIR}/Inter-LICENSE.txt")
-add_custom_command(OUTPUT ${SCP_FONT_LICENSE}
-  COMMAND ${CMAKE_COMMAND} -E make_directory ${SCP_APP_DIR}
+set(SMP_FONT_LICENSE "${SMP_APP_DIR}/Inter-LICENSE.txt")
+add_custom_command(OUTPUT ${SMP_FONT_LICENSE}
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${SMP_APP_DIR}
   COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/third_party/inter/LICENSE.txt
-          ${SCP_FONT_LICENSE}
+          ${SMP_FONT_LICENSE}
   DEPENDS ${CMAKE_SOURCE_DIR}/third_party/inter/LICENSE.txt
   VERBATIM)
-add_custom_target(scp_font_license ALL DEPENDS ${SCP_FONT_LICENSE})
+add_custom_target(smp_font_license ALL DEPENDS ${SMP_FONT_LICENSE})
 
 if(APPLE)
-  find_program(SCP_CODESIGN codesign REQUIRED)
+  find_program(SMP_CODESIGN codesign REQUIRED)
   configure_file(packaging/macos/Info.plist.in ${CMAKE_BINARY_DIR}/Info.plist @ONLY)
-  set(SCP_ICON ${CMAKE_SOURCE_DIR}/packaging/macos/AppIcon.icns)
-  set(SCP_SIGN_STAMP ${CMAKE_BINARY_DIR}/bundle.stamp)
+  set(SMP_ICON ${CMAKE_SOURCE_DIR}/packaging/macos/AppIcon.icns)
+  set(SMP_SIGN_STAMP ${CMAKE_BINARY_DIR}/bundle.stamp)
   # Ad-hoc signature (no developer ID; fine for a locally built app). Only
   # re-signed when the binary, plist, icon, font license or seeded .env
   # change: anything the app writes into Contents/Resources at runtime makes
   # `codesign --verify` report modified contents, which is expected.
-  add_custom_command(OUTPUT ${SCP_SIGN_STAMP}
+  add_custom_command(OUTPUT ${SMP_SIGN_STAMP}
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/Info.plist
-            "${SCP_BUNDLE}/Contents/Info.plist"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SCP_ICON} "${SCP_APP_DIR}/AppIcon.icns"
-    COMMAND ${SCP_CODESIGN} --force --sign - --options runtime "${SCP_BUNDLE}"
-    COMMAND ${CMAKE_COMMAND} -E touch ${SCP_SIGN_STAMP}
-    DEPENDS spotify-c-player scp_env ${SCP_ENV_STAMP} ${CMAKE_BINARY_DIR}/Info.plist ${SCP_ICON}
-            scp_font_license ${SCP_FONT_LICENSE}
-    COMMENT "Signing ${SCP_APP_NAME}.app (ad hoc)"
+            "${SMP_BUNDLE}/Contents/Info.plist"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SMP_ICON} "${SMP_APP_DIR}/AppIcon.icns"
+    COMMAND ${SMP_CODESIGN} --force --sign - --options runtime "${SMP_BUNDLE}"
+    COMMAND ${CMAKE_COMMAND} -E touch ${SMP_SIGN_STAMP}
+    DEPENDS smalltify-player smp_env ${SMP_ENV_STAMP} ${CMAKE_BINARY_DIR}/Info.plist ${SMP_ICON}
+            smp_font_license ${SMP_FONT_LICENSE}
+    COMMENT "Signing ${SMP_APP_NAME}.app (ad hoc)"
     VERBATIM)
-  add_custom_target(scp_bundle ALL DEPENDS ${SCP_SIGN_STAMP})
+  add_custom_target(smp_bundle ALL DEPENDS ${SMP_SIGN_STAMP})
 endif()
 
 # --- tests: tests/test_<name>.c -> ctest target test_<name> -----------------
 enable_testing()
-file(GLOB SCP_TESTS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/test_*.c)
-foreach(t ${SCP_TESTS})
+file(GLOB SMP_TESTS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/test_*.c)
+foreach(t ${SMP_TESTS})
   get_filename_component(n ${t} NAME_WE)
   add_executable(${n} ${t})
-  target_link_libraries(${n} PRIVATE scp_core)
+  target_link_libraries(${n} PRIVATE smp_core)
   # Release flags add -DNDEBUG; tests rely on assert().
   target_compile_options(${n} PRIVATE $<IF:$<C_COMPILER_ID:MSVC>,/UNDEBUG,-UNDEBUG>)
   add_test(NAME ${n} COMMAND ${n})

@@ -1,4 +1,4 @@
-## Spotify C Player
+## Smalltify Player
 This app is meant to be a lightweight spotify player that anyone can use on any OS.
 Written in C only.
 

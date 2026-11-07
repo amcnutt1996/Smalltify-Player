@@ -1,7 +1,7 @@
-# Spotify C Player: build report (2026-11-06)
+# Smalltify Player: build report (2026-11-06)
 
 ## Status
-**Rebuilt with the readability and library update.** The installable app is **`build/dist/Spotify C Player.app`** (836 KB, macOS 13+, ad-hoc signed, `codesign --verify` passes, empty `data/`). Your client ID and Soloist key are already in it. The old `/Applications` copy was removed at your request, so this is a fresh install: drag the app to /Applications → sign in with your browser (this sign-in grants the new permissions too) → allow Local Network → pick this Mac's device once in Spotify on your phone.
+**Renamed to Smalltify Player and rebuilt from a clean build folder.** The installable app is **`build/dist/Smalltify Player.app`** (836 KB, macOS 13+, ad-hoc signed, `codesign --verify` passes, empty `data/`, bundle id `com.smalltifyplayer.app`, binary `smalltify-player`). Your client ID and Soloist key are already in it. The old `Spotify C Player.app` was removed from `/Applications` together with its system leftovers (see Housekeeping), so this is a fresh install: drag the app to /Applications → sign in with your browser → allow Local Network (asked again because the bundle id changed) → pick "Smalltify Player (<Mac name>)" once in Spotify on your phone.
 
 Not verified on real hardware: the minimized pairing poll switching to 15 s, a clean long idle-CPU measurement on the player screen, and the Linux/Windows code paths (never compiled here).
 
@@ -61,5 +61,6 @@ You approved both sign-ins with your real account, and everything worked: now pl
 - Pairing needs local-network discovery. A VPN, guest Wi-Fi or client isolation can hide the device.
 
 ## Housekeeping
-- **Cleanup:** all dev services, agents, scratch folders and worktrees are stopped or deleted. No `spotify-c-player`, `soloist` or `librespot` processes are running.
+- **Cleanup:** all dev services, agents, scratch folders and worktrees are stopped or deleted. No `smalltify-player`, `soloist` or `librespot` processes are running.
 - **Secrets:** the client secret in your `.env` is never read and never copied into build output. The repo `.env` is gitignored.
+- **Old name removed:** the `com.spotifycplayer.app` shader cache and the `soloist` CFNetwork cache in `DARWIN_USER_CACHE_DIR`, old crash reports, `/tmp` build scratch and 11 stale Launch Services registrations were deleted. One entry remains: macOS's Local Network record for `com.spotifycplayer.app` in the root-owned `/Library/Preferences/com.apple.networkextension.plist`. It is inert without the app; clear it in System Settings → Privacy & Security → Local Network if listed.

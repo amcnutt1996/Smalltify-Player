@@ -7,7 +7,7 @@
 
 #include "platform.h"
 
-#define HTTP_USER_AGENT        "spotify-c-player/0.1"
+#define HTTP_USER_AGENT        "smalltify-player/0.1"
 #define HTTP_CONNECT_TIMEOUT_MS 5000L
 #define HTTP_TOTAL_TIMEOUT_MS   15000L
 #define HTTP_STALL_BYTES_PER_S  1024L /* download mode: slower than this... */

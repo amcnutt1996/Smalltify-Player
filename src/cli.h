@@ -1,11 +1,11 @@
-/* Command-line front end: `spotify-c-player <command> [args]`.
+/* Command-line front end: `smalltify-player <command> [args]`.
  * Each command returns a process exit code. */
 #ifndef CLI_H
 #define CLI_H
 
 #include "config.h"
 
-#define CLI_PROG "spotify-c-player"
+#define CLI_PROG "smalltify-player"
 
 typedef struct {
     const char *name;

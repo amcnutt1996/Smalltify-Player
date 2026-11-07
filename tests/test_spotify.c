@@ -192,7 +192,7 @@ static void test_strerror(void)
 
 static const char DEVICES_JSON[] =
     "{\"devices\":["
-    "{\"id\":\"a1\",\"is_active\":false,\"name\":\"Spotify C Player\",\"type\":\"Computer\",\"volume_percent\":70},"
+    "{\"id\":\"a1\",\"is_active\":false,\"name\":\"Smalltify Player\",\"type\":\"Computer\",\"volume_percent\":70},"
     "{\"id\":\"b2\",\"is_active\":true,\"name\":\"Kitchen\",\"type\":\"Speaker\",\"volume_percent\":null},"
     "{\"id\":null,\"is_active\":false,\"name\":\"Restricted TV\",\"type\":\"TV\"}]}";
 
@@ -203,7 +203,7 @@ static void test_devices(void)
 
     assert(sp_parse_devices(DEVICES_JSON, d, 4, &n) == SP_OK);
     assert(n == 3);
-    assert(!strcmp(d[0].id, "a1") && !strcmp(d[0].name, "Spotify C Player"));
+    assert(!strcmp(d[0].id, "a1") && !strcmp(d[0].name, "Smalltify Player"));
     assert(!strcmp(d[0].type, "Computer") && d[0].volume == 70 && !d[0].is_active);
     assert(d[1].is_active && d[1].volume == -1); /* null volume_percent */
     assert(d[2].id[0] == '\0' && d[2].volume == -1 && !strcmp(d[2].type, "TV"));
@@ -770,7 +770,7 @@ static void test_fmt_time(void)
 /* Where Play goes: our device, the active one, any other, or nowhere. */
 static void test_pick_device(void)
 {
-    const char *me = "Spotify C Player (mac)";
+    const char *me = "Smalltify Player (mac)";
     Device d[3];
     memset(d, 0, sizeof d);
     snprintf(d[0].id, sizeof d[0].id, "phone");

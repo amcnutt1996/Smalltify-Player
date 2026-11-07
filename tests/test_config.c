@@ -261,15 +261,15 @@ static void test_device_name(void)
 {
     char out[CFG_DEVICE_NAME_LEN];
     config_device_name("laptop", out, sizeof out);
-    assert(!strcmp(out, "Spotify C Player (laptop)"));
+    assert(!strcmp(out, "Smalltify Player (laptop)"));
     config_device_name("Gregs-MacBook-Pro.local", out, sizeof out);
-    assert(!strcmp(out, "Spotify C Player (Gregs-MacBook-Pro)"));
+    assert(!strcmp(out, "Smalltify Player (Gregs-MacBook-Pro)"));
     config_device_name("", out, sizeof out);
-    assert(!strcmp(out, "Spotify C Player"));
+    assert(!strcmp(out, "Smalltify Player"));
     config_device_name(".local", out, sizeof out);
-    assert(!strcmp(out, "Spotify C Player"));
+    assert(!strcmp(out, "Smalltify Player"));
     config_device_name("a\tb\nc", out, sizeof out); /* control characters dropped */
-    assert(!strcmp(out, "Spotify C Player (abc)"));
+    assert(!strcmp(out, "Smalltify Player (abc)"));
 
     /* Long names are cut to fit, never inside a UTF-8 character. */
     char host[200];
@@ -277,13 +277,13 @@ static void test_device_name(void)
     host[sizeof host - 1] = 0;
     config_device_name(host, out, sizeof out);
     assert(strlen(out) == sizeof out - 1 && out[strlen(out) - 1] == ')');
-    char small[24]; /* "Spotify C Player (" is 18 bytes: room for 4 */
+    char small[24]; /* "Smalltify Player (" is 18 bytes: room for 4 */
     config_device_name("ab\xC3\xA9z", small, sizeof small);  /* "abéz": 5 bytes */
-    assert(!strcmp(small, "Spotify C Player (ab\xC3\xA9)"));
+    assert(!strcmp(small, "Smalltify Player (ab\xC3\xA9)"));
     config_device_name("abc\xC3\xA9", small, sizeof small);  /* é would straddle */
-    assert(!strcmp(small, "Spotify C Player (abc)"));
+    assert(!strcmp(small, "Smalltify Player (abc)"));
     config_device_name("x", small, 10);                   /* no room for a host */
-    assert(!strcmp(small, "Spotify C"));
+    assert(!strcmp(small, "Smalltify"));
 }
 
 int main(void)

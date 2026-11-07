@@ -1612,7 +1612,7 @@ static void draw_setup(Ui *u)
         u->text_dirty = 0;
     }
     float y = 48;
-    text_center(u, "Spotify C Player", y, FS_L, C_TEXT);
+    text_center(u, "Smalltify Player", y, FS_L, C_TEXT);
     y += (float)m->fl + 28;
     y += para(u, "A Spotify client ID is needed.", PAD, y, maxw, C_TEXT) + 14;
     y += para(u, "Add this line to the file:", PAD, y, maxw, C_DIM) + 8;
@@ -1647,11 +1647,11 @@ static void draw_move(Ui *u)
 {
     const Metrics *m = &u->m;
     float y = 120;
-    text_center(u, "Spotify C Player", y, FS_L, C_TEXT);
+    text_center(u, "Smalltify Player", y, FS_L, C_TEXT);
     y += (float)m->fl + 36;
     text_center(u, "This folder is read-only.", y, FS_S, C_ERR);
     y += (float)m->fs + 18;
-    text_center(u, "Move Spotify C Player to Applications", y, FS_S, C_TEXT);
+    text_center(u, "Move Smalltify Player to Applications", y, FS_S, C_TEXT);
     y += m->line;
     text_center(u, "(or another writable folder)", y, FS_S, C_TEXT);
     y += m->line;
@@ -1749,7 +1749,7 @@ static void end_reauth(Ui *u, int signed_in)
 static void draw_login(Ui *u)
 {
     const Metrics *m = &u->m;
-    text_center(u, "Spotify C Player", 120, FS_L, C_TEXT);
+    text_center(u, "Smalltify Player", 120, FS_L, C_TEXT);
     if (u->login_th) {
         plat_mutex_lock(u->mu);
         int done = u->login_done, rc = u->login_rc;
@@ -1899,7 +1899,7 @@ static void draw_key(Ui *u)
     int enter = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER);
 
     float y = 48;
-    text_center(u, "Spotify C Player", y, FS_L, C_TEXT);
+    text_center(u, "Smalltify Player", y, FS_L, C_TEXT);
     y += (float)m->fl + 28;
     y += para(u, "To play music on this computer, it needs\na Spotify Soloist API key (optional).",
               PAD, y, maxw, C_TEXT) + 16;
@@ -3044,7 +3044,7 @@ int ui_run(const Config *cfg)
                    FLAG_WINDOW_ALWAYS_RUN);
     /* A new window shows the art WIN_ART tall at the chosen text size. */
     Metrics m0 = metrics_for(u->cfg.font_size);
-    InitWindow(WIN_W, (int)ceilf(player_reserve(&m0) + WIN_ART), "Spotify C Player");
+    InitWindow(WIN_W, (int)ceilf(player_reserve(&m0) + WIN_ART), "Smalltify Player");
     if (!IsWindowReady()) {
         plat_mutex_free(u->mu);
         return 1;

@@ -412,9 +412,9 @@ static void reply(plat_sock c, const char *status, const char *msg)
     char body[512], head[256];
     int bn = snprintf(body, sizeof body,
                       "<!doctype html><html><head><meta charset=\"utf-8\">"
-                      "<title>Spotify C Player</title></head>"
+                      "<title>Smalltify Player</title></head>"
                       "<body style=\"font-family:sans-serif;text-align:center;margin-top:3em\">"
-                      "<h2>Spotify C Player</h2><p>%s</p><p>You can close this tab.</p>"
+                      "<h2>Smalltify Player</h2><p>%s</p><p>You can close this tab.</p>"
                       "</body></html>", msg);
     if (bn < 0 || (size_t)bn >= sizeof body)
         return;

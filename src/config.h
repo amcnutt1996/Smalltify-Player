@@ -18,7 +18,7 @@
 
 #define CFG_PATH_LEN 1024
 #define CFG_REDIRECT_PORT 8888
-#define CFG_DEVICE_NAME "Spotify C Player" /* prefix of Config.device_name */
+#define CFG_DEVICE_NAME "Smalltify Player" /* prefix of Config.device_name */
 #define CFG_DEVICE_NAME_LEN 64
 
 typedef struct {
@@ -37,7 +37,7 @@ typedef struct {
     char soloist_cache[CFG_PATH_LEN];/* <app>/data/soloist-cache */
     char soloist_home[CFG_PATH_LEN]; /* <app>/data/soloist-home */
     char redirect_uri[128];          /* http://127.0.0.1:8888/callback */
-    char device_name[CFG_DEVICE_NAME_LEN]; /* "Spotify C Player (<host>)": our Connect
+    char device_name[CFG_DEVICE_NAME_LEN]; /* "Smalltify Player (<host>)": our Connect
                                         device, unique per computer */
     char paired_path[CFG_PATH_LEN];  /* <app>/data/soloist-paired: marker */
     char name_path[CFG_PATH_LEN];    /* <app>/data/device-name: device_name as paired */
