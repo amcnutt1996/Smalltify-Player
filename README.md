@@ -6,6 +6,11 @@ A small, low-power Spotify player and remote for the desktop, written in plain C
 
 > **Built with AI:** This entire project was created, completed and orchestrated with AI using Claude Code.
 
+## Screenshots
+| Now playing | Library | Devices | Settings |
+|---|---|---|---|
+| <img src="docs/screenshots/player.png" width="200" alt="Now playing: album art, title, artist, progress, playback controls, volume"> | <img src="docs/screenshots/library.png" width="200" alt="Library: search, Liked Songs, playlists, albums, artists, podcasts, episodes, recently played, queue"> | <img src="docs/screenshots/devices.png" width="200" alt="Devices: Spotify Connect devices to play on"> | <img src="docs/screenshots/settings.png" width="200" alt="Settings: text size"> |
+
 ## What it's for
 The official Spotify desktop app is a large Chromium-based app that uses a lot of memory and battery. Smalltify Player covers everyday listening with a fraction of the footprint:
 
