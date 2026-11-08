@@ -703,7 +703,7 @@ typedef enum { PANEL_NONE, PANEL_LIBRARY, PANEL_DEVICES, PANEL_SETTINGS } Panel;
 
 /* Widget ids for the one widget that may hold the mouse. */
 enum {
-    W_NONE, W_RELOAD, W_SIGNIN, W_CANCEL, W_OPEN_URL, W_OPEN_KEY, W_BACK, W_CHANGE_KEY,
+    W_NONE, W_RELOAD, W_SIGNIN, W_CANCEL, W_OPEN_URL, W_OPEN_KEY, W_OPEN_DASH, W_BACK, W_CHANGE_KEY,
     W_RESTART, W_HINT_CLOSE, W_LATER,
     W_PREV, W_PLAY, W_NEXT, W_SEEK, W_VOLUME, W_SHUFFLE, W_REPEAT, W_LOGOUT, W_HEART,
     W_LIBRARY, W_LIB_BACK, W_LIB_PLAY, W_LIB_SIGNIN, W_DEVICES, W_DEV_REFRESH, W_SETTINGS,
@@ -848,6 +848,7 @@ typedef struct {
     float      wheel;         /* mouse wheel turned short of a whole row */
     char       query[SP_NAME_LEN];
     char       key_input[sizeof(((Config *)0)->soloist_key)]; /* key screen; secret */
+    char       id_input[sizeof(((Config *)0)->client_id)];    /* setup screen; public */
 } Ui;
 
 /* --- font and text ------------------------------------------------------- */
@@ -1603,6 +1604,71 @@ static void wrap_env_path(Ui *u, float maxw)
 }
 
 /* --- setup screen (no client id) ----------------------------------------- */
+#define SPOTIFY_DASHBOARD_URL "https://developer.spotify.com/dashboard"
+
+/* Letters, digits, '-' and '_': what seed_env.cmake accepts as a client ID. */
+static int client_id_ok(const char *s)
+{
+    if (!s[0])
+        return 0;
+    for (; *s; s++) {
+        int ok = (*s >= '0' && *s <= '9') || (*s >= 'A' && *s <= 'Z') ||
+                 (*s >= 'a' && *s <= 'z') || *s == '_' || *s == '-';
+        if (!ok)
+            return 0;
+    }
+    return 1;
+}
+
+/* edit_line drops control characters, so only the blanks of a paste are
+ * left to trim. */
+static void trim_blanks(char *s)
+{
+    size_t n = strlen(s), a = 0;
+    while (a < n && s[a] == ' ')
+        a++;
+    while (n > a && s[n - 1] == ' ')
+        n--;
+    memmove(s, s + a, n - a);
+    s[n - a] = 0;
+}
+
+/* Read .env again and go on once it has a client id; missing says why not. */
+static void setup_reload(Ui *u, const char *missing)
+{
+    u->setup_msg = NULL;
+    Config c;
+    if (config_load(&c) == 0)
+        u->cfg = c; /* no AuthStore exists yet, so nothing holds the old one */
+    u->text_dirty = 1;
+    if (!u->cfg.client_id[0])
+        u->setup_msg = missing;
+    else if (enter_app(u) != 0)
+        u->setup_msg = "Out of memory.";
+}
+
+/* Save the pasted client id into <app>/.env, then read .env again. The
+ * text stays in the box when the save fails, so it can be fixed. */
+static void setup_save(Ui *u)
+{
+    u->setup_msg = NULL;
+    trim_blanks(u->id_input);
+    if (!u->id_input[0]) {
+        setup_reload(u, "Still no SPOTIFY_CLIENT_ID in .env.");
+        return;
+    }
+    if (!client_id_ok(u->id_input)) {
+        u->setup_msg = "A Client ID has only letters, digits, - and _.";
+        return;
+    }
+    if (config_set_env_value(&u->cfg, "SPOTIFY_CLIENT_ID", u->id_input) != 0) {
+        u->setup_msg = "Could not save the Client ID to .env. Is the app folder writable?";
+        return;
+    }
+    memset(u->id_input, 0, sizeof u->id_input);
+    setup_reload(u, "Could not read the Client ID back from .env.");
+}
+
 static void draw_setup(Ui *u)
 {
     const Metrics *m = &u->m;
@@ -1611,35 +1677,47 @@ static void draw_setup(Ui *u)
         wrap_env_path(u, maxw);
         u->text_dirty = 0;
     }
+    /* The one field on this screen always has the keyboard. The client ID
+     * is public (PKCE), so it is shown as typed. */
+    edit_line(u->id_input, sizeof u->id_input, 0);
+    int enter = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER);
+
     float y = 48;
     text_center(u, "Smalltify Player", y, FS_L, C_TEXT);
     y += (float)m->fl + 28;
     y += para(u, "A Spotify client ID is needed.", PAD, y, maxw, C_TEXT) + 14;
-    y += para(u, "Add this line to the file:", PAD, y, maxw, C_DIM) + 8;
-    text(u, u->env_wrapped, PAD, y, FS_S, C_TEXT);
-    y += text_h(u, u->env_wrapped) + 16;
-    text(u, "SPOTIFY_CLIENT_ID=...", PAD, y, FS_S, C_ACCENT);
-    y += (float)m->fs + 18;
-    y += para(u, "Create the app at developer.spotify.com\nwith this redirect URI:", PAD, y, maxw,
-              C_DIM) + 8;
+    text(u, "1. Create an app at", PAD, y, FS_S, C_DIM);
+    y += m->line;
+    text(u, "developer.spotify.com/dashboard", PAD, y, FS_S, C_TEXT);
+    y += (float)m->fs + 8;
+    Rectangle ro = { PAD, y, btn_w(u, "Open the page", 120), (float)m->fs + 14 };
+    if (button(u, W_OPEN_DASH, ro, "Open the page", FS_S, 0) &&
+        plat_open_url(SPOTIFY_DASHBOARD_URL) != 0)
+        u->setup_msg = "Could not open the browser.";
+    y += ro.height + 12;
+    y += para(u, "Set this redirect URI in the app:", PAD, y, maxw, C_DIM) + 8;
     text(u, u->cfg.redirect_uri, PAD, y, FS_S, C_TEXT);
-    y += (float)m->fs + 26;
-
-    float bw = btn_w(u, "Reload", 120), bh = (float)m->fs + 22;
-    Rectangle rb = { ((float)u->w - bw) / 2.0f, y, bw, bh };
-    u->need_h = y + bh + 16 + (float)m->fs + PAD; /* a one-line message below */
-    if (button(u, W_RELOAD, rb, "Reload", FS_S, 0)) {
-        Config c;
-        if (config_load(&c) == 0)
-            u->cfg = c; /* no AuthStore exists yet, so nothing holds the old one */
-        u->text_dirty = 1;
-        if (!u->cfg.client_id[0])
-            u->setup_msg = "Still no SPOTIFY_CLIENT_ID in .env.";
-        else if (enter_app(u) != 0)
-            u->setup_msg = "Out of memory.";
+    y += (float)m->fs + 18;
+    text(u, "2. Paste its Client ID here and press Save:", PAD, y, FS_S, C_DIM);
+    y += (float)m->fs + 8;
+    float bw = fmaxf(btn_w(u, "Save", 72), btn_w(u, "Reload", 72)), gap = 6;
+    Rectangle box = { PAD, y, maxw - bw - gap, m->row };
+    Rectangle rb = { PAD + box.width + gap, y, bw, m->row };
+    draw_field(u, box, u->id_input, "Paste the Client ID");
+    /* Empty box: re-read a client ID added to .env by hand. */
+    if (button(u, W_RELOAD, rb, u->id_input[0] ? "Save" : "Reload", FS_S, 1) || enter) {
+        setup_save(u);
+        if (u->screen != SCR_SETUP)
+            return;
     }
-    if (u->setup_msg && u->screen == SCR_SETUP)
-        para_center(u, u->setup_msg, y + bh + 16, C_ERR);
+    y += m->row + 8;
+    if (u->setup_msg)
+        y += para_center(u, u->setup_msg, y, C_ERR) + 8;
+    y += para(u, "Or put SPOTIFY_CLIENT_ID=... in this file\nand press Reload:", PAD, y, maxw,
+              C_DIM) + 6;
+    text(u, u->env_wrapped, PAD, y, FS_S, C_TEXT);
+    y += text_h(u, u->env_wrapped);
+    u->need_h = y + (float)m->fs + PAD;
 }
 
 /* --- move screen (app folder not writable) -------------------------------- */

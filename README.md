@@ -19,11 +19,19 @@ The official Spotify desktop app is a large Chromium-based app that uses a lot o
 - **Remote control:** play, pause, skip, seek, volume, shuffle, repeat and device transfer for any Spotify Connect device.
 - **Library:** Liked Songs, playlists, albums, artists, podcasts, episodes, recently played, the queue and search.
 - **Scriptable:** every action is also a CLI command (`smalltify-player now`, `next`, `vol +10`, ...).
-- **Self-contained:** everything the app stores lives inside its own folder or app bundle. Delete it to uninstall.
+- **Self-contained and portable:** everything the app stores lives inside its own folder or app bundle. Delete it to uninstall, or carry the `.app` on a USB drive.
 
 Playback control needs a **Spotify Premium** account.
 
-## First-time setup (macOS)
+## Download (macOS)
+Needs macOS 13 or newer on Apple silicon.
+
+1. Download `Smalltify-Player-<version>-arm64.dmg` from [Releases](https://github.com/amcnutt1996/Smalltify-Player/releases).
+2. Open it and drag **Smalltify Player** to **Applications**, or to any folder or drive you can write to (see [Portable](#portable)).
+3. Release builds are signed with a Developer ID and notarized by Apple, so macOS opens them without a warning.
+4. The release ships with no Spotify Client ID. The setup screen asks for yours: create a Spotify developer app (step 2 below), paste its **Client ID** and press **Save**. Then continue with [First launch](#7-first-launch).
+
+## Build from source (macOS)
 
 ### 1. Prerequisites
 - macOS 13 or newer. Local playback needs Apple silicon, because Spotify publishes no Soloist build for Intel Macs. On an Intel Mac the app works as a remote only.
@@ -46,7 +54,7 @@ git clone https://github.com/amcnutt1996/Smalltify-Player.git
 cd Smalltify-Player
 cp .env.example .env
 ```
-Edit `.env` and fill in `SPOTIFY_CLIENT_ID=` and, if you have one, `SOLOIST_API_KEY=`. `.env` is git-ignored. The build copies only these two lines into the app bundle and never copies a client secret.
+Edit `.env` and fill in `SPOTIFY_CLIENT_ID=` and, if you have one, `SOLOIST_API_KEY=`. `.env` is git-ignored. A development build copies only these two lines into the app bundle and never copies a client secret. A release build (see [Releasing](#releasing-macos)) copies neither. You can also leave the ID out and paste it on the setup screen at first launch.
 
 ### 5. Build and test
 ```sh
@@ -60,7 +68,7 @@ This produces `build/dist/Smalltify Player.app`, signed ad hoc.
 Drag `build/dist/Smalltify Player.app` to `/Applications` and open it from there, Launchpad or the Dock. Always open the `.app`, because double-clicking the bare `smalltify-player` file inside it opens Terminal.
 
 ### 7. First launch
-1. Click **Sign in with Spotify** and approve the request in your browser. The player opens right away.
+1. If the app has no Client ID yet, paste yours on the setup screen and press **Save**. Then click **Sign in with Spotify** and approve the request in your browser. The player opens right away.
 2. When macOS asks whether "Smalltify Player" may find devices on your local network, click **Allow**. Otherwise Spotify Connect can't see the player.
 3. **Pair once.** Spotify lets Soloist sign in only after an official Spotify app on the same network picks it once. Open Spotify on your phone. The app downloads Soloist from Spotify into its folder (Soloist can't be bundled) and starts it. It then shows a tip naming this Mac's device, "Smalltify Player (<Mac name>)". Choose that device once in the phone's Spotify device list. If no other device of your account shows up for 10 minutes, the unpaired Soloist stops again to save battery.
 4. Done. The pairing is saved inside the app. From now on, Play streams on this Mac after every restart, with no phone needed. Restarts, rebuilds and Soloist updates keep the pairing; only **Log out** or deleting the app clears it.
@@ -83,8 +91,11 @@ data/soloist-home/       Soloist's HOME/TMPDIR, so its OS caches stay here too
 Drag the app to the Trash to uninstall everything. If the bundle's `.env` has no Soloist key, paste one on the key screen and press **Save**, which writes it to the bundle's `.env`.
 
 - The app writes into its own bundle, so keep it in a folder you can write to (`/Applications` works for admin accounts). If it runs from a read-only place (a disk image, or a downloaded copy that macOS runs from a temporary location), it asks you to move it first.
-- It is ad-hoc signed, not notarized. After the first run, `codesign --verify` reports the bundle as modified because of the files in `Contents/Resources`. That's expected.
+- A development build (`cmake --build build`) is ad-hoc signed, not notarized. After the first run, `codesign --verify` reports the bundle as modified because of the files in `Contents/Resources`. That's expected.
 - CLI: `"/Applications/Smalltify Player.app/Contents/MacOS/smalltify-player" now`, etc.
+
+### Portable
+The app keeps everything in its bundle on purpose, so a `.app` on a USB drive runs on any Apple silicon Mac with macOS 13 or newer, and it brings your sign-in, keys, pairing and settings along.
 
 ## Using the player
 The bottom bar has **Devices**, **Library**, **Settings** and **Log out**.
@@ -140,6 +151,15 @@ smalltify-player queue <uri>               me
 | `src/ui.c` | raylib GUI, event-driven (≈0% CPU when idle); Library panel, Settings, embedded Inter font |
 | `src/browse.c` | Pure Library-panel helpers: what a click plays, row texts, search grouping, list cap |
 | `src/cli.c` | CLI commands |
+
+## Releasing (macOS)
+Needs a Developer ID Application certificate in the keychain and a notary profile (one time: `xcrun notarytool store-credentials smalltify`, with an app-specific password).
+
+```sh
+cmake --build build --target release   # or packaging/macos/release.sh
+```
+This builds an arm64 release in `build-release/`, signs the app with the hardened runtime, makes `build/release/Smalltify-Player-<version>-arm64.dmg`, notarizes and staples it, then checks it with `codesign`, `spctl` and `stapler`. A release bundle ships `.env.example` unchanged, so it contains no Client ID and no Soloist key. Environment: `SMP_SIGN_ID` picks the signing identity, `SMP_NOTARY_PROFILE` the notary profile (default `smalltify`). `--no-notarize` skips Apple (`SMP_SIGN_ID=-` for an ad-hoc test build; Gatekeeper rejects it).
+
 
 ## License
 Smalltify Player is released under the [MIT License](LICENSE).

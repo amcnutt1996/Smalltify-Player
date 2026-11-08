@@ -1,4 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
+# Oldest macOS the app supports: the binary's minos and Info.plist's
+# LSMinimumSystemVersion both come from here. Set before project(); an empty
+# cached value (CMake's default when unset) gets this one.
+if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET 13.0 CACHE STRING "Minimum macOS version" FORCE)
+endif()
 project(smalltify_player VERSION 0.1.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
@@ -119,13 +125,16 @@ if(WIN32)
   endif()
 endif()
 
-# Seed <app>/.env at build time; see packaging/seed_env.cmake (only the
-# client ID and Soloist key lines of the repo .env, never the secret; a
-# rebuild refreshes them only when the repo .env changed).
+# Seed <app>/.env at build time; see packaging/seed_env.cmake. Dev builds
+# (SMP_SEED_ENV ON) carry the client ID and Soloist key lines of the repo
+# .env, never the secret; a rebuild refreshes them only when the repo .env
+# changed. Release builds (OFF) ship .env.example unchanged.
+option(SMP_SEED_ENV "Seed <app>/.env from the repo .env (dev builds)" ON)
 set(SMP_ENV_STAMP ${CMAKE_BINARY_DIR}/env.stamp)
 add_custom_target(smp_env ALL
   COMMAND ${CMAKE_COMMAND} -DSRC_DIR=${CMAKE_SOURCE_DIR} -DDEST=${SMP_APP_DIR}/.env
-          -DSTAMP=${SMP_ENV_STAMP} -P ${CMAKE_SOURCE_DIR}/packaging/seed_env.cmake
+          -DSTAMP=${SMP_ENV_STAMP} -DSEED=${SMP_SEED_ENV}
+          -P ${CMAKE_SOURCE_DIR}/packaging/seed_env.cmake
   BYPRODUCTS ${SMP_ENV_STAMP}
   VERBATIM)
 
@@ -159,6 +168,11 @@ if(APPLE)
     COMMENT "Signing ${SMP_APP_NAME}.app (ad hoc)"
     VERBATIM)
   add_custom_target(smp_bundle ALL DEPENDS ${SMP_SIGN_STAMP})
+  # `cmake --build build --target release`: signed, notarized DMG; see
+  # packaging/macos/release.sh. Not part of ALL.
+  add_custom_target(release
+    COMMAND ${CMAKE_SOURCE_DIR}/packaging/macos/release.sh
+    USES_TERMINAL VERBATIM)
 endif()
 
 # --- tests: tests/test_<name>.c -> ctest target test_<name> -----------------

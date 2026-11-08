@@ -1,13 +1,27 @@
 # Seed or refresh the app folder's .env at build time:
-#   cmake -DSRC_DIR=<repo> -DDEST=<app>/.env -DSTAMP=<build>/env.stamp -P seed_env.cmake
-# A missing DEST starts from .env.example. Only the SPOTIFY_CLIENT_ID and
-# SOLOIST_API_KEY lines of the repo .env are carried over; every other key
-# there (the client secret above all) never reaches the build output. An
-# existing DEST keeps every other line, and is rewritten only when those
-# repo lines changed since the last seed (STAMP holds their hash), so a key
-# saved in the app is not reverted by every rebuild. Values are never
-# printed.
+#   cmake -DSRC_DIR=<repo> -DDEST=<app>/.env -DSTAMP=<build>/env.stamp -DSEED=ON|OFF
+#         -P seed_env.cmake
+# SEED OFF (release builds) never reads the repo .env: DEST becomes a byte
+# copy of .env.example when it is missing; an existing DEST is left alone.
+# SEED ON (dev builds): a missing DEST starts from .env.example. Only the
+# SPOTIFY_CLIENT_ID and SOLOIST_API_KEY lines of the repo .env are carried
+# over; every other key there (the client secret above all) never reaches
+# the build output. An existing DEST keeps every other line, and is
+# rewritten only when those repo lines changed since the last seed (STAMP
+# holds their hash), so a key saved in the app is not reverted by every
+# rebuild. Values are never printed.
 cmake_minimum_required(VERSION 3.20)
+
+if(NOT SEED)
+  get_filename_component(dest_dir "${DEST}" DIRECTORY)
+  file(MAKE_DIRECTORY "${dest_dir}")
+  if(NOT EXISTS "${DEST}")
+    configure_file("${SRC_DIR}/.env.example" "${DEST}" COPYONLY)
+  endif()
+  file(CHMOD "${DEST}" PERMISSIONS OWNER_READ OWNER_WRITE)
+  file(WRITE "${STAMP}" "off\n")
+  return()
+endif()
 
 set(seeded "")
 foreach(key SPOTIFY_CLIENT_ID SOLOIST_API_KEY)
