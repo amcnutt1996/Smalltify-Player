@@ -1,4 +1,4 @@
-/* The Library panel's rules, apart from raylib so the tests can run them:
+/* The Library panel's rules, apart from the GUI so the tests can run them:
  * what a click plays, what a row says, how search results group, and how a
  * list grows. */
 #ifndef BROWSE_H

@@ -1,4 +1,4 @@
-/* The Library panel's rules (browse.h): no raylib, no network. */
+/* The Library panel's rules (browse.h): no GUI, no network. */
 #include "browse.h"
 
 #include <stdio.h>

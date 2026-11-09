@@ -92,7 +92,9 @@ sign() {
 }
 
 echo "==> Signing the app ($identity)"
-sign --options runtime "$stage"
+sign "$stage/Contents/Frameworks/libvulkan.1.dylib"
+sign "$stage/Contents/Frameworks/libMoltenVK.dylib"
+sign --options runtime --entitlements "$root/packaging/macos/entitlements.plist" "$stage"
 codesign --verify --strict --deep -vv "$stage"
 
 # --- disk image -----------------------------------------------------------

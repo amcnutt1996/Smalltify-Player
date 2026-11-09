@@ -21,36 +21,24 @@ find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
 
 include(FetchContent)
-set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+# Raven (GUI library, Apache-2.0), pinned to the commit the port was checked against.
+set(RAVEN_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(RAVEN_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(RAVEN_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(RAVEN_BUILD_WEB OFF CACHE BOOL "" FORCE)
+set(RAVEN_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-# Spotify album art is JPEG; raylib 5.5 leaves the JPEG decoder out by
-# default. CUSTOMIZE_BUILD keeps every other option at its config.h default
-# except the ones below, which this app never uses.
-set(CUSTOMIZE_BUILD ON CACHE BOOL "" FORCE)
-set(SUPPORT_FILEFORMAT_JPG ON CACHE BOOL "" FORCE)
-foreach(opt
-    SUPPORT_MODULE_RAUDIO SUPPORT_MODULE_RMODELS
-    # F12 / Ctrl+F12 would write screenshotNNN.png / .gif into the working
-    # directory, outside the portable app folder.
-    SUPPORT_SCREEN_CAPTURE SUPPORT_GIF_RECORDING SUPPORT_AUTOMATION_EVENTS
-    # Never set a target FPS (event waiting), so frame pacing is unused; on
-    # Windows the timer option would raise the system timer to 1 ms for the
-    # whole session, which costs battery.
-    SUPPORT_PARTIALBUSY_WAIT_LOOP SUPPORT_WINMM_HIGHRES_TIMER
-    SUPPORT_FILEFORMAT_GIF SUPPORT_FILEFORMAT_QOI SUPPORT_FILEFORMAT_DDS)
-  set(${opt} OFF CACHE BOOL "" FORCE)
-endforeach()
-# Drop unreferenced functions (most of raylib) from the executable.
+# Drop unreferenced functions (most of Raven) from the executable.
 if(APPLE)
   add_link_options(-Wl,-dead_strip)
 elseif(NOT MSVC)
   add_compile_options(-ffunction-sections -fdata-sections)
   add_link_options(-Wl,--gc-sections)
 endif()
-FetchContent_Declare(raylib
-  URL https://github.com/raysan5/raylib/archive/refs/tags/5.5.tar.gz
-  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-FetchContent_MakeAvailable(raylib)
+FetchContent_Declare(raven
+  GIT_REPOSITORY https://github.com/oscar-soirey/Raven
+  GIT_TAG 32722ad0678b126b2629934882a53452e60dccec)
+FetchContent_MakeAvailable(raven)
 
 add_library(cjson STATIC third_party/cjson/cJSON.c)
 target_include_directories(cjson PUBLIC third_party/cjson)
@@ -70,12 +58,12 @@ file(CONFIGURE OUTPUT ${CMAKE_BINARY_DIR}/ui_font.c CONTENT
 # --- app -------------------------------------------------------------------
 # smp_core = every module except main.c. Static lib: tests and the exe pull
 # in only the objects they reference.
-file(GLOB SMP_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.c)
+file(GLOB SMP_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.c ${CMAKE_SOURCE_DIR}/src/gui/*.c ${CMAKE_SOURCE_DIR}/src/screens/*.c)
 list(REMOVE_ITEM SMP_SOURCES ${CMAKE_SOURCE_DIR}/src/main.c)
 add_library(smp_core STATIC ${SMP_SOURCES} ${CMAKE_BINARY_DIR}/ui_font.c)
 target_include_directories(smp_core PUBLIC src)
 target_include_directories(smp_core PRIVATE third_party/inter)
-target_link_libraries(smp_core PUBLIC raylib cjson CURL::libcurl Threads::Threads)
+target_link_libraries(smp_core PUBLIC raven::raven cjson CURL::libcurl Threads::Threads)
 if(WIN32)
   # platform.c uses Vista+ APIs (SRW locks, condition variables); MinGW
   # headers default to an older target.
@@ -152,6 +140,41 @@ if(APPLE)
   find_program(SMP_CODESIGN codesign REQUIRED)
   configure_file(packaging/macos/Info.plist.in ${CMAKE_BINARY_DIR}/Info.plist @ONLY)
   set(SMP_ICON ${CMAKE_SOURCE_DIR}/packaging/macos/AppIcon.icns)
+  # Vulkan for the bundle. The hardened runtime refuses a Homebrew loader, so
+  # the app carries its own loader and MoltenVK in Contents/Frameworks. The
+  # loader's install name is set to "libvulkan.1.dylib" so that Raven's own
+  # dlopen of that name finds the bundled copy (see preload_vulkan in main.c).
+  find_library(SMP_VULKAN_LOADER NAMES libvulkan.1.dylib REQUIRED
+               HINTS /opt/homebrew/lib /usr/local/lib)
+  find_library(SMP_MOLTENVK NAMES libMoltenVK.dylib REQUIRED
+               HINTS /opt/homebrew/lib /usr/local/lib)
+  get_filename_component(SMP_VULKAN_REAL "${SMP_VULKAN_LOADER}" REALPATH)
+  get_filename_component(SMP_MOLTENVK_REAL "${SMP_MOLTENVK}" REALPATH)
+  get_filename_component(SMP_VULKAN_PKG "${SMP_VULKAN_REAL}/../.." ABSOLUTE)
+  get_filename_component(SMP_MOLTENVK_PKG "${SMP_MOLTENVK_REAL}/../.." ABSOLUTE)
+  set(SMP_FRAMEWORKS "${SMP_BUNDLE}/Contents/Frameworks")
+  set(SMP_VK_STAMP ${CMAKE_BINARY_DIR}/vulkan.stamp)
+  # install_name_tool invalidates the copied signatures: each library is
+  # re-signed ad hoc after the rewrite.
+  add_custom_command(OUTPUT ${SMP_VK_STAMP}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${SMP_FRAMEWORKS}
+    COMMAND ${CMAKE_COMMAND} -E copy ${SMP_VULKAN_REAL} ${SMP_FRAMEWORKS}/libvulkan.1.dylib
+    COMMAND ${CMAKE_COMMAND} -E copy ${SMP_MOLTENVK_REAL} ${SMP_FRAMEWORKS}/libMoltenVK.dylib
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/packaging/macos/MoltenVK_icd.json
+            ${SMP_APP_DIR}/MoltenVK_icd.json
+    COMMAND install_name_tool -id libvulkan.1.dylib ${SMP_FRAMEWORKS}/libvulkan.1.dylib
+    COMMAND install_name_tool -id libMoltenVK.dylib ${SMP_FRAMEWORKS}/libMoltenVK.dylib
+    COMMAND ${SMP_CODESIGN} --force --sign - ${SMP_FRAMEWORKS}/libvulkan.1.dylib
+    COMMAND ${SMP_CODESIGN} --force --sign - ${SMP_FRAMEWORKS}/libMoltenVK.dylib
+    COMMAND ${CMAKE_COMMAND} -E copy ${SMP_VULKAN_PKG}/LICENSE.txt
+            ${SMP_APP_DIR}/Vulkan-Loader-LICENSE.txt
+    COMMAND ${CMAKE_COMMAND} -E copy ${SMP_MOLTENVK_PKG}/LICENSE
+            ${SMP_APP_DIR}/MoltenVK-LICENSE.txt
+    COMMAND ${CMAKE_COMMAND} -E touch ${SMP_VK_STAMP}
+    DEPENDS ${SMP_VULKAN_REAL} ${SMP_MOLTENVK_REAL} ${CMAKE_SOURCE_DIR}/packaging/macos/MoltenVK_icd.json
+    COMMENT "Bundling the Vulkan loader and MoltenVK"
+    VERBATIM)
+  add_custom_target(smp_vulkan ALL DEPENDS ${SMP_VK_STAMP})
   set(SMP_SIGN_STAMP ${CMAKE_BINARY_DIR}/bundle.stamp)
   # Ad-hoc signature (no developer ID; fine for a locally built app). Only
   # re-signed when the binary, plist, icon, font license or seeded .env
@@ -161,10 +184,11 @@ if(APPLE)
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/Info.plist
             "${SMP_BUNDLE}/Contents/Info.plist"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SMP_ICON} "${SMP_APP_DIR}/AppIcon.icns"
-    COMMAND ${SMP_CODESIGN} --force --sign - --options runtime "${SMP_BUNDLE}"
+    COMMAND ${SMP_CODESIGN} --force --sign - --options runtime
+            --entitlements ${CMAKE_SOURCE_DIR}/packaging/macos/entitlements.plist "${SMP_BUNDLE}"
     COMMAND ${CMAKE_COMMAND} -E touch ${SMP_SIGN_STAMP}
     DEPENDS smalltify-player smp_env ${SMP_ENV_STAMP} ${CMAKE_BINARY_DIR}/Info.plist ${SMP_ICON}
-            smp_font_license ${SMP_FONT_LICENSE}
+            smp_font_license ${SMP_FONT_LICENSE} ${SMP_VK_STAMP}
     COMMENT "Signing ${SMP_APP_NAME}.app (ad hoc)"
     VERBATIM)
   add_custom_target(smp_bundle ALL DEPENDS ${SMP_SIGN_STAMP})

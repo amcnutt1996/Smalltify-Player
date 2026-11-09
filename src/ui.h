@@ -1,4 +1,4 @@
-/* raylib GUI. Event-waiting mode: redraws only on input or poller/art
+/* GUI. Event-waiting mode (Raven): redraws only on input or poller/art
  * wakeups, so an idle window costs ~0% CPU. */
 #ifndef UI_H
 #define UI_H
