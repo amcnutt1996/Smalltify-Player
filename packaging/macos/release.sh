@@ -66,12 +66,18 @@ cmake --build "$build" --target smp_bundle
 src_app="$build/dist/$app_name.app"
 stage="$build/stage/$app_name.app"
 rm -rf "$build/stage"
-mkdir -p "$stage/Contents/MacOS" "$stage/Contents/Resources"
+mkdir -p "$stage/Contents/MacOS" "$stage/Contents/Resources" "$stage/Contents/Frameworks"
 cp -pX "$src_app/Contents/Info.plist" "$stage/Contents/"
 cp -pX "$src_app/Contents/MacOS/smalltify-player" "$stage/Contents/MacOS/"
 cp -pX "$src_app/Contents/Resources/AppIcon.icns" \
   "$src_app/Contents/Resources/Inter-LICENSE.txt" \
+  "$src_app/Contents/Resources/Vulkan-Loader-LICENSE.txt" \
+  "$src_app/Contents/Resources/MoltenVK-LICENSE.txt" \
+  "$src_app/Contents/Resources/MoltenVK_icd.json" \
   "$src_app/Contents/Resources/.env" "$stage/Contents/Resources/"
+cp -pX "$src_app/Contents/Frameworks/libvulkan.1.dylib" \
+  "$src_app/Contents/Frameworks/libMoltenVK.dylib" "$stage/Contents/Frameworks/"
+chmod u+w "$stage/Contents/Frameworks/libvulkan.1.dylib" "$stage/Contents/Frameworks/libMoltenVK.dylib"
 xattr -cr "$stage"
 
 cmp -s "$stage/Contents/Resources/.env" "$root/.env.example" ||
