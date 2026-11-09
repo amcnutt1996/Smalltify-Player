@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.20)
 if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
   set(CMAKE_OSX_DEPLOYMENT_TARGET 13.0 CACHE STRING "Minimum macOS version" FORCE)
 endif()
-project(smalltify_player VERSION 0.1.0 LANGUAGES C)
+project(smalltify_player VERSION 0.1.1 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
