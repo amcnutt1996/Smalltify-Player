@@ -1,6 +1,6 @@
 # Smalltify Player
 
-A small, low-power Spotify player and remote for the desktop, written in plain C11. It has a native GUI (raylib) and a command-line interface in one binary. It plays music on your computer through [Spotify Soloist](https://developer.spotify.com/documentation/soloist), Spotify's official headless Spotify Connect client, and it can also control any other Spotify Connect device on your account (phone, speaker, TV).
+A small, low-power Spotify player and remote for the desktop, written in plain C11. It has a native GUI (Raven) and a command-line interface in one binary. It plays music on your computer through [Spotify Soloist](https://developer.spotify.com/documentation/soloist), Spotify's official headless Spotify Connect client, and it can also control any other Spotify Connect device on your account (phone, speaker, TV).
 
 > **Platform status:** Smalltify Player has only been tested on **macOS** (13 Ventura or newer, Apple silicon). The code has Windows and Linux paths, but they are untested.
 
@@ -37,7 +37,8 @@ Needs macOS 13 or newer on Apple silicon.
 - macOS 13 or newer. Local playback needs Apple silicon, because Spotify publishes no Soloist build for Intel Macs. On an Intel Mac the app works as a remote only.
 - Xcode Command Line Tools (clang, `codesign`, libcurl): `xcode-select --install`
 - CMake 3.20 or newer: `brew install cmake`
-- An internet connection for the first build, because CMake downloads raylib 5.5. cJSON and the Inter font are vendored in `third_party/`.
+- Vulkan loader and MoltenVK for the GUI: `brew install vulkan-loader molten-vk`. CMake looks in `/opt/homebrew/lib` and `/usr/local/lib`.
+- An internet connection for the first build, because CMake downloads Raven (GUI library, Apache 2.0) at the commit pinned in `CMakeLists.txt`. cJSON and the Inter font are vendored in `third_party/`.
 
 ### 2. Create a Spotify developer app
 1. Go to https://developer.spotify.com/dashboard and create an app.
@@ -148,7 +149,7 @@ smalltify-player queue <uri>               me
 | `src/soloist.c` | Downloads, updates, and supervises Spotify Soloist |
 | `src/poller.c` | Background playback-state polling: fetches every 5 s and at each track's end, UI ticks at 1 Hz locally |
 | `src/art.c` | Album art download (memory only) |
-| `src/ui.c` | raylib GUI, event-driven (≈0% CPU when idle); Library panel, Settings, embedded Inter font |
+| `src/ui.c` | Raven GUI, event-driven (≈0% CPU when idle); Library panel, Settings, embedded Inter font |
 | `src/browse.c` | Pure Library-panel helpers: what a click plays, row texts, search grouping, list cap |
 | `src/cli.c` | CLI commands |
 
@@ -160,10 +161,12 @@ cmake --build build --target release   # or packaging/macos/release.sh
 ```
 This builds an arm64 release in `build-release/`, signs the app with the hardened runtime, makes `build/release/Smalltify-Player-<version>-arm64.dmg`, notarizes and staples it, then checks it with `codesign`, `spctl` and `stapler`. A release bundle ships `.env.example` unchanged, so it contains no Client ID and no Soloist key. Environment: `SMP_SIGN_ID` picks the signing identity, `SMP_NOTARY_PROFILE` the notary profile (default `smalltify`). `--no-notarize` skips Apple (`SMP_SIGN_ID=-` for an ad-hoc test build; Gatekeeper rejects it).
 
+The bundled Vulkan loader and MoltenVK sit in `Contents/Frameworks/` (`libvulkan.1.dylib`, `libMoltenVK.dylib`), with `Contents/Resources/MoltenVK_icd.json` pointing at `../Frameworks/libMoltenVK.dylib`. The release bundle is ad-hoc signed unless a Developer ID is used (`SMP_SIGN_ID`).
+
 
 ## License
 Smalltify Player is released under the [MIT License](LICENSE).
 
-Third-party components keep their own licenses: cJSON (MIT, `third_party/cjson/LICENSE`), the Inter font (SIL OFL 1.1, `third_party/inter/LICENSE.txt`) and raylib (zlib, fetched at build time). Spotify Soloist is not included; the app downloads it from Spotify, and it is covered by Spotify's own terms.
+Third-party components keep their own licenses: cJSON (MIT, `third_party/cjson/LICENSE`), the Inter font (SIL OFL 1.1, `third_party/inter/LICENSE.txt`) and Raven (Apache 2.0, fetched at build time). Spotify Soloist is not included; the app downloads it from Spotify, and it is covered by Spotify's own terms.
 
 Not affiliated with or endorsed by Spotify. Spotify is a trademark of Spotify AB.

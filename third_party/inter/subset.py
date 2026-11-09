@@ -7,13 +7,13 @@
 
 Writes, next to this script:
   Inter-Regular.subset.ttf  the outlines of the codepoints in BLOCKS, without
-                            hinting, kerning or OpenType layout (raylib uses
-                            none of them); the name table keeps the copyright
+                            hinting, kerning or OpenType layout (Raven rasterises the
+                            outlines); the name table keeps the copyright
                             and license. CMakeLists.txt compiles it into the app.
   inter_subset.h            the codepoints the subset maps and the widths of
-                            its blank glyphs, for src/ui.c.
+                            its blank glyphs.
 
-Combining marks are left out: raylib advances by their bitmap width, so
+Combining marks are left out: the old raylib build advanced by their bitmap width, so
 they would push the text apart instead of sitting on the previous letter.
 """
 import os
@@ -63,8 +63,8 @@ def main():
         return hmtx[g][0] == 0 and glyf[g].numberOfContours != 0
 
     keep = [c for a, b in BLOCKS for c in range(a, b + 1) if c in cmap and not is_mark(c)]
-    # Blank glyphs with a width (no-break and typographic spaces): raylib
-    # sizes every blank glyph but U+0020 to zero, src/ui.c restores these.
+    # Blank glyphs with a width (no-break and typographic spaces): the old raylib
+    # build sized every blank glyph but U+0020 to zero, so their widths are listed.
     blanks = [(c, hmtx[cmap[c]][0]) for c in keep
               if c != 0x20 and glyf[cmap[c]].numberOfContours == 0 and hmtx[cmap[c]][0] > 0]
 
@@ -101,7 +101,7 @@ def main():
         "};",
         "",
         "/* Blank glyphs other than U+0020 with their advance in font units:",
-        " * raylib gives every blank glyph but the space a zero width. */",
+        " * the old raylib build gave every blank glyph but the space a zero width. */",
         "static const int inter_blanks[][2] = {",
     ]
     for i in range(0, len(blanks), 4):
@@ -109,7 +109,7 @@ def main():
     lines += [
         "};",
         "",
-        "/* Ascender minus descender in font units: a raylib font size of N px",
+        "/* Ascender minus descender in font units: a font size of N px",
         " * scales this height to N. */",
         "#define INTER_HEIGHT %d" % (hhea.ascent - hhea.descent),
         "",

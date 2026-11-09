@@ -6,7 +6,7 @@
 Not verified on real hardware: the minimized pairing poll switching to 15 s, a clean long idle-CPU measurement on the player screen, and the Linux/Windows code paths (never compiled here).
 
 ## Update: readable text, Settings, full library (2026-11-06, while you were away)
-- **Text:** the embedded Inter font replaces raylib's 10 px bitmap font; default body text is 14 px, and all layout follows the text size. **Settings** (next to Log out) offers Small / Default / Large / Extra large, applies at once, and saves `UI_FONT_SIZE` in `.env`.
+- **Text:** the embedded Inter font replaces the old raylib build's 10 px bitmap font; default body text is 14 px, and all layout follows the text size. **Settings** (next to Log out) offers Small / Default / Large / Extra large, applies at once, and saves `UI_FONT_SIZE` in `.env`.
 - **Library:** Liked Songs (with your total), Playlists, Albums, Artists, Podcasts, Your Episodes, Recently played and Queue; search across songs, artists, albums, playlists, podcasts and episodes; drill into playlists, albums, artists and shows; play a song inside its playlist, album or Liked Songs; +Queue; a heart for liking the current song. README → *Using the player* has the details.
 - **Spotify's Feb 2026 API limits** shape what's possible: search returns at most 10 per kind (the old GUI search asked for 20, which Spotify now refuses), followed playlists list no songs (they still play), and Home, Browse, recommendations, artist top songs, lyrics and Jams have no API.
 - **CLI:** `list`, `search --type`, `like`/`unlike`/`saved`, `queue`, `me`.
@@ -22,7 +22,7 @@ Not verified on real hardware: the minimized pairing poll switching to 15 s, a c
 | 2 | HTTP wrapper: libcurl, keep-alive, 401 refresh, 429 retry | `ca486a8` |
 | 3 | `now` CLI + Web API state parser | `32b30c6`, `68a06ed` |
 | 4 | Playback commands: play/pause/toggle/next/prev/seek/vol/shuffle/repeat/devices/transfer | `54059b3`, `c90a11b` |
-| 5 | GUI shell (raylib, event-driven), device picker | `c04ac05`, `7140b77` |
+| 5 | GUI shell (Raven, event-driven), device picker | `c04ac05`, `7140b77` |
 | 6 | Poller thread | `ec0c176` |
 | 7 | Album art + extras: playlists and search (CLI + GUI Library panel) | `f8cf3fd`, `31b912b`, `7367cf7` |
 | — | Council fixes (13 review findings, 5 test findings) | `2b751f7`, `a9ca7b0`, `632fae6`, `43490a2`, `c0e5be6` |
@@ -57,7 +57,7 @@ You approved both sign-ins with your real account, and everything worked: now pl
 - **Linux and Windows code was never compiled or run here** (Mac only): the Linux `fork`/`PR_SET_PDEATHSIG` spawn and the whole Win32 path. A Linux build and a Windows build are the next checks.
 - Soloist has no Intel Mac or Windows-on-ARM builds; on those platforms the app works only as a remote control.
 - Soloist receives its key as a command-line argument (Spotify's limitation), so other local processes can see it. Soloist also runs Spotify's own crash reporter.
-- The GUI crashes if launched while the display is asleep. This is a raylib limitation.
+- The GUI crashed if launched while the display was asleep in the old raylib build. Not re-tested on Raven.
 - Pairing needs local-network discovery. A VPN, guest Wi-Fi or client isolation can hide the device.
 
 ## Housekeeping

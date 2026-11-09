@@ -28,7 +28,7 @@ static const int inter_ranges[][2] = {
 };
 
 /* Blank glyphs other than U+0020 with their advance in font units:
- * raylib gives every blank glyph but the space a zero width. */
+ * the old raylib build gave every blank glyph but the space a zero width. */
 static const int inter_blanks[][2] = {
     { 0x00A0, 576 }, { 0x2000, 1118 }, { 0x2001, 2234 }, { 0x2002, 1024 },
     { 0x2003, 2048 }, { 0x2004, 684 }, { 0x2005, 512 }, { 0x2006, 340 },
@@ -36,6 +36,6 @@ static const int inter_blanks[][2] = {
     { 0x202F, 372 }, { 0x205F, 576 },
 };
 
-/* Ascender minus descender in font units: a raylib font size of N px
+/* Ascender minus descender in font units: a font size of N px
  * scales this height to N. */
 #define INTER_HEIGHT 2478
