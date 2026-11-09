@@ -4,8 +4,6 @@ A small, low-power Spotify player and remote for the desktop, written in plain C
 
 > **Platform status:** Smalltify Player has only been tested on **macOS** (13 Ventura or newer, Apple silicon). The code has Windows and Linux paths, but they are untested.
 
-> **Built with AI:** This entire project was created, completed and orchestrated with AI using Claude Code.
-
 ## Screenshots
 | Now playing | Library | Devices | Settings |
 |---|---|---|---|
