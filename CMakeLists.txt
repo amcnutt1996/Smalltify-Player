@@ -21,7 +21,7 @@ find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
 
 include(FetchContent)
-# Raven (GUI library, Apache-2.0), pinned to the commit the port was checked against.
+# Raven (GUI library, Apache-2.0), pinned to a tested commit.
 set(RAVEN_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(RAVEN_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(RAVEN_BUILD_TOOLS OFF CACHE BOOL "" FORCE)

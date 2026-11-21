@@ -1,7 +1,6 @@
 /*
  * widgets.c: the GUI kit's widgets (buttons, transport icons, slider,
- * heart). Ported from the old ui.c; draws and reads input only
- * through gui.h.
+ * heart). Draws and reads input only through gui.h.
  */
 #include "gui.h"
 #include "window.h"
@@ -9,7 +8,7 @@
 #include <math.h>
 
 /* Press inside r makes id active; release inside while active is a click.
- * A press outside never activates, as the old clicked(). */
+ * A press outside never activates. */
 int gui_clicked(int id, GuiRect r)
 {
     int hot = gui_hit(r);
@@ -19,7 +18,7 @@ int gui_clicked(int id, GuiRect r)
     if (gui_active == id && !gui_input.down) {
         gui_active = 0;
         click = hot;
-        /* the old code redrew after a click so the new state shows at once */
+        /* redraw after a click so the new state shows at once */
         if (click)
             window_redraw();
     }
@@ -49,7 +48,7 @@ static int body(int id, GuiRect r, int on)
 int gui_button(int id, GuiRect r, const char* label, float size, int on)
 {
     int click = body(id, r, on);
-    /* the old code centred a line of the font size's height, not the font's own line height */
+    /* centre a line of the font size's height, not the font's own line height */
     if (label)
         gui_text_center(size, r.x + r.w / 2.0f, r.y + (r.h - size) / 2.0f, label, GUI_TEXT);
     return click;
@@ -92,7 +91,7 @@ void gui_icon_face(int id, GuiRect r, GuiIcon icon, int on)
 
 void gui_slider(int id, GuiRect r, float* value, int enabled, int* released)
 {
-    /* a hit area larger than the thin bar, as before */
+    /* a hit area larger than the thin bar */
     GuiRect hit = { r.x - 6, r.y - 8, r.w + 12, r.h + 16 };
     int hot = gui_hit(hit);
     *released = 0;
@@ -137,7 +136,7 @@ static void draw_heart(GuiRect r, int on, float th, GuiColor c)
             gui_triangle(cx, cy, px[i], py[i], px[i + 1], py[i + 1], c);
     } else {
         for (int i = 0; i < N; i++) {
-            gui_circle(px[i], py[i], th / 2.0f, c); /* round joints, as DrawSplineLinear */
+            gui_circle(px[i], py[i], th / 2.0f, c); /* round joints */
             gui_line(px[i], py[i], px[i + 1], py[i + 1], th, c);
         }
         gui_circle(px[N], py[N], th / 2.0f, c);

@@ -2,10 +2,10 @@
  * gui.h: the GUI kit shared by every screen and panel. Built on Raven
  * (https://github.com/oscar-soirey/Raven, Apache-2.0).
  *
- * Model: immediate mode, as the old UI was. The window has one root
+ * Model: immediate mode. The window has one root
  * custom widget. Its paint callback calls gui_begin_paint() and then the
  * active screen's draw function; its event callback feeds gui_event().
- * Screens lay out and hit-test with the rectangles they draw, as before.
+ * Screens lay out and hit-test with the rectangles they draw.
  *
  * Units: all sizes and coordinates are logical units (Raven applies the
  * window scale). Colours are GuiColor, 0..1 per channel.
@@ -30,7 +30,7 @@ typedef struct GuiColor {
     float r, g, b, a;
 } GuiColor;
 
-/* Palette: the old C_* constants of ui.c (value / 255, alpha 1). */
+/* Palette (8-bit value / 255, alpha 1). */
 #define GUI_BG     ((GuiColor){ 18 / 255.0f, 18 / 255.0f, 18 / 255.0f, 1.0f })
 #define GUI_PANEL  ((GuiColor){ 40 / 255.0f, 40 / 255.0f, 40 / 255.0f, 1.0f })
 #define GUI_HOVER  ((GuiColor){ 58 / 255.0f, 58 / 255.0f, 58 / 255.0f, 1.0f })
@@ -76,8 +76,8 @@ void gui_end_paint(void);
 int gui_event(const REvent* event);
 
 /* ---- fonts and text ----------------------------------------------------
- * One Inter face (the embedded subset) at every size. Sizes are the old
- * logical font sizes (Metrics.fs / Metrics.fl in ui_state.h). */
+ * One Inter face (the embedded subset) at every size. Sizes are logical
+ * font sizes (Metrics.fs / Metrics.fl in ui_state.h). */
 
 int   gui_font_init(const unsigned char* ttf, size_t len); /* 0 = ok */
 void  gui_font_shutdown(void);
@@ -97,18 +97,18 @@ char* gui_fit_text(float size, const char* text, float max_w, char* out, size_t 
 /* Wrap text at spaces into lines of max_w; newlines start a new line. With
  * max_lines > 0 at most that many lines: a word that cannot break becomes
  * the last line and is ellipsised, and so is the last line when text
- * remains (the old fit_two_lines). With max_lines <= 0 there is no limit and
- * an overlong word overflows (the old wrap_words). Lines are joined by '\n'.
+ * remains. With max_lines <= 0 there is no limit and an overlong word
+ * overflows. Lines are joined by '\n'.
  * Returns the number of lines written. */
 int gui_wrap_text(float size, const char* text, float max_w, int max_lines,
     char* out, size_t cap);
-/* Hard wrap at any character, spaces included: the old wrap_text, used for
+/* Hard wrap at any character, spaces included, used for
  * the env path where spaces are part of the path. */
 int gui_wrap_path(float size, const char* text, float max_w, char* out,
     size_t cap);
 
 /* ---- shapes -------------------------------------------------------------
- * `roundness` is the old fraction (0 = square, 1 = fully round, the
+ * `roundness` is a fraction (0 = square, 1 = fully round, the
  * radius being roundness * min(w, h) / 2). The kit converts it to pixels. */
 
 void gui_fill(GuiRect r, float roundness, GuiColor c);
@@ -127,10 +127,9 @@ int gui_hit(GuiRect r);
 
 /* ---- widgets ------------------------------------------------------------
  * `id` is the W_* widget id (ui_state.h). Buttons return 1 when activated
- * this frame. The press/release semantics are the old clicked(): a press
- * inside makes the widget active; release inside while active activates
- * it. Buttons: on = 1 draws the GUI_ON fill and skips the hover tint (the
- * old button()'s `on` argument; no old button had a disabled state).
+ * this frame. A press inside makes the widget active; release inside while
+ * active activates it. Buttons: on = 1 draws the GUI_ON fill and skips the
+ * hover tint; buttons have no disabled state.
  * Sliders: enabled = 0 draws dim and ignores input. */
 
 int gui_button(int id, GuiRect r, const char* label, float size, int on);
@@ -152,7 +151,7 @@ void gui_icon(GuiRect r, GuiIcon icon, GuiColor c);
 
 /* Horizontal slider, value in [0, 1]. While dragging it writes the new
  * value to *value. *released is set to 1 on the frame the drag ends, so the
- * caller can commit the value (the old commit-on-release). */
+ * caller can commit the value on release. */
 void gui_slider(int id, GuiRect r, float* value, int enabled, int* released);
 
 /* A press and release inside r for widget id, as the widgets take them:
@@ -166,7 +165,7 @@ void gui_heart(GuiRect r, int on, float thickness);
 
 /* Editable single-line field: edits buf (cap bytes, NUL-terminated) from
  * this frame's typed text, Backspace and paste. key_chars = 1 drops spaces
- * and non-ASCII (API keys), as the old edit_line did. The caller holds
+ * and non-ASCII (API keys). The caller holds
  * focus; the kit only edits. */
 void gui_edit_line(char* buf, size_t cap, int key_chars);
 

@@ -1,6 +1,5 @@
 /*
- * common.c: text and layout helpers shared by the screens, ported from
- * ui.c onto the GUI kit.
+ * common.c: text and layout helpers shared by the screens, on the GUI kit.
  */
 #include <stdio.h>
 #include <string.h>

@@ -1,6 +1,6 @@
 /*
- * common.h: text and layout helpers shared by the screens, ported from
- * ui.c onto the GUI kit. fs is FS_S (body) or FS_L (title).
+ * common.h: text and layout helpers shared by the screens, on the GUI kit.
+ * fs is FS_S (body) or FS_L (title).
  */
 #ifndef SMP_SCREENS_COMMON_H
 #define SMP_SCREENS_COMMON_H

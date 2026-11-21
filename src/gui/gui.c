@@ -1,7 +1,7 @@
 /*
  * gui.c: the GUI kit on Raven, except the widgets (widgets.c). Input state,
  * the paint bracket, text, shapes, clipping, hit tests and the one-line
- * text field. Ported from the helpers of the old ui.c.
+ * text field.
  */
 #include "gui.h"
 
@@ -13,8 +13,7 @@
 
 #define ELLIPSIS "\xE2\x80\xA6" /* U+2026 */
 
-/* Between the lines of one text, as the old build spaced them: a line break
- * moves down size + LINE_GAP. */
+/* Between the lines of one text: a line break moves down size + LINE_GAP. */
 #define LINE_GAP 4.0f
 
 GuiInput gui_input;
@@ -22,9 +21,8 @@ int      gui_active;
 
 static RPainter *painter;
 static Rid       font = R_INVALID_ID;
-/* Raven's font size is an em; the old build's was the pixel height of ascent
- * to descent. This ratio converts the old size to an em, so glyphs and line
- * heights keep their old size. */
+/* The kit's font size is the pixel height from ascent to descent; Raven's
+ * is an em. This ratio converts the kit's size to an em. */
 static float     em_per_px = 1.0f;
 
 /* --- frame and input ----------------------------------------------------- */
@@ -136,10 +134,9 @@ int gui_event(const REvent *e)
         gui_input.wheel += e->wheel_y;
         return 1;
     case R_EVENT_KEY_DOWN:
-        /* Backspace fires on the press and on auto-repeat, as the old
-         * GetKeyPressed plus IsKeyPressedRepeat did. Each event counts, so
-         * none is lost when several arrive before one paint. The other keys
-         * fire on the press edge only, as the old IsKeyPressed did. */
+        /* Backspace fires on the press and on auto-repeat. Each event
+         * counts, so none is lost when several arrive before one paint. The
+         * other keys fire on the press edge only. */
         if (e->key == R_KEY_BACKSPACE) {
             gui_input.key_backspace++;
             return 1;
@@ -198,8 +195,7 @@ static uint32_t be32(const unsigned char *p)
     return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
 }
 
-/* unitsPerEm / (ascent - descent) from the head and hhea tables. The old
- * build sized a font by that pixel height (stbtt_ScaleForPixelHeight). */
+/* unitsPerEm / (ascent - descent) from the head and hhea tables. */
 static int ttf_em_per_px(const unsigned char *ttf, size_t len, float *out)
 {
     if (len < 12)
@@ -255,16 +251,15 @@ float gui_text_width(float size, const char *text)
     return w;
 }
 
-/* One line is exactly size tall: em_per_px makes Raven's line box size, the
- * same as the old one-line text measure. Line breaks add the gap in
- * gui_text and in the callers' own line steps. */
+/* One line is exactly size tall: em_per_px makes Raven's line box size.
+ * Line breaks add the gap in gui_text and in the callers' own line steps. */
 float gui_text_height(float size)
 {
     return size;
 }
 
-/* Lines are drawn one by one so a line break moves down size + LINE_GAP,
- * as the old build's text drawing did; Rdraw_text would step by the font's line. */
+/* Lines are drawn one by one so a line break moves down size + LINE_GAP;
+ * Rdraw_text would step by the font's line. */
 void gui_text(float size, float x, float y, const char *text, GuiColor c)
 {
     float em = size * em_per_px;
@@ -377,8 +372,7 @@ static void cut_line(float size, const char *src, size_t n, float max_w, char *o
     fit_cut(size, out, max_w, cap);
 }
 
-/* At most max_lines lines (max_lines > 0). This is the old fit_two_lines for
- * any count: a line ends at a '\n' or at its last space that fits. The last
+/* At most max_lines lines (max_lines > 0): a line ends at a '\n' or at its last space that fits. The last
  * line takes the rest, cut with an ellipsis; a word that cannot break is
  * cut the same way. */
 static int wrap_capped(float size, const char *text, float max_w, int max_lines, char *out, size_t cap)
@@ -436,7 +430,7 @@ int gui_wrap_text(float size, const char *text, float max_w, int max_lines, char
     return wrap_capped(size, text, max_w, max_lines, out, cap);
 }
 
-/* The old wrap_text: hard-wrap at any character, spaces included. */
+/* Hard-wrap at any character, spaces included. */
 int gui_wrap_path(float size, const char *text, float max_w, char *out, size_t cap)
 {
     size_t o = 0, line = 0, i = 0;
@@ -484,7 +478,7 @@ void gui_fill(GuiRect r, float roundness, GuiColor c)
     Rdraw_rect(painter, r.x, r.y, r.w, r.h, radius, c.r, c.g, c.b, c.a);
 }
 
-/* The old outline lay outside r (its ring ran from r's edge out by the
+/* The outline lies outside r (its ring runs from r's edge out by the
  * thickness); Raven draws it inside its bounds, so the bounds grow by the
  * thickness. */
 void gui_outline(GuiRect r, float roundness, float thickness, GuiColor c)

@@ -117,6 +117,11 @@ Pressing Play plays on the active device, else this computer (once paired), else
 ## Soloist updates
 Soloist builds expire 90 days after their build date. The app checks the build at every start and downloads a new one when it's missing or expired, and when it expires within 7 days at most once a day (Spotify may still serve the same build; the check time is kept in `data/soloist-check`). A download is unpacked into `soloist.new/`, run once to check it, and only then swapped in, so a bad download never breaks a working build. A build expiring while the app runs is replaced once and restarted; if Soloist stops otherwise, the player shows **Restart Soloist** (which re-reads the key from `.env`) and **Change key**. `smalltify-player engine --update` forces a fresh download. Spotify publishes builds for macOS on Apple silicon, Windows x64, and Linux (x86_64, arm64, arm32), but not for Intel Macs or Windows on ARM. There the app controls other devices only.
 
+## Known limits
+- Pairing needs local-network discovery. A VPN, guest Wi-Fi or client isolation can hide the device.
+- Soloist receives its key as a command-line argument (Spotify's limitation), so other local processes can see it. Soloist also runs Spotify's own crash reporter.
+- Launching the app while the display is asleep has not been tested.
+
 ## CLI
 ```
 smalltify-player login | logout | engine [--update]
