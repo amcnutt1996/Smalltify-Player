@@ -1,5 +1,5 @@
 # Library
-`Spotify Soloist` - Spotify's official headless Spotify Connect player (replaced `librespot`, see DECISIONS.md #18). It's downloaded at runtime into the app folder, because Spotify forbids redistributing it. The app spawns it, reads its output, and kills it when done.
+`Spotify Soloist` - Spotify's official headless Spotify Connect player (see DECISIONS.md #18). It's downloaded at runtime into the app folder, because Spotify forbids redistributing it. The app spawns it, reads its output, and kills it when done.
 
 # Build Order
 1. Auth CLI Wrapper
