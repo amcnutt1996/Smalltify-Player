@@ -70,7 +70,6 @@ mkdir -p "$stage/Contents/MacOS" "$stage/Contents/Resources" "$stage/Contents/Fr
 cp -pX "$src_app/Contents/Info.plist" "$stage/Contents/"
 cp -pX "$src_app/Contents/MacOS/smalltify-player" "$stage/Contents/MacOS/"
 cp -pX "$src_app/Contents/Resources/AppIcon.icns" \
-  "$src_app/Contents/Resources/Inter-LICENSE.txt" \
   "$src_app/Contents/Resources/Vulkan-Loader-LICENSE.txt" \
   "$src_app/Contents/Resources/MoltenVK-LICENSE.txt" \
   "$src_app/Contents/Resources/MoltenVK_icd.json" \

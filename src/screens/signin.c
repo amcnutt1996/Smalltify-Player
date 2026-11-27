@@ -1,239 +1,459 @@
-/* signin.c: the screens before the player: Setup, Move, Login and the
- * Soloist API key. Drawing and layout only; the sign-in logic stays in ui.c. */
+/* signin.c: the card screens (signin.h). Every screen is a page of the one
+ * card, under the same header: the app's mark, its name and a line about
+ * the screen. The steps themselves (saving, signing in, reloading .env)
+ * stay in ui.c. */
+#include "screens/signin.h"
 
-#include "signin.h"
-
-#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
-#include "../ui_internal.h"
-#include "common.h"
+#include "auth.h"
+#include "gui/components.h"
+#include "gui/shell.h"
+#include "platform.h"
+#include "screens/signin_badge.h"
+#include "ui_internal.h"
 
 #define SPOTIFY_DASHBOARD_URL "https://developer.spotify.com/dashboard"
-#define SOLOIST_KEY_URL "https://developer.spotify.com/dashboard/soloist"
+#define SOLOIST_KEY_URL       "https://developer.spotify.com/dashboard/soloist"
+#define ELLIPSIS              "\xE2\x80\xA6" /* U+2026 */
+#define OPEN_FAILED           "Could not open the browser."
 
-/* <app>/.env hard-wrapped to the window (a path has no spaces). */
-static void wrap_env_path(Ui *u, float maxw)
+enum { PAGES = SCR_PLAYER }; /* one page per screen before the player */
+
+static struct {
+    Ui    *u;
+    Screen shown; /* the page shown; SCR_PLAYER before the first pass */
+    Rid    about; /* the header's line about the screen */
+    Rid    page[PAGES];
+    /* setup */
+    Rid id_field, id_save, uri, setup_err, setup_env;
+    int id_typed; /* id_save says Save (else Reload) */
+    /* login */
+    Rid idle, later, reload, waiting, wait_text, again_row, login_err;
+    /* key */
+    Rid key_field, key_save, key_err, key_env;
+    int key_typed;
+} g;
+
+/* ---- pieces --------------------------------------------------------------------- */
+
+static Rid centered(Rid label)
 {
-    char env_path[CFG_PATH_LEN];
-    if (plat_path_join(env_path, sizeof env_path, u->cfg.app_dir, ".env") != 0)
-        snprintf(env_path, sizeof env_path, ".env");
-    gui_wrap_path(px_of(u, FS_S), env_path, maxw, u->env_wrapped, sizeof u->env_wrapped);
+    Rlabel_set_text_align(label, R_TEXT_ALIGN_CENTER);
+    return label;
 }
 
-/* --- setup screen (no client id) ----------------------------------------- */
-void draw_setup(Ui *u)
+static Rid with_class(Rid widget, const char *cls)
 {
-    const Metrics *m = &u->m;
-    float maxw = (float)(u->w - 2 * PAD);
-    if (u->text_dirty) {
-        wrap_env_path(u, maxw);
-        u->text_dirty = 0;
-    }
-    /* The one field on this screen always has the keyboard. The client ID
-     * is public (PKCE), so it is shown as typed. */
-    gui_edit_line(u->id_input, sizeof u->id_input, 0);
-    int enter = gui_input.key_enter;
-
-    float y = 48;
-    text_center(u, "Smalltify Player", y, FS_L, GUI_TEXT);
-    y += (float)m->fl + 28;
-    y += para(u, "A Spotify client ID is needed.", PAD, y, maxw, GUI_TEXT) + 14;
-    text(u, "1. Create an app at", PAD, y, FS_S, GUI_DIM);
-    y += m->line;
-    text(u, "developer.spotify.com/dashboard", PAD, y, FS_S, GUI_TEXT);
-    y += (float)m->fs + 8;
-    GuiRect ro = { PAD, y, btn_w(u, "Open the page", 120), (float)m->fs + 14 };
-    if (gui_button(W_OPEN_DASH, ro, "Open the page", px_of(u, FS_S), 0) &&
-        plat_open_url(SPOTIFY_DASHBOARD_URL) != 0)
-        u->setup_msg = "Could not open the browser.";
-    y += ro.h + 12;
-    y += para(u, "Set this redirect URI in the app:", PAD, y, maxw, GUI_DIM) + 8;
-    text(u, u->cfg.redirect_uri, PAD, y, FS_S, GUI_TEXT);
-    y += (float)m->fs + 18;
-    text(u, "2. Paste its Client ID here and press Save:", PAD, y, FS_S, GUI_DIM);
-    y += (float)m->fs + 8;
-    float bw = fmaxf(btn_w(u, "Save", 72), btn_w(u, "Reload", 72)), gap = 6;
-    GuiRect box = { PAD, y, maxw - bw - gap, m->row };
-    GuiRect rb = { PAD + box.w + gap, y, bw, m->row };
-    draw_field(u, box, u->id_input, "Paste the Client ID");
-    /* Empty box: re-read a client ID added to .env by hand. */
-    if (gui_button(W_RELOAD, rb, u->id_input[0] ? "Save" : "Reload", px_of(u, FS_S), 1) || enter) {
-        setup_save(u);
-        if (u->screen != SCR_SETUP)
-            return;
-    }
-    y += m->row + 8;
-    if (u->setup_msg)
-        y += para_center(u, u->setup_msg, y, GUI_ERR) + 8;
-    y += para(u, "Or put SPOTIFY_CLIENT_ID=... in this file\nand press Reload:", PAD, y, maxw,
-              GUI_DIM) + 6;
-    text(u, u->env_wrapped, PAD, y, FS_S, GUI_TEXT);
-    y += text_h(u, u->env_wrapped);
-    u->need_h = y + (float)m->fs + PAD;
+    Rwidget_add_class(widget, cls);
+    return widget;
 }
 
-/* --- move screen (app folder not writable) -------------------------------- */
-void draw_move(Ui *u)
+/* A numbered step: the number in a ring, then the text; returns the column
+ * under the text, where the step's content goes. */
+static Rid step(Rid parent, const char *number, const char *text)
 {
-    const Metrics *m = &u->m;
-    float y = 120;
-    text_center(u, "Smalltify Player", y, FS_L, GUI_TEXT);
-    y += (float)m->fl + 36;
-    text_center(u, "This folder is read-only.", y, FS_S, GUI_ERR);
-    y += (float)m->fs + 18;
-    text_center(u, "Move Smalltify Player to Applications", y, FS_S, GUI_TEXT);
-    y += m->line;
-    text_center(u, "(or another writable folder)", y, FS_S, GUI_TEXT);
-    y += m->line;
-    text_center(u, "and open it again.", y, FS_S, GUI_TEXT);
-    u->need_h = y + (float)m->fs + PAD;
+    Rid row = comp_hbox(parent, 12.0f);
+    Rid ring = Rwidget_create(R_WIDGET_BORDER);
+    Rwidget_add_child(row, ring);
+    Rborder_set_corner_radius(ring, 11.0f, 11.0f, 11.0f, 11.0f);
+    Rborder_set_outline(ring, 1.5f, 1.0f, 1.0f, 1.0f, 0.3f);
+    Rwidget_set_size(ring, 22.0f, 22.0f);
+    Rslot_set_valign(ring, R_VALIGN_TOP);
+    Rwidget_set_accessible_hidden(ring, R_TRUE);
+    Rid n = with_class(centered(comp_label(ring, number, TEXT_CAPTION)), "on");
+    Rslot_set_valign(n, R_VALIGN_CENTER);
+    Rid col = comp_vbox(row, COMP_GAP);
+    Rslot_set_fill(col, 1.0f);
+    comp_label(col, text, TEXT_BODY);
+    return col;
 }
 
-/* --- login screen -------------------------------------------------------- */
-/* Our PKCE login for the Web API. With reauth set it is over the running
- * player, asking an older sign-in for new permissions: Later goes back. */
-void draw_login(Ui *u)
+/* A web address the step is about, and the button that opens it. */
+static void web_page(Rid col, const char *shown, RButtonClickedCallback open)
 {
-    const Metrics *m = &u->m;
-    text_center(u, "Smalltify Player", 120, FS_L, GUI_TEXT);
-    if (u->login_th) {
-        plat_mutex_lock(u->mu);
-        int done = u->login_done, rc = u->login_rc;
-        plat_mutex_unlock(u->mu);
-        if (done) {
-            int cancelled = u->login_cancel;
-            login_join(u);
-            if (rc == 0) {
-                u->login_msg = NULL;
-                u->consent_asked = 1; /* it got what Spotify grants */
-                if (u->reauth)
-                    end_reauth(u, 1);
-                else
-                    advance_signin(u);
-                return;
-            }
-            u->login_msg = cancelled ? "Sign-in cancelled." : auth_login_strerror(rc);
-        }
-    }
+    with_class(comp_text(col, shown, TEXT_BODY), "muted");
+    Rid b = comp_button(col, "Open the page", BUTTON_SECONDARY, open, g.u);
+    Rslot_set_halign(b, R_HALIGN_LEFT);
+}
 
-    float y = 120 + (float)m->fl + 48;
-    if (u->reauth) {
-        y += para_center(u, AUTH_RECONSENT_REASON, y, GUI_TEXT) + 26;
-    } else {
-        text_center(u, "Sign in to control your music.", y, FS_S, GUI_TEXT);
-        y += (float)m->fs + 26;
-    }
-    float bw = btn_w(u, "Sign in with Spotify", 200), bh = (float)m->fs + 30;
-    GuiRect rb = { ((float)u->w - bw) / 2.0f, y, bw, bh };
-    if (!u->login_th) {
-        if (gui_button(W_SIGNIN, rb, "Sign in with Spotify", px_of(u, FS_S), 1))
-            start_login(u);
-        /* Over the player: go on without the new permissions. Else a client
-         * ID fixed in .env applies without a restart. */
-        const char *second = u->reauth ? "Later" : "Reload .env";
-        float rw = btn_w(u, second, 120), rh = (float)m->fs + 14;
-        GuiRect rr = { ((float)u->w - rw) / 2.0f, y + bh + 8, rw, rh };
-        u->need_h = rr.y + rh + 12 + (float)m->fs + PAD;
-        if (u->reauth && gui_button(W_LATER, rr, second, px_of(u, FS_S), 0)) {
-            end_reauth(u, 0);
-            return;
-        }
-        if (!u->reauth && gui_button(W_RELOAD, rr, second, px_of(u, FS_S), 0)) {
-            Config c;
-            AuthStore *a = NULL;
-            if (config_load(&c) == 0 && (a = auth_store_new(&c)) != NULL) {
-                auth_store_free(u->auth); /* nothing else uses it on this screen */
-                u->auth = a;
-                u->cfg = c;
-                u->login_msg = NULL;
-                if (!c.client_id[0])
-                    set_screen(u, SCR_SETUP);
-            }
-            memset(&c, 0, sizeof c);
-            return;
-        }
-        if (u->login_msg)
-            para_center(u, u->login_msg, rr.y + rh + 12, GUI_ERR);
+/* A field with its Save / Reload button at its end. */
+static Rid field_row(Rid col, const char *placeholder, RTextChangedCallback on_change,
+                     RTextChangedCallback on_commit, RButtonClickedCallback on_save, Rid *save)
+{
+    Rid row = comp_hbox(col, COMP_GAP);
+    Rid field = comp_field(row, placeholder, 0, on_change, on_commit, g.u);
+    Rslot_set_fill(field, 1.0f);
+    Rslot_set_valign(field, R_VALIGN_CENTER);
+    *save = comp_button(row, "Reload", BUTTON_PRIMARY, on_save, g.u);
+    Rwidget_set_min_size(*save, 84.0f, -1.0f);
+    Rslot_set_valign(*save, R_VALIGN_CENTER);
+    return field;
+}
+
+static Rid error_line(Rid parent)
+{
+    Rid l = with_class(comp_label(parent, "", TEXT_BODY), "error");
+    comp_set_visible(l, 0);
+    return l;
+}
+
+/* "Or put NAME=... in this file and press Reload:" and the file. */
+static Rid env_footer(Rid parent, const char *text)
+{
+    Rid box = comp_vbox(parent, 4.0f);
+    with_class(comp_label(box, text, TEXT_CAPTION), "muted");
+    Rid path = comp_label(box, "", TEXT_CAPTION);
+    Rlabel_set_selectable(path, R_TRUE);
+    return path;
+}
+
+static void show_error(Rid label, const char *msg)
+{
+    comp_text_set(label, msg);
+    comp_set_visible(label, msg && msg[0]);
+}
+
+/* <app>/.env, where the settings are kept. */
+static void show_env_path(Rid label, const Ui *u)
+{
+    char path[CFG_PATH_LEN];
+    if (plat_path_join(path, sizeof path, u->cfg.app_dir, ".env") != 0)
+        snprintf(path, sizeof path, ".env");
+    comp_text_set(label, path);
+}
+
+/* An empty field re-reads .env (a value added there by hand). */
+static void show_save(Rid button, int *shown, int typed)
+{
+    if (*shown == typed)
         return;
-    }
-    text_center(u, u->login_cancel ? "Cancelling..." : "Waiting for browser...", mid_y(u, rb),
-                FS_S, GUI_TEXT);
-    float by = y + bh + 8;
+    *shown = typed;
+    comp_button_set_text(button, typed ? "Save" : "Reload");
+}
+
+/* ---- setup --------------------------------------------------------------------- */
+
+static void on_open_dashboard(Rid button, void *ud)
+{
+    (void)button;
+    Ui *u = ud;
+    if (plat_open_url(SPOTIFY_DASHBOARD_URL) != 0)
+        u->setup_msg = OPEN_FAILED;
+}
+
+static void on_copy_uri(Rid button, void *ud)
+{
+    (void)button;
+    Ui *u = ud;
+    Rclipboard_set_text(u->cfg.redirect_uri);
+    shell_toast("Redirect URI copied", 0);
+}
+
+/* The client ID is public (PKCE): shown as typed, kept in id_input. */
+static void on_id_changed(Rid field, const char *text, void *ud)
+{
+    (void)field;
+    Ui *u = ud;
+    snprintf(u->id_input, sizeof u->id_input, "%s", text);
+}
+
+static void on_id_commit(Rid field, const char *text, void *ud)
+{
+    on_id_changed(field, text, ud);
+    setup_save(ud);
+}
+
+static void on_id_save(Rid button, void *ud)
+{
+    (void)button;
+    setup_save(ud);
+}
+
+static void build_setup(Rid p)
+{
+    Rid s1 = step(p, "1", "Create an app at");
+    web_page(s1, "developer.spotify.com/dashboard", on_open_dashboard);
+    with_class(comp_label(s1, "Set this redirect URI in the app:", TEXT_BODY), "muted");
+    Rid row = comp_hbox(s1, COMP_GAP);
+    g.uri = comp_text(row, "", TEXT_BODY);
+    Rslot_set_fill(g.uri, 1.0f);
+    Rslot_set_valign(g.uri, R_VALIGN_CENTER);
+    Rid copy = comp_button(row, "Copy", BUTTON_LINK, on_copy_uri, g.u);
+    Rslot_set_valign(copy, R_VALIGN_CENTER);
+
+    Rid s2 = step(p, "2", "Paste its Client ID here and press Save:");
+    g.id_field = field_row(s2, "Paste the Client ID", on_id_changed, on_id_commit, on_id_save, &g.id_save);
+    Rtext_input_set_max_length(g.id_field, (int)sizeof g.u->id_input - 1);
+    g.setup_err = error_line(s2);
+
+    g.setup_env = env_footer(p, "Or put SPOTIFY_CLIENT_ID=... in this file and press Reload:");
+}
+
+static void update_setup(Ui *u)
+{
+    comp_field_set(g.id_field, u->id_input); /* setup_save trims or empties it */
+    comp_text_set(g.uri, u->cfg.redirect_uri);
+    show_save(g.id_save, &g.id_typed, u->id_input[0] != 0);
+    show_error(g.setup_err, u->setup_msg);
+    show_env_path(g.setup_env, u);
+}
+
+/* ---- login ---------------------------------------------------------------------- */
+
+static void on_sign_in(Rid button, void *ud)
+{
+    (void)button;
+    Ui *u = ud;
+    if (u->auth && !u->login_th)
+        start_login(u);
+}
+
+static void on_reload_env(Rid button, void *ud)
+{
+    (void)button;
+    reload_env(ud);
+}
+
+/* Over the player: go on without the new permissions. */
+static void on_later(Rid button, void *ud)
+{
+    (void)button;
+    end_reauth(ud, 0);
+}
+
+static void on_open_again(Rid button, void *ud)
+{
+    (void)button;
+    open_again(ud);
+}
+
+static void on_copy_link(Rid button, void *ud)
+{
+    (void)button;
+    Ui *u = ud;
+    char url[SIGNIN_URL_LEN];
     plat_mutex_lock(u->mu);
-    int has_url = u->login_url[0] != 0;
+    memcpy(url, u->login_url, sizeof url);
     plat_mutex_unlock(u->mu);
-    if (has_url && !u->login_cancel) {
-        float ow = btn_w(u, "Open sign-in page again", 200);
-        GuiRect ro = { ((float)u->w - ow) / 2.0f, by, ow, m->row };
-        if (gui_button(W_OPEN_URL, ro, "Open sign-in page again", px_of(u, FS_S), 0))
-            open_again(u);
-        by += m->row + 8;
-    }
-    float xw = btn_w(u, "Cancel", 100);
-    GuiRect rc = { ((float)u->w - xw) / 2.0f, by, xw, m->row };
-    u->need_h = by + m->row + 12 + (float)m->fs + PAD;
-    if (gui_button(W_CANCEL, rc, "Cancel", px_of(u, FS_S), 0))
-        u->login_cancel = 1;
-    if (u->login_msg)
-        para_center(u, u->login_msg, by + m->row + 12, GUI_ERR);
+    if (!url[0])
+        return;
+    Rclipboard_set_text(url);
+    shell_toast("Sign-in link copied", 0);
 }
 
-/* --- Soloist key screen -------------------------------------------------- */
-void draw_key(Ui *u)
+static void on_cancel(Rid button, void *ud)
 {
-    const Metrics *m = &u->m;
-    float maxw = (float)(u->w - 2 * PAD);
-    if (u->text_dirty) {
-        wrap_env_path(u, maxw);
-        u->text_dirty = 0;
-    }
-    /* The one field on this screen always has the keyboard. */
-    gui_edit_line(u->key_input, sizeof u->key_input, 1);
-    int enter = gui_input.key_enter;
+    (void)button;
+    Ui *u = ud;
+    u->login_cancel = 1;
+}
 
-    float y = 48;
-    text_center(u, "Smalltify Player", y, FS_L, GUI_TEXT);
-    y += (float)m->fl + 28;
-    y += para(u, "To play music on this computer, it needs\na Spotify Soloist API key (optional).",
-              PAD, y, maxw, GUI_TEXT) + 16;
-    text(u, "1. Generate a key at", PAD, y, FS_S, GUI_DIM);
-    y += m->line;
-    text(u, "developer.spotify.com/dashboard/soloist", PAD, y, FS_S, GUI_TEXT);
-    y += (float)m->fs + 8;
-    GuiRect ro = { PAD, y, btn_w(u, "Open the page", 120), (float)m->fs + 14 };
-    if (gui_button(W_OPEN_KEY, ro, "Open the page", px_of(u, FS_S), 0) &&
-        plat_open_url(SOLOIST_KEY_URL) != 0)
-        u->setup_msg = "Could not open the browser.";
-    y += ro.h + 12;
-    text(u, "2. Paste it here and press Save:", PAD, y, FS_S, GUI_DIM);
-    y += (float)m->fs + 8;
-    float bw = fmaxf(btn_w(u, "Save", 72), btn_w(u, "Reload", 72)), gap = 6;
-    GuiRect box = { PAD, y, maxw - bw - gap, m->row };
-    GuiRect rb = { PAD + box.w + gap, y, bw, m->row };
-    char masked[SP_NAME_LEN];
+static void build_login(Rid p)
+{
+    g.idle = comp_vbox(p, 10.0f);
+    comp_button(g.idle, "Sign in with Spotify", BUTTON_PRIMARY, on_sign_in, g.u);
+    g.reload = comp_button(g.idle, "Reload .env", BUTTON_SECONDARY, on_reload_env, g.u);
+    g.later = comp_button(g.idle, "Later", BUTTON_SECONDARY, on_later, g.u);
+
+    g.waiting = comp_vbox(p, 10.0f);
+    g.wait_text = with_class(centered(comp_label(g.waiting, "", TEXT_BODY)), "muted");
+    g.again_row = comp_hbox(g.waiting, COMP_GAP);
+    Rslot_set_halign(g.again_row, R_HALIGN_CENTER);
+    comp_button(g.again_row, "Open sign-in page again", BUTTON_SECONDARY, on_open_again, g.u);
+    Rid copy = comp_button(g.again_row, "Copy link", BUTTON_LINK, on_copy_link, g.u);
+    Rslot_set_valign(copy, R_VALIGN_CENTER);
+    comp_button(g.waiting, "Cancel", BUTTON_SECONDARY, on_cancel, g.u);
+
+    g.login_err = centered(error_line(p));
+}
+
+static void update_login(Ui *u)
+{
+    int waiting = u->login_th != NULL;
+    comp_set_visible(g.idle, !waiting);
+    comp_set_visible(g.waiting, waiting);
+    if (waiting) {
+        plat_mutex_lock(u->mu);
+        int has_url = u->login_url[0] != 0;
+        plat_mutex_unlock(u->mu);
+        comp_text_set(g.wait_text, u->login_cancel ? "Cancelling" ELLIPSIS : "Waiting for browser" ELLIPSIS);
+        comp_set_visible(g.again_row, has_url && !u->login_cancel);
+    } else {
+        /* Over the player: Later. Else a client ID fixed in .env applies
+         * without a restart. */
+        comp_set_visible(g.later, u->reauth);
+        comp_set_visible(g.reload, !u->reauth);
+    }
+    show_error(g.login_err, u->login_msg);
+}
+
+/* ---- key ------------------------------------------------------------------------- */
+
+static void on_open_key_page(Rid button, void *ud)
+{
+    (void)button;
+    Ui *u = ud;
+    if (plat_open_url(SOLOIST_KEY_URL) != 0)
+        u->setup_msg = OPEN_FAILED;
+}
+
+static void on_key_save(Rid button, void *ud)
+{
+    (void)button;
+    save_key(ud);
+}
+
+static void on_back(Rid button, void *ud)
+{
+    (void)button;
+    leave_key(ud);
+}
+
+/* What an API key holds: printable ASCII, no blanks (a pasted line break or
+ * space is dropped). */
+static void key_append(Ui *u, const char *s)
+{
+    size_t n = strlen(u->key_input);
+    for (; *s && n + 1 < sizeof u->key_input; s++)
+        if (*s > ' ' && *s <= '~')
+            u->key_input[n++] = *s;
+    u->key_input[n] = 0;
+}
+
+/* The key never enters the field: it is kept in key_input, and the field
+ * shows it masked (mask_secret: only its last 4 characters). So the field
+ * takes typing, Backspace and paste here, at the end of the key, as
+ * before; Enter saves, Escape goes back. */
+static int on_key_event(Rid field, const REvent *e, void *ud)
+{
+    (void)field;
+    Ui *u = ud;
+    if (e->type == R_EVENT_TEXT) {
+        char c[2] = { (char)e->codepoint, 0 };
+        if (e->codepoint < 128)
+            key_append(u, c);
+        return R_TRUE;
+    }
+    if (e->type != R_EVENT_KEY_DOWN)
+        return R_FALSE;
+    int command = (e->modifiers & (R_MOD_SUPER | R_MOD_CTRL)) != 0;
+    switch (e->key) {
+    case R_KEY_TAB:
+        return R_FALSE;
+    case R_KEY_ESCAPE:
+        if (!e->repeat)
+            leave_key(u);
+        return R_TRUE;
+    case R_KEY_ENTER:
+    case R_KEY_KP_ENTER:
+        if (!e->repeat)
+            save_key(u);
+        return R_TRUE;
+    case R_KEY_BACKSPACE: {
+        size_t n = strlen(u->key_input);
+        if (command)
+            n = 0;
+        else if (n > 0)
+            n--;
+        memset(u->key_input + n, 0, sizeof u->key_input - n);
+        return R_TRUE;
+    }
+    case R_KEY_V:
+        if (command) {
+            const char *clip = Rclipboard_get_text();
+            if (clip && !e->repeat)
+                key_append(u, clip);
+        }
+        return R_TRUE;
+    default:
+        /* other shortcuts (Quit, Settings...) go on; the field's own
+         * editing (caret, selection, cut) does not apply to the mask */
+        return !command || e->key == R_KEY_A || e->key == R_KEY_C || e->key == R_KEY_X;
+    }
+}
+
+static void build_key(Rid p)
+{
+    Rid s1 = step(p, "1", "Generate a key at");
+    web_page(s1, "developer.spotify.com/dashboard/soloist", on_open_key_page);
+
+    Rid s2 = step(p, "2", "Paste it here and press Save:");
+    g.key_field = field_row(s2, "Paste the key (it stays hidden)", NULL, NULL, on_key_save, &g.key_save);
+    Rwidget_set_event_callback(g.key_field, on_key_event, g.u);
+    g.key_err = error_line(s2);
+
+    g.key_env = env_footer(p, "Or put SOLOIST_API_KEY=... in this file and press Reload:");
+    comp_button(p, "Back", BUTTON_SECONDARY, on_back, g.u);
+}
+
+static void update_key(Ui *u)
+{
+    char masked[sizeof u->key_input];
     mask_secret(u->key_input, masked, sizeof masked);
-    draw_field(u, box, masked, "Paste the key (it stays hidden)");
-    /* Empty box: re-read a key added to .env by hand. */
-    if (gui_button(W_RELOAD, rb, u->key_input[0] ? "Save" : "Reload", px_of(u, FS_S), 1) || enter) {
-        save_key(u);
-        if (u->screen != SCR_KEY)
-            return;
-    }
-    y += m->row + 12;
-    y += para(u, "Or put SOLOIST_API_KEY=... in this file\nand press Reload:", PAD, y, maxw,
-              GUI_DIM) + 6;
-    text(u, u->env_wrapped, PAD, y, FS_S, GUI_TEXT);
-    y += text_h(u, u->env_wrapped) + 16;
+    comp_field_set(g.key_field, masked);
+    show_save(g.key_save, &g.key_typed, u->key_input[0] != 0);
+    show_error(g.key_err, u->setup_msg);
+    show_env_path(g.key_env, u);
+}
 
-    float sw = btn_w(u, "Back", 100);
-    GuiRect rs = { ((float)u->w - sw) / 2.0f, y, sw, m->row };
-    u->need_h = y + m->row + 12 + (float)m->fs + PAD;
-    if (gui_button(W_BACK, rs, "Back", px_of(u, FS_S), 0)) {
-        leave_key(u);
-        return;
+/* ---- the card ---------------------------------------------------------------------- */
+
+void signin_build(Ui *u, Rid parent)
+{
+    memset(&g, 0, sizeof g);
+    g.u = u;
+    g.shown = SCR_PLAYER;
+    g.id_typed = g.key_typed = -1;
+
+    Rid root = comp_vbox(parent, 22.0f);
+    Rid head = comp_vbox(root, 10.0f);
+    Rslot_set_halign(signin_badge(head, 60.0f), R_HALIGN_CENTER);
+    centered(comp_label(head, "Smalltify Player", TEXT_LARGE));
+    g.about = centered(comp_label(head, "", TEXT_BODY));
+
+    for (int i = 0; i < PAGES; i++) {
+        g.page[i] = comp_vbox(root, 18.0f);
+        comp_set_visible(g.page[i], 0);
     }
-    if (u->setup_msg)
-        para_center(u, u->setup_msg, y + m->row + 12, GUI_ERR);
+    centered(comp_label(g.page[SCR_MOVE],
+                        "Move Smalltify Player to Applications\n(or another writable folder)\nand open it again.",
+                        TEXT_BODY));
+    build_setup(g.page[SCR_SETUP]);
+    build_login(g.page[SCR_LOGIN]);
+    build_key(g.page[SCR_KEY]);
+}
+
+void signin_update(Ui *u)
+{
+    Screen s = u->screen;
+    if (s >= PAGES)
+        return;
+    if (s != g.shown) {
+        for (int i = 0; i < PAGES; i++)
+            comp_set_visible(g.page[i], i == (int)s);
+        g.shown = s;
+        /* the one field of the screen has the keyboard, as before */
+        if (s == SCR_SETUP)
+            Rwidget_focus(g.id_field);
+        else if (s == SCR_KEY)
+            Rwidget_focus(g.key_field);
+    }
+
+    static const char *const about[PAGES] = {
+        [SCR_MOVE] = "This folder is read-only.",
+        [SCR_SETUP] = "A Spotify client ID is needed.",
+        [SCR_LOGIN] = "Sign in to control your music.",
+        [SCR_KEY] = "To play music on this computer, it needs a Spotify Soloist API key (optional).",
+    };
+    comp_text_set(g.about, s == SCR_LOGIN && u->reauth ? AUTH_RECONSENT_REASON : about[s]);
+    comp_set_class(g.about, "error", s == SCR_MOVE);
+
+    switch (s) {
+    case SCR_SETUP: update_setup(u); break;
+    case SCR_LOGIN: update_login(u); break;
+    case SCR_KEY:   update_key(u); break;
+    default:        break;
+    }
 }

@@ -1,5 +1,6 @@
-/* GUI. Event-waiting mode (Raven): redraws only on input or poller/art
- * wakeups, so an idle window costs ~0% CPU. */
+/* GUI on Raven's retained widgets, event-waiting: the loop sleeps until
+ * input or a worker's wake, and Raven draws only what changed, so an idle
+ * window costs ~0% CPU. */
 #ifndef UI_H
 #define UI_H
 

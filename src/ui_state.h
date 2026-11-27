@@ -1,12 +1,12 @@
-/* Shared UI types: the worker structs, widget ids, layout constants and the
- * Ui struct. Types and macros only; the logic stays in ui.c and the screen
- * modules. */
+/* Shared UI types: the worker structs and the Ui struct. Types and macros
+ * only; the logic stays in ui.c, and the widgets of each screen stay in its
+ * module (screens/), file-static. */
 #ifndef SMP_UI_STATE_H
 #define SMP_UI_STATE_H
 
 #include <stdint.h>
 
-#include "gui/gui.h"
+#include <Raven.h>
 
 #include "art.h"
 #include "auth.h"
@@ -18,30 +18,11 @@
 #include "soloist.h"
 #include "spotify.h"
 
-#define WIN_W      360
-#define WIN_ART    220 /* album art side in a new window */
-#define MIN_W      320
-#define MIN_H      440
-#define PAD        16
-#define LINE_GAP   4   /* between the lines of one text */
-#define BAR_GAP    8   /* between bottom-bar buttons */
-#define BAR_MARGIN 8   /* narrowest label margin in a bottom-bar button */
-#define ELLIPSIS   "\xE2\x80\xA6" /* U+2026 */
-
-/* Text styles: body text and titles. Their sizes follow the font-size
- * setting (font_sizes, Ui.m). */
-enum { FS_S, FS_L };
-
-/* Body and title text in logical pixels for each CFG_FONT_* setting.
- * Defined in ui.c. */
-typedef struct {
-    int         body, title;
-    const char *label;
-} FontSize;
-extern const FontSize font_sizes[CFG_FONT_SIZES];
-
-#define BAR_BUTTONS 4
-extern const char *const bar_label[BAR_BUTTONS]; /* defined in ui.c */
+/* The window: landscape, and the smallest it can be made. */
+#define WIN_W 1000
+#define WIN_H 660
+#define MIN_W 720
+#define MIN_H 480
 
 /* Optimistic edits survive contradicting snapshots this long: right after a
  * command Spotify often still reports the old state. */
@@ -196,21 +177,6 @@ typedef struct {
 
 /* --- UI state ------------------------------------------------------------ */
 typedef enum { SCR_MOVE, SCR_SETUP, SCR_LOGIN, SCR_KEY, SCR_PLAYER } Screen;
-typedef enum { PANEL_NONE, PANEL_LIBRARY, PANEL_DEVICES, PANEL_SETTINGS } Panel;
-
-/* Widget ids for the one widget that may hold the mouse (gui_active). */
-enum {
-    W_NONE, W_RELOAD, W_SIGNIN, W_CANCEL, W_OPEN_URL, W_OPEN_KEY, W_OPEN_DASH, W_BACK, W_CHANGE_KEY,
-    W_RESTART, W_HINT_CLOSE, W_LATER,
-    W_PREV, W_PLAY, W_NEXT, W_SEEK, W_VOLUME, W_SHUFFLE, W_REPEAT, W_LOGOUT, W_HEART,
-    W_LIBRARY, W_LIB_BACK, W_LIB_PLAY, W_LIB_SIGNIN, W_DEVICES, W_DEV_REFRESH, W_SETTINGS,
-    W_LIB_ROW /* + row index; rows of two panels never show together */
-};
-#define W_LIB_QUEUE (W_LIB_ROW + BROWSE_KEEP)   /* + row index: its +Queue */
-#define W_LIB_MORE  (W_LIB_QUEUE + BROWSE_KEEP) /* + search group: See all; + BROWSE_GROUPS: retry */
-
-#define ROW_GAP 6 /* between list rows */
-#define ROW_PAD 8 /* between a row's edge and its text */
 
 enum { PEND_PLAY = 1, PEND_SEEK = 2, PEND_SHUFFLE = 4, PEND_REPEAT = 8, PEND_VOLUME = 16 };
 
@@ -223,56 +189,18 @@ typedef struct {
     uint64_t   until;
 } Pending;
 
-/* Text sizes and the geometry that follows from them, in logical pixels. */
-typedef struct {
-    int   size;  /* CFG_FONT_* they were made for */
-    int   fs;    /* body text */
-    int   fl;    /* titles */
-    float line;  /* pitch of one-line texts stacked under each other */
-    float row;   /* list rows, text fields, most buttons */
-    float row2;  /* list rows with two lines of text */
-    float bar;   /* bottom-bar buttons */
-    float min_w; /* narrowest window: the bottom bar at BAR_MARGIN */
-} Metrics;
-
-/* One screen of the Library panel: the root (the search field and the
- * sections), a list (of yours, or what a playlist, album, artist or show
- * holds) or search results. */
-typedef enum { LV_ROOT, LV_LIST, LV_SEARCH } LevelKind;
-
-typedef struct {
-    LevelKind kind;
-    SpList    list;               /* LV_LIST */
-    unsigned  types;              /* LV_SEARCH: SP_SEARCH_* bits */
-    char      uri[SP_URI_LEN];    /* the playlist, album, artist or show listed */
-    char      title[SP_NAME_LEN + 16];
-    char      query[SP_NAME_LEN]; /* LV_SEARCH */
-    ItemList  items;              /* the root: none, it only shows page.total */
-    SpPage    page;               /* the next page: more, total, restricted */
-    int       loaded;             /* a page came */
-    int       err;                /* SP_ERR_* of the last request */
-    uint64_t  want;               /* the request in flight (LibReq.seq), 0 = none */
-    int       scroll;             /* first row shown */
-} Level;
-
-/* Screens deep: the root, search results, "See all", an artist, an album. */
-#define LIB_DEPTH 5
-
+/* What every screen shows comes from here: the update pass (ui.c) pulls
+ * the workers' news into it, then each screen module pushes what changed
+ * into its own widgets. Widgets live in the modules, file-static. */
 typedef struct {
     Config     cfg;
     AuthStore *auth;
     Screen     screen;
-    Metrics    m;
-    int        redraw;   /* state changed mid-frame: draw one more frame */
-    int        w, h;
-    int        min_w, min_h; /* window minimum last set */
-    float      need_h;   /* height the screen drawn last needs */
-    int        text_dirty;
+    int        preview;      /* SMP_UI_PREVIEW set: the player page without a session */
     int        size_unsaved; /* Settings could not write UI_FONT_SIZE */
 
-    /* setup and key screens: <app>/.env, wrapped to the window */
-    char env_wrapped[CFG_PATH_LEN + 64];
-    const char *setup_msg;
+    /* setup and key screens */
+    const char *setup_msg;   /* "" or NULL = none; an error to show */
 
     /* sign-in screen: our PKCE login */
     plat_mutex  *mu;
@@ -301,21 +229,16 @@ typedef struct {
     Poller       *poller;
     CmdWorker     cmd;
     DeviceWorker  dev;
-    PlaybackState st;
-    uint64_t      seq;
+    PlaybackState st;          /* the poller's snapshot, optimistic edits on top */
+    uint64_t      seq;         /* the snapshot taken (poller_snapshot) */
     Pending       pend;
     uint64_t      cmd_seq;
     int           cmd_err, poll_err, background;
-    int           status_red; /* u->status is an error */
     char          played_on[SP_NAME_LEN];
-    float         seek_t, vol_t; /* slider positions while dragged */
-    char msg[320], msg_shown[320]; /* the one status message, see status_message */
-    char hint[320], hint_fit[320]; /* pairing tip; "" = none */
-    char title[SP_NAME_LEN], artists[SP_NAME_LEN], album[SP_NAME_LEN];
-    char status[SP_NAME_LEN];
-    char t_pos[16], t_dur[16];
-    int  pos_sec; /* second shown in t_pos, -1 = reformat */
-    uint64_t note_until; /* "Added to queue" shows until then */
+    char          status[320];  /* the one status line (status_message) */
+    int           status_error; /* status is an error */
+    char          hint[320];    /* pairing tip; "" = none */
+    uint64_t      note_until;   /* "Added to queue" shows until then */
 
     /* the heart by the title: is the playing track saved? */
     char     heart_uri[SP_URI_LEN]; /* the track it is for, "" = none */
@@ -324,25 +247,23 @@ typedef struct {
     uint64_t like_sent, like_done;  /* saves asked for / answered (save_seq) */
     int      like_err;              /* SP_ERR_* of a failed save */
 
-    /* album art: decoded once per image, drawn from a Raven image */
+    /* album art: decoded once per image into a texture */
     ArtLoader *art;
-    uint64_t   art_seq;
-    Rid        art_tex; /* 0 or R_INVALID_ID = none; Raven never issues either */
+    uint64_t   art_seq; /* art_take's */
+    uint64_t   art_gen; /* bumped whenever art_tex changes */
+    Rid        art_tex; /* the art playing; R_INVALID_ID = none */
+    Rid        art_old; /* the one before, deleted at the end of the update pass */
 
-    /* side panels over the player area (one at a time) */
-    Panel      panel;
-    uint64_t   devs_seq;      /* cmd.devs_seq of devs */
+    /* Spotify Connect devices, from the command worker */
+    uint64_t   devs_seq;      /* cmd.devs_seq of devs: changes with the list */
     uint64_t   dev_seq_noted; /* cmd.devs_seq last checked by note_other */
     DeviceList devs;
-    /* the Library: a stack of screens, fed by the library worker */
+
+    /* lists, search and the heart; the Library's screens are library.c's */
     LibWorker  libw;
-    Level      lv[LIB_DEPTH];
-    int        depth;         /* lv[depth] shows */
-    uint64_t   lib_req_seq;   /* the last LibReq.seq */
-    float      wheel;         /* mouse wheel turned short of a whole row */
-    char       query[SP_NAME_LEN];
-    char       key_input[sizeof(((Config *)0)->soloist_key)]; /* key screen; secret */
-    char       id_input[sizeof(((Config *)0)->client_id)];    /* setup screen; public */
+
+    char key_input[sizeof(((Config *)0)->soloist_key)]; /* key screen; secret */
+    char id_input[sizeof(((Config *)0)->client_id)];    /* setup screen; public */
 } Ui;
 
 #endif /* SMP_UI_STATE_H */

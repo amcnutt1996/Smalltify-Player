@@ -1,57 +1,61 @@
 /*
  * window.h: the window shell. Owns the Raven lifecycle (init, one window,
- * one root custom widget that paints through gui.h), the event loop and the
- * redraw/wake plumbing. Knows nothing about screens: ui.c passes a draw
- * function.
+ * shutdown), the event loop and the wake plumbing. Knows nothing about
+ * screens: ui.c passes a frame function that runs once per loop iteration.
  *
- * Threading: window_open, window_run, window_set_size, window_set_min_size,
- * window_is_minimized and window_redraw run on the UI
- * thread. window_wake
- * and window_quit are thread-safe (worker threads and signal-driven quits
- * call them).
+ * Threading: everything here runs on the UI thread (the one that called
+ * window_open), except window_wake and window_quit, which any thread may
+ * call (workers, the signal-driven quit).
  */
 #ifndef SMP_GUI_WINDOW_H
 #define SMP_GUI_WINDOW_H
 
-#include "gui.h"
+#include <Raven.h>
 
-/* Paints one frame. Called on the UI thread inside the paint bracket
- * (gui_begin_paint / gui_end_paint, done by the window). w, h are the
- * window size in logical units. */
-typedef void (*WindowDrawFn)(void* user, float w, float h);
+/* Runs once per loop iteration, before layout and paint: after every wake
+ * (window_wake), input event, timer and animation frame. dt is the time
+ * since the previous call, in seconds. */
+typedef void (*WindowFrameFn)(void *user, double dt);
 
 /* The user closed the window, or window_quit was called. Runs once, on the
  * UI thread, before the loop returns. */
-typedef void (*WindowCloseFn)(void* user);
+typedef void (*WindowCloseFn)(void *user);
 
-/* Creates the Raven runtime and one window, loads the GUI font from the
- * compiled-in ui_font_ttf (ui_font.c) and sets the root widget to draw.
- * w, h, min_w, min_h are logical units. Returns 0 on success. */
-int window_open(const char* title, int w, int h, int min_w, int min_h,
-    WindowDrawFn draw, void* user);
+/* Starts Raven (Vulkan), applies the theme (theme_init) and creates the
+ * window, hidden until window_run: w x h and the minimum size in logical
+ * units. On macOS the title bar is transparent over the content, with the
+ * system's traffic lights inline (mac_window_setup). Returns 0 on success. */
+int window_open(const char *title, int w, int h, int min_w, int min_h);
 
-/* Runs the event loop until the window closes or window_quit is called,
- * then calls on_close, releases the font and shuts Raven down. Returns the
- * exit code (0 for a normal close). */
-int window_run(WindowCloseFn on_close, void* close_user);
+/* The window, for Raven calls that take one (Rdialog_open...). */
+Rid window_id(void);
 
-/* Resizes the window to w x h logical units (UI thread). */
-void window_set_size(int w, int h);
+/* Shows the window and runs the loop until it closes or window_quit is
+ * called, then calls on_close and shuts Raven down. The loop sleeps in the
+ * OS until something happens: an idle window costs no CPU. Returns the exit
+ * code (0 for a normal close). */
+int window_run(WindowFrameFn frame, WindowCloseFn on_close, void *user);
 
-/* Sets the smallest size the user can resize the window to, in logical
- * units (UI thread). Raven: Rwindow_set_min_size. */
+/* Smallest size the user can resize the window to, in logical units. */
 void window_set_min_size(int w, int h);
 
-/* 1 while the window is minimized (UI thread). */
+/* 1 while the window is minimized. */
 int window_is_minimized(void);
 
-/* Marks the window for a repaint on the next frame (UI thread). */
-void window_redraw(void);
-
-/* Wakes the loop so it repaints or handles its queue (thread-safe). */
+/* Wakes the loop so the frame function runs soon (thread-safe; Rwake_up). */
 void window_wake(void);
 
-/* Asks the loop to return (thread-safe). The close callback still runs. */
+/* Asks the loop to return (thread-safe). The close function still runs. */
 void window_quit(void);
+
+/* For the event callback (Rwidget_set_event_callback) of a widget that
+ * stands for the title bar: a left press moves the window, a double click
+ * zooms it. Returns R_TRUE when it used the event. Events the widget's
+ * children handle (buttons) never get here. */
+int window_title_event(const REvent *event);
+
+/* Continuous frames while an animation runs: +1 when one starts, -1 when it
+ * settles. Frames stop again when the count is back to 0. */
+void window_animating(int delta);
 
 #endif /* SMP_GUI_WINDOW_H */

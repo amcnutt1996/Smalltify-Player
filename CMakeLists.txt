@@ -6,6 +6,9 @@ if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
   set(CMAKE_OSX_DEPLOYMENT_TARGET 13.0 CACHE STRING "Minimum macOS version" FORCE)
 endif()
 project(smalltify_player VERSION 0.1.1 LANGUAGES C)
+if(APPLE)
+  enable_language(OBJC) # src/gui/macos.m: the title bar and the application menu
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -43,16 +46,31 @@ FetchContent_MakeAvailable(raven)
 add_library(cjson STATIC third_party/cjson/cJSON.c)
 target_include_directories(cjson PUBLIC third_party/cjson)
 
-# GUI font: a subset of Inter (SIL OFL 1.1; third_party/inter/subset.py
-# makes it), compiled in as a byte array so the app needs no font file.
-# Regenerated at configure time whenever the .ttf changes.
-set(SMP_FONT ${CMAKE_SOURCE_DIR}/third_party/inter/Inter-Regular.subset.ttf)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${SMP_FONT})
-file(READ ${SMP_FONT} SMP_FONT_BYTES HEX)
-string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," SMP_FONT_BYTES "${SMP_FONT_BYTES}")
-string(REGEX REPLACE "((0x..,){16})" "\\1\n" SMP_FONT_BYTES "${SMP_FONT_BYTES}")
-file(CONFIGURE OUTPUT ${CMAKE_BINARY_DIR}/ui_font.c CONTENT
-  "/* Generated from third_party/inter/Inter-Regular.subset.ttf by CMakeLists.txt. */\nconst unsigned char ui_font_ttf[] = {\n@SMP_FONT_BYTES@};\nconst unsigned int ui_font_ttf_len = sizeof ui_font_ttf;\n"
+# GUI font off macOS: a subset of Inter (SIL OFL 1.1; third_party/inter/
+# subset.py makes it), compiled in as a byte array so the app needs no font
+# file. Regenerated at configure time whenever the .ttf changes. macOS uses
+# the system's San Francisco, which may not be shipped (src/gui/theme.c).
+if(NOT APPLE)
+  set(SMP_FONT ${CMAKE_SOURCE_DIR}/third_party/inter/Inter-Regular.subset.ttf)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${SMP_FONT})
+  file(READ ${SMP_FONT} SMP_FONT_BYTES HEX)
+  string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," SMP_FONT_BYTES "${SMP_FONT_BYTES}")
+  string(REGEX REPLACE "((0x..,){16})" "\\1\n" SMP_FONT_BYTES "${SMP_FONT_BYTES}")
+  file(CONFIGURE OUTPUT ${CMAKE_BINARY_DIR}/ui_font.c CONTENT
+    "/* Generated from third_party/inter/Inter-Regular.subset.ttf by CMakeLists.txt. */\nconst unsigned char ui_font_ttf[] = {\n@SMP_FONT_BYTES@};\nconst unsigned int ui_font_ttf_len = sizeof ui_font_ttf;\n"
+    @ONLY)
+endif()
+
+# The application's mark (src/screens/signin_badge.c), compiled in the same
+# way so the app needs no image file. src/gui/logo.png comes from
+# packaging/logo.png (packaging/macos/make_icon.py).
+set(SMP_LOGO ${CMAKE_SOURCE_DIR}/src/gui/logo.png)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${SMP_LOGO})
+file(READ ${SMP_LOGO} SMP_LOGO_BYTES HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," SMP_LOGO_BYTES "${SMP_LOGO_BYTES}")
+string(REGEX REPLACE "((0x..,){16})" "\\1\n" SMP_LOGO_BYTES "${SMP_LOGO_BYTES}")
+file(CONFIGURE OUTPUT ${CMAKE_BINARY_DIR}/ui_logo.c CONTENT
+  "/* Generated from src/gui/logo.png by CMakeLists.txt. */\nconst unsigned char ui_logo_png[] = {\n@SMP_LOGO_BYTES@};\nconst unsigned int ui_logo_png_len = sizeof ui_logo_png;\n"
   @ONLY)
 
 # --- app -------------------------------------------------------------------
@@ -60,10 +78,18 @@ file(CONFIGURE OUTPUT ${CMAKE_BINARY_DIR}/ui_font.c CONTENT
 # in only the objects they reference.
 file(GLOB SMP_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.c ${CMAKE_SOURCE_DIR}/src/gui/*.c ${CMAKE_SOURCE_DIR}/src/screens/*.c)
 list(REMOVE_ITEM SMP_SOURCES ${CMAKE_SOURCE_DIR}/src/main.c)
-add_library(smp_core STATIC ${SMP_SOURCES} ${CMAKE_BINARY_DIR}/ui_font.c)
+list(APPEND SMP_SOURCES ${CMAKE_BINARY_DIR}/ui_logo.c)
+if(APPLE)
+  list(APPEND SMP_SOURCES ${CMAKE_SOURCE_DIR}/src/gui/macos.m)
+else()
+  list(APPEND SMP_SOURCES ${CMAKE_BINARY_DIR}/ui_font.c)
+endif()
+add_library(smp_core STATIC ${SMP_SOURCES})
 target_include_directories(smp_core PUBLIC src)
 target_include_directories(smp_core PRIVATE third_party/inter)
 target_link_libraries(smp_core PUBLIC raven::raven cjson CURL::libcurl Threads::Threads)
+# The version the Settings sheet shows (project() above).
+target_compile_definitions(smp_core PRIVATE SMP_VERSION="${PROJECT_VERSION}")
 if(WIN32)
   # platform.c uses Vista+ APIs (SRW locks, condition variables); MinGW
   # headers default to an older target.
@@ -72,6 +98,7 @@ if(WIN32)
 endif()
 if(APPLE)
   target_link_libraries(smp_core PUBLIC "-framework CoreServices") # quit Apple event
+  target_link_libraries(smp_core PUBLIC "-framework AppKit")       # src/gui/macos.m
 endif()
 if(MSVC)
   target_compile_options(smp_core PRIVATE /W4)
@@ -126,15 +153,18 @@ add_custom_target(smp_env ALL
   BYPRODUCTS ${SMP_ENV_STAMP}
   VERBATIM)
 
-# The font's license goes with the app, as the OFL asks.
-set(SMP_FONT_LICENSE "${SMP_APP_DIR}/Inter-LICENSE.txt")
-add_custom_command(OUTPUT ${SMP_FONT_LICENSE}
-  COMMAND ${CMAKE_COMMAND} -E make_directory ${SMP_APP_DIR}
-  COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/third_party/inter/LICENSE.txt
-          ${SMP_FONT_LICENSE}
-  DEPENDS ${CMAKE_SOURCE_DIR}/third_party/inter/LICENSE.txt
-  VERBATIM)
-add_custom_target(smp_font_license ALL DEPENDS ${SMP_FONT_LICENSE})
+# The font's license goes with the app, as the OFL asks (off macOS, where
+# the font is Inter).
+if(NOT APPLE)
+  set(SMP_FONT_LICENSE "${SMP_APP_DIR}/Inter-LICENSE.txt")
+  add_custom_command(OUTPUT ${SMP_FONT_LICENSE}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${SMP_APP_DIR}
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/third_party/inter/LICENSE.txt
+            ${SMP_FONT_LICENSE}
+    DEPENDS ${CMAKE_SOURCE_DIR}/third_party/inter/LICENSE.txt
+    VERBATIM)
+  add_custom_target(smp_font_license ALL DEPENDS ${SMP_FONT_LICENSE})
+endif()
 
 if(APPLE)
   find_program(SMP_CODESIGN codesign REQUIRED)
@@ -177,8 +207,8 @@ if(APPLE)
   add_custom_target(smp_vulkan ALL DEPENDS ${SMP_VK_STAMP})
   set(SMP_SIGN_STAMP ${CMAKE_BINARY_DIR}/bundle.stamp)
   # Ad-hoc signature (no developer ID; fine for a locally built app). Only
-  # re-signed when the binary, plist, icon, font license or seeded .env
-  # change: anything the app writes into Contents/Resources at runtime makes
+  # re-signed when the binary, plist, icon or seeded .env change: anything
+  # the app writes into Contents/Resources at runtime makes
   # `codesign --verify` report modified contents, which is expected.
   add_custom_command(OUTPUT ${SMP_SIGN_STAMP}
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/Info.plist
@@ -188,7 +218,7 @@ if(APPLE)
             --entitlements ${CMAKE_SOURCE_DIR}/packaging/macos/entitlements.plist "${SMP_BUNDLE}"
     COMMAND ${CMAKE_COMMAND} -E touch ${SMP_SIGN_STAMP}
     DEPENDS smalltify-player smp_env ${SMP_ENV_STAMP} ${CMAKE_BINARY_DIR}/Info.plist ${SMP_ICON}
-            smp_font_license ${SMP_FONT_LICENSE} ${SMP_VK_STAMP}
+            ${SMP_VK_STAMP}
     COMMENT "Signing ${SMP_APP_NAME}.app (ad hoc)"
     VERBATIM)
   add_custom_target(smp_bundle ALL DEPENDS ${SMP_SIGN_STAMP})

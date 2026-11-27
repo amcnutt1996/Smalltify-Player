@@ -1,22 +1,22 @@
 /*
- * window.c: the window shell on Raven: one resizable window, one root
- * custom widget that paints through gui.h, and an event-waiting loop that
- * background threads wake.
+ * window.c: the window shell on Raven: one window and an event-waiting loop
+ * that background threads wake. The widgets themselves are retained: the
+ * frame function pushes state changes into them, and Raven lays out and
+ * paints only what changed.
  */
 #include "window.h"
 
 #include <stdio.h>
 #include <string.h>
 
-/* The GUI font, third_party/inter/Inter-Regular.subset.ttf, compiled in by
- * CMakeLists.txt (ui_font.c in the build folder). */
-extern const unsigned char ui_font_ttf[];
-extern const unsigned int ui_font_ttf_len;
+#include "macos.h"
+#include "theme.h"
 
 static Rid g_window = R_INVALID_ID;
-static Rid g_root = R_INVALID_ID; /* the custom widget the screens draw in */
-static WindowDrawFn g_draw;
-static void *g_draw_user;
+static WindowFrameFn g_frame;
+static void *g_frame_user;
+static int g_animating; /* animations running: frames keep coming */
+static Rid g_parked = R_INVALID_ID; /* the field that had the keyboard when the window went to the background */
 
 /* Raven only records warnings and errors unless it has a callback, so this
  * one reports them, from WARNING up. Runs on any thread, the render
@@ -25,52 +25,12 @@ static void log_error(RError code, RSeverity severity, const char *detail)
 {
     if (severity < R_SEVERITY_WARNING)
         return;
-    fprintf(stderr, "raven: %s (%s): %s\n", Rerror_to_string(code),
-            Rseverity_to_string(severity), detail ? detail : "");
-}
-
-/* One frame: the kit's paint bracket around the screen.
- * The root widget fills the window, so its size is the window's. */
-static void paint(Rid widget, RPainter *painter, float width, float height, void *user)
-{
-    (void)widget;
-    (void)user;
-    gui_begin_paint(painter, width, height);
-    g_draw(g_draw_user, width, height);
-    gui_end_paint();
-}
-
-/* The kit reads input while it paints, so an event it used needs a frame;
- * one it did not use changes nothing on screen. */
-static int feed(const REvent *event)
-{
-    if (!gui_event(event))
-        return R_FALSE;
-    Rwidget_invalidate(g_root);
-    return R_TRUE;
-}
-
-/* Input comes through the window hook, ahead of any widget. The root
- * widget's own callback would get keys only while it held the keyboard
- * focus, and the pointer only over the window: Raven gives custom widgets
- * no mouse capture, so a release outside the window would be lost. */
-static int on_input(Rid window, const REvent *event, void *user)
-{
-    (void)window;
-    (void)user;
-    return feed(event);
-}
-
-static int on_root_event(Rid widget, const REvent *event, void *user)
-{
-    (void)widget;
-    (void)event;
-    (void)user;
-    return R_FALSE;
+    fprintf(stderr, "raven: %s (%s): %s\n", Rerror_to_string(code), Rseverity_to_string(severity),
+            detail ? detail : "");
 }
 
 /* Closing ends the loop like window_quit. The window stays until
- * Rshutdown, after the cleanup, so on_close can still use it. */
+ * Rshutdown, after the cleanup, so the close function can still use it. */
 static int on_close_request(Rid window, void *user)
 {
     (void)window;
@@ -79,70 +39,109 @@ static int on_close_request(Rid window, void *user)
     return R_FALSE;
 }
 
-int window_open(const char *title, int w, int h, int min_w, int min_h,
-                WindowDrawFn draw, void *user)
+/* The window is the one the user works in: Raven's flag, and on macOS the
+ * application's too (see mac_app_active). */
+static int window_in_front(void)
+{
+#ifdef __APPLE__
+    if (!mac_app_active())
+        return 0;
+#endif
+    return Rwindow_is_active(g_window);
+}
+
+/* A focused field's caret blinks: a repaint twice a second. While the
+ * window is in the background no field keeps the keyboard (disabling the
+ * field is Raven's only way to drop focus; it is enabled again at once),
+ * and the field gets it back when the window does, unless something else
+ * took it meanwhile. Screens that focus a field while in the background
+ * (sign-in at launch) have it parked here the same pass. */
+static void park_text_focus(void)
+{
+    if (!window_in_front()) {
+        if (Rwindow_wants_text_input(g_window)) {
+            Rid field = Rwindow_get_focused_widget(g_window);
+            Rwidget_set_enabled(field, R_FALSE);
+            Rwidget_set_enabled(field, R_TRUE);
+            g_parked = field;
+        }
+    } else if (g_parked != R_INVALID_ID) {
+        Rid field = g_parked;
+        g_parked = R_INVALID_ID;
+        if (Rwindow_get_focused_widget(g_window) == R_INVALID_ID && Rwidget_is_valid(field))
+            Rwidget_focus(field);
+    }
+}
+
+/* Raven calls this once per loop iteration, before its layout and paint. */
+static void on_frame(double dt, void *user)
+{
+    (void)user;
+    if (g_frame)
+        g_frame(g_frame_user, dt);
+    park_text_focus();
+}
+
+int window_open(const char *title, int w, int h, int min_w, int min_h)
 {
     RInitDesc desc;
-    GuiColor bg = GUI_BG;
 
-    g_draw = draw;
-    g_draw_user = user;
     Rerror_set_callback(log_error); /* before Rinit, so a failed start is reported */
-
     /* The defaults keep vsync on and always apply the monitor scale to
      * logical sizes. */
     memset(&desc, 0, sizeof desc);
     desc.backend = R_BACKEND_VULKAN;
+    desc.app_name = title;
     if (!Rinit_ex(&desc))
         return -1;
+    /* Every widget is built from C: no interface files to look for or
+     * watch. */
+    Rxml_set_auto_load(R_FALSE);
+    Rxml_set_live_reload(R_FALSE);
+    theme_init();
 
-    /* R_WINDOW_DEFAULT is resizable. No key closes a Raven window. */
-    g_window = Rwindow_create(title, w, h, R_WINDOW_DEFAULT);
-    if (g_window == R_INVALID_ID)
-        goto fail;
-    Rwindow_set_min_size(g_window, min_w, min_h);
-    /* The background colour; it also fills a resized window until its
-     * new frame. */
-    Rwindow_set_clear_color(g_window, bg.r, bg.g, bg.b, bg.a);
-    Rwindow_set_close_callback(g_window, on_close_request, NULL);
-    Rwindow_set_event_hook(g_window, on_input, NULL);
-
-    if (gui_font_init(ui_font_ttf, ui_font_ttf_len) != 0)
-        goto fail;
-    g_root = Rwidget_create(R_WIDGET_CUSTOM);
-    if (g_root == R_INVALID_ID) {
-        gui_font_shutdown();
-        goto fail;
+    /* Hidden until window_run, so the content and (on macOS) the title bar
+     * are in place when it first shows. R_WINDOW_DEFAULT is resizable. */
+    g_window = Rwindow_create(title, w, h, R_WINDOW_HIDDEN);
+    if (g_window == R_INVALID_ID) {
+        Rshutdown();
+        return -1;
     }
-    Rcustom_set_paint_callback(g_root, paint, NULL);
-    Rwidget_set_event_callback(g_root, on_root_event, NULL);
-    Rwindow_set_content(g_window, g_root);
+    Rwindow_set_min_size(g_window, min_w, min_h);
+    Rwindow_set_close_callback(g_window, on_close_request, NULL);
+#ifdef __APPLE__
+    mac_window_setup(g_window);
+#endif
+    theme_set_art(NULL, 0); /* the wallpaper before any art */
     return 0;
-
-fail:
-    Rshutdown();
-    g_window = g_root = R_INVALID_ID;
-    return -1;
 }
 
-int window_run(WindowCloseFn on_close, void *close_user)
+Rid window_id(void)
 {
-    /* Event waiting: Rwait_frame sleeps in the
-     * OS event wait until input or a wake, and draws only a
-     * window that asked for a frame. */
-    while (Rwait_frame(-1.0)) {}
+    return g_window;
+}
+
+int window_run(WindowFrameFn frame, WindowCloseFn on_close, void *user)
+{
+    g_frame = frame;
+    g_frame_user = user;
+    Rset_frame_callback(on_frame, NULL);
+    Rwindow_center(g_window);
+    Rwindow_show(g_window);
+    /* Event waiting: Rwait_frame sleeps in the OS event wait until input,
+     * a wake, a timer or an animation, and draws only a window that
+     * changed. */
+    while (Rwait_frame(-1.0)) {
+    }
+    Rset_frame_callback(NULL, NULL);
     if (on_close)
-        on_close(close_user);
-    gui_font_shutdown();
+        on_close(user);
     int rc = Rget_exit_code(); /* Rshutdown clears it */
     Rshutdown();
-    g_window = g_root = R_INVALID_ID;
+    g_window = R_INVALID_ID;
+    g_animating = 0;
+    g_parked = R_INVALID_ID;
     return rc;
-}
-
-void window_set_size(int w, int h)
-{
-    Rwindow_set_size(g_window, w, h);
 }
 
 void window_set_min_size(int w, int h)
@@ -155,21 +154,39 @@ int window_is_minimized(void)
     return Rwindow_is_minimized(g_window);
 }
 
-void window_redraw(void)
-{
-    Rwidget_invalidate(g_root);
-}
-
-/* The screens pick up the workers' results while they draw, so a wake
- * must bring a frame; a bare
- * Rwake_up would only turn the loop. Off the UI thread this sets an atomic
- * flag and makes the same wake as Rwake_up. */
+/* The frame function runs on every loop iteration, so a bare wake is
+ * enough: it pulls the workers' news and pushes what changed. */
 void window_wake(void)
 {
-    Rwindow_request_redraw(g_window);
+    Rwake_up();
 }
 
 void window_quit(void)
 {
     Rquit(0);
+}
+
+int window_title_event(const REvent *event)
+{
+    if (event->type != R_EVENT_MOUSE_DOWN || event->button != R_MOUSE_LEFT)
+        return R_FALSE;
+    if (event->clicks == 2) {
+        if (Rwindow_is_maximized(g_window))
+            Rwindow_restore(g_window);
+        else
+            Rwindow_maximize(g_window);
+    } else {
+        Rwindow_begin_move(g_window);
+    }
+    return R_TRUE;
+}
+
+void window_animating(int delta)
+{
+    int was = g_animating > 0;
+    g_animating += delta;
+    if (g_animating < 0)
+        g_animating = 0;
+    if ((g_animating > 0) != was)
+        Rwindow_set_continuous_redraw(g_window, g_animating > 0);
 }

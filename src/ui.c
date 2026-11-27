@@ -2,37 +2,38 @@
  * The loop sleeps until input or window_wake (Raven event waiting), so an idle
  * window costs no CPU. Background threads call window_wake when they have
  * news. All network work runs on worker threads; the UI thread only copies
- * snapshots and draws. */
+ * snapshots and pushes what changed into the widgets.
+ *
+ * The update pass (ui_update) runs once per loop iteration, before Raven's
+ * layout and paint: it pulls the workers' news into Ui, then calls the
+ * update of each screen module shown, which compares and changes only the
+ * widgets whose value changed. Nothing changed, nothing is drawn. */
 #include "ui.h"
 
-#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-#include "gui/gui.h"
+#include "gui/shell.h"
+#include "gui/theme.h"
 #include "gui/window.h"
 
 #include "art.h"
 #include "auth.h"
 #include "browse.h"
 #include "http.h"
+#include "library.h"
 #include "model.h"
 #include "platform.h"
 #include "poller.h"
 #include "soloist.h"
 #include "spotify.h"
 
-#include "screens/common.h"
 #include "screens/player.h"
+#include "screens/settings.h"
+#include "screens/sidebar.h"
 #include "screens/signin.h"
 #include "ui_internal.h"
-
-/* Body and title text in logical pixels for each CFG_FONT_* setting. */
-const FontSize font_sizes[CFG_FONT_SIZES] = {
-    { 12, 19, "Small" }, { 14, 22, "Default" }, { 16, 25, "Large" }, { 19, 29, "Extra large" },
-};
-
-const char *const bar_label[BAR_BUTTONS] = { "Devices", "Library", "Settings", "Log out" };
 
 /* The workers take a void(*)(void*) wake callback; this adapts window_wake. */
 static void ui_wake(void *ud)
@@ -199,9 +200,12 @@ static int cmd_start(CmdWorker *w, AuthStore *auth, Poller *poller, const char *
 /* Line c up: it replaces a playback command still waiting at the end, else
  * it waits its turn. A full FIFO (the worker is stuck, e.g. offline) lets a
  * playback command replace a playback command at its end and drops c
- * otherwise, so a waiting queue add is never overwritten. */
+ * otherwise, so a waiting queue add is never overwritten. Without a
+ * session (no worker) there is nobody to send it to. */
 static void cmd_send(CmdWorker *w, const Cmd *c)
 {
+    if (!w->th)
+        return;
     plat_mutex_lock(w->mu);
     Cmd *last = w->len ? &w->fifo[(w->head + w->len - 1) % CMD_FIFO] : NULL;
     if (last && c->kind != CMD_QUEUE && last->kind != CMD_QUEUE)
@@ -321,8 +325,12 @@ static int lib_start(LibWorker *w, AuthStore *auth)
     return 0;
 }
 
-static void lib_post(LibWorker *w, const LibReq *r)
+/* Requests go to slots the worker empties; without a session (no worker)
+ * they are dropped. */
+void lib_post(LibWorker *w, const LibReq *r)
 {
+    if (!w->th)
+        return;
     plat_mutex_lock(w->mu);
     w->req = *r;
     w->has_req = 1;
@@ -332,6 +340,8 @@ static void lib_post(LibWorker *w, const LibReq *r)
 
 static void lib_post_check(LibWorker *w, const char *uri)
 {
+    if (!w->th)
+        return;
     plat_mutex_lock(w->mu);
     snprintf(w->check, sizeof w->check, "%s", uri);
     w->has_check = 1;
@@ -341,6 +351,8 @@ static void lib_post_check(LibWorker *w, const char *uri)
 
 void lib_post_save(LibWorker *w, const char *uri, int on, uint64_t seq)
 {
+    if (!w->th)
+        return;
     plat_mutex_lock(w->mu);
     snprintf(w->save, sizeof w->save, "%s", uri);
     w->save_on = on;
@@ -512,198 +524,6 @@ static int installer_start(Installer *in, const Config *cfg, int force)
     return 0;
 }
 
-/* --- font and text ------------------------------------------------------- */
-static Metrics metrics_for(int size)
-{
-    if (size < 0 || size >= CFG_FONT_SIZES)
-        size = CFG_FONT_DEFAULT;
-    Metrics m = { 0 };
-    m.size = size;
-    m.fs = font_sizes[size].body;
-    m.fl = font_sizes[size].title;
-    m.line = (float)m.fs + 6;
-    m.row = (float)m.fs + 18;
-    m.row2 = 2.0f * (float)m.fs + LINE_GAP + 16;
-    m.bar = (float)m.fs + 10;
-    return m;
-}
-
-/* The text sizes and the geometry that follows from them, for the size
- * setting: at start and whenever it changes. Also the narrowest window the
- * bottom bar needs (Metrics.min_w). */
-static void apply_metrics(Ui *u)
-{
-    Metrics m = metrics_for(u->cfg.font_size);
-    if (u->m.min_w > 0.0f && u->m.size == m.size)
-        return;
-    u->m = m;
-    float labels = 0.0f;
-    for (int i = 0; i < BAR_BUTTONS; i++)
-        labels += gui_text_width(px_of(u, FS_S), bar_label[i]);
-    u->m.min_w = labels + 2 * BAR_BUTTONS * BAR_MARGIN + (BAR_BUTTONS - 1) * BAR_GAP + 2 * PAD;
-    u->text_dirty = 1;
-}
-
-/* --- Library panel: its stack of screens ---------------------------------- */
-/* The list a screen shows, as browse_play_target takes it: -1 for search. */
-int lib_list_of(const Level *lv)
-{
-    return lv->kind == LV_LIST ? (int)lv->list : -1;
-}
-
-/* Ask the library worker for lv's next page (the root's: the Liked Songs
- * total). One request per screen at a time; its seq matches the answer. */
-void lib_request(Ui *u, Level *lv)
-{
-    LibReq r;
-    int room = BROWSE_KEEP - lv->items.n;
-    memset(&r, 0, sizeof r);
-    r.seq = ++u->lib_req_seq;
-    r.page = lv->page;
-    switch (lv->kind) {
-    case LV_ROOT:
-        r.list = SP_LIST_LIKED;
-        memset(&r.page, 0, sizeof r.page);
-        r.cap = 1;
-        break;
-    case LV_LIST:
-        r.list = lv->list;
-        snprintf(r.id, sizeof r.id, "%s", lv->uri);
-        r.cap = room < SP_PAGE_MAX ? room : SP_PAGE_MAX;
-        break;
-    case LV_SEARCH:
-        r.search = 1;
-        r.types = lv->types;
-        snprintf(r.query, sizeof r.query, "%s", lv->query);
-        /* Every kind: one page, each kind's "See all" has the rest. */
-        r.cap = lv->types == SP_SEARCH_ALL ? LIB_PAGE : room < SP_SEARCH_LIMIT ? room : SP_SEARCH_LIMIT;
-        break;
-    }
-    lv->want = r.seq;
-    lib_post(&u->libw, &r);
-}
-
-/* Start lv over from its first page. */
-static void lib_reload(Ui *u, Level *lv)
-{
-    browse_free(&lv->items);
-    memset(&lv->page, 0, sizeof lv->page);
-    lv->loaded = lv->scroll = 0;
-    lv->err = SP_OK;
-    lib_request(u, lv);
-}
-
-/* A new screen on top for the caller to fill and fetch; NULL when full. */
-static Level *lib_push(Ui *u, LevelKind kind, const char *title)
-{
-    if (u->depth + 1 >= LIB_DEPTH)
-        return NULL;
-    u->lv[u->depth].want = 0; /* a page on its way there is of no use now */
-    Level *lv = &u->lv[++u->depth];
-    memset(lv, 0, sizeof *lv);
-    lv->kind = kind;
-    snprintf(lv->title, sizeof lv->title, "%s", title);
-    u->wheel = 0.0f;
-    u->redraw = 1;
-    return lv;
-}
-
-/* Back one screen: the root fetches its Liked Songs total again, a list
- * that never loaded tries again. */
-void lib_pop(Ui *u)
-{
-    if (u->depth == 0)
-        return;
-    Level *lv = &u->lv[u->depth--];
-    browse_free(&lv->items);
-    memset(lv, 0, sizeof *lv);
-    Level *top = &u->lv[u->depth];
-    if (top->kind == LV_ROOT || !top->loaded)
-        lib_request(u, top);
-    u->wheel = 0.0f;
-    u->redraw = 1;
-}
-
-static void lib_reset(Ui *u)
-{
-    for (int i = 0; i < LIB_DEPTH; i++)
-        browse_free(&u->lv[i].items);
-    memset(u->lv, 0, sizeof u->lv);
-    u->depth = 0;
-    u->wheel = 0.0f;
-    u->query[0] = 0;
-}
-
-void lib_open_list(Ui *u, SpList list, const char *title, const char *uri)
-{
-    Level *lv = lib_push(u, LV_LIST, title);
-    if (!lv)
-        return;
-    lv->list = list;
-    snprintf(lv->uri, sizeof lv->uri, "%s", uri);
-    lib_request(u, lv);
-}
-
-/* Search results of every kind (SP_SEARCH_ALL, grouped), or of one. */
-void lib_open_search(Ui *u, const char *query, unsigned types, const char *title)
-{
-    Level *lv = lib_push(u, LV_SEARCH, title);
-    if (!lv)
-        return;
-    lv->types = types;
-    snprintf(lv->query, sizeof lv->query, "%s", query);
-    lib_request(u, lv);
-}
-
-/* What an album, artist, playlist or show row holds, on a screen of its own. */
-void lib_open_item(Ui *u, const Item *it)
-{
-    SpList list = it->kind == ITEM_ALBUM    ? SP_LIST_ALBUM
-                : it->kind == ITEM_ARTIST   ? SP_LIST_ARTIST
-                : it->kind == ITEM_PLAYLIST ? SP_LIST_PLAYLIST
-                                            : SP_LIST_SHOW;
-    lib_open_list(u, list, it->name, it->uri);
-}
-
-/* The panel opened: the Liked Songs total, the queue and what played last
- * may have changed since. */
-void lib_opened(Ui *u)
-{
-    Level *lv = &u->lv[u->depth];
-    if (lv->kind == LV_ROOT)
-        lib_request(u, lv);
-    else if (lv->kind == LV_LIST && (lv->list == SP_LIST_QUEUE || lv->list == SP_LIST_RECENT))
-        lib_reload(u, lv);
-}
-
-/* Take the library worker's page if it answers the screen shown; one for a
- * screen left since is dropped. */
-void lib_sync(Ui *u)
-{
-    Level *lv = &u->lv[u->depth];
-    LibWorker *w = &u->libw;
-    int sort = 0;
-    if (!lv->want)
-        return;
-    plat_mutex_lock(w->mu);
-    if (w->res_seq == lv->want) {
-        int rc = w->res_rc;
-        lv->want = 0;
-        if (rc == SP_OK && lv->kind != LV_ROOT &&
-            browse_append(&lv->items, w->res, w->res_n, BROWSE_KEEP) < 0)
-            rc = SP_ERR_OTHER; /* out of memory: keep what there is */
-        if (rc == SP_OK) {
-            lv->page = w->res_page;
-            lv->loaded = 1;
-            sort = lv->kind == LV_SEARCH && lv->types == SP_SEARCH_ALL;
-        }
-        lv->err = rc;
-    }
-    plat_mutex_unlock(w->mu);
-    if (sort)
-        browse_sort_groups(lv->items.v, lv->items.n);
-}
-
 /* --- screen transitions -------------------------------------------------- */
 static void reset_player_state(Ui *u)
 {
@@ -714,14 +534,13 @@ static void reset_player_state(Ui *u)
     u->cmd_seq = 0;
     u->cmd_err = u->poll_err = 0;
     u->background = 0;
-    u->msg[0] = u->msg_shown[0] = u->hint[0] = 0;
+    u->status[0] = u->hint[0] = 0;
+    u->status_error = 0;
     u->played_on[0] = 0;
-    u->text_dirty = 1;
     u->art_seq = 0;
-    u->panel = PANEL_NONE;
     u->devs_seq = u->dev_seq_noted = 0;
     memset(&u->devs, 0, sizeof u->devs);
-    lib_reset(u);
+    lib_reset();
     u->heart_uri[0] = 0;
     u->heart = -1;
     u->heart_gen = u->like_sent = u->like_done = 0;
@@ -732,9 +551,19 @@ static void reset_player_state(Ui *u)
 void set_screen(Ui *u, Screen s)
 {
     u->screen = s;
-    gui_active = W_NONE;
-    u->text_dirty = 1;
-    u->redraw = 1;
+}
+
+/* The art goes: the screens show none (art_gen), the wallpaper and the
+ * accent are the theme's again. The texture is deleted at the end of the
+ * next update pass, once no Image shows it. */
+static void drop_art(Ui *u)
+{
+    if (Rtexture_is_valid(u->art_old))
+        Rtexture_destroy(u->art_old);
+    u->art_old = u->art_tex;
+    u->art_tex = R_INVALID_ID;
+    u->art_gen++;
+    theme_set_art(NULL, 0);
 }
 
 /* Soloist and its helpers; safe to call in any state. */
@@ -766,9 +595,7 @@ void stop_session(Ui *u)
     lib_stop(&u->libw);
     art_stop(u->art);
     u->art = NULL;
-    if (Rtexture_is_valid(u->art_tex))
-        Rtexture_destroy(u->art_tex);
-    u->art_tex = R_INVALID_ID;
+    drop_art(u);
     poller_stop(u->poller);
     u->poller = NULL;
 }
@@ -781,7 +608,6 @@ void start_engine(Ui *u, int force)
     if (u->inst.th || u->sol || !soloist_supported() || !u->cfg.soloist_key[0])
         return;
     u->eng_err[0] = 0;
-    u->text_dirty = 1;
     if (installer_start(&u->inst, &u->cfg, force) != 0)
         snprintf(u->eng_err, sizeof u->eng_err, "Could not start the Soloist setup.");
 }
@@ -854,8 +680,7 @@ static int client_id_ok(const char *s)
     return 1;
 }
 
-/* edit_line drops control characters, so only the blanks of a paste are
- * left to trim. */
+/* A pasted ID may come with blanks around it. */
 static void trim_blanks(char *s)
 {
     size_t n = strlen(s), a = 0;
@@ -874,7 +699,6 @@ static void setup_reload(Ui *u, const char *missing)
     Config c;
     if (config_load(&c) == 0)
         u->cfg = c; /* no AuthStore exists yet, so nothing holds the old one */
-    u->text_dirty = 1;
     if (!u->cfg.client_id[0])
         u->setup_msg = missing;
     else if (enter_app(u) != 0)
@@ -901,6 +725,23 @@ void setup_save(Ui *u)
     }
     memset(u->id_input, 0, sizeof u->id_input);
     setup_reload(u, "Could not read the Client ID back from .env.");
+}
+
+/* The sign-in screen's "Reload .env": a client ID fixed in .env applies
+ * without a restart; the setup screen when .env has none any more. */
+void reload_env(Ui *u)
+{
+    Config c;
+    AuthStore *a = NULL;
+    if (config_load(&c) == 0 && (a = auth_store_new(&c)) != NULL) {
+        auth_store_free(u->auth); /* nothing else uses it on this screen */
+        u->auth = a;
+        u->cfg = c;
+        u->login_msg = NULL;
+        if (!c.client_id[0])
+            set_screen(u, SCR_SETUP);
+    }
+    memset(&c, 0, sizeof c);
 }
 
 /* --- login screen -------------------------------------------------------- */
@@ -936,7 +777,7 @@ void open_again(Ui *u)
         u->login_msg = "Could not open the browser.";
 }
 
-void login_join(Ui *u)
+static void login_join(Ui *u)
 {
     if (!u->login_th)
         return;
@@ -982,9 +823,7 @@ void end_reauth(Ui *u, int signed_in)
     plat_mutex_lock(u->cmd.mu);
     u->cmd.me_stale = 1; /* it may be another account */
     plat_mutex_unlock(u->cmd.mu);
-    Level *lv = &u->lv[u->depth];
-    if (lv->err != SP_OK)
-        lib_reload(u, lv);
+    lib_retry(u);
     u->heart_uri[0] = 0; /* the heart checks the playing track again */
 }
 
@@ -1048,7 +887,6 @@ static void finish_install(Ui *u)
     memcpy(u->eng_err, u->inst.err, sizeof u->eng_err);
     plat_mutex_unlock(u->inst.mu);
     installer_stop(&u->inst);
-    u->text_dirty = 1;
     if (rc == 0) {
         u->eng_err[0] = 0;
         u->sol = soloist_start(&u->cfg, ui_wake, NULL);
@@ -1067,21 +905,19 @@ static void finish_install(Ui *u)
 
 /* Another device of the account is online: when unpaired, start Soloist
  * (installing it first if needed) so that device can pick this one. */
-void note_other(Ui *u, const char *name)
+static void note_other(Ui *u, const char *name)
 {
     if (!name[0] || strcmp(name, u->cfg.device_name) == 0)
         return;
-    if (strcmp(u->other_dev, name) != 0) {
+    if (strcmp(u->other_dev, name) != 0)
         snprintf(u->other_dev, sizeof u->other_dev, "%s", name);
-        u->text_dirty = 1;
-    }
     if (!u->paired && !u->auto_failed)
         start_engine(u, 0);
 }
 
-/* Follow the install worker and Soloist's state; runs every player frame
- * (frames only happen on events, so this adds no wakeups). */
-void poll_engine(Ui *u)
+/* Follow the install worker and Soloist's state; runs in every update pass
+ * of the player (passes only happen on events, so this adds no wakeups). */
+static void poll_engine(Ui *u)
 {
     if (u->inst.th) {
         plat_mutex_lock(u->inst.mu);
@@ -1104,7 +940,6 @@ void poll_engine(Ui *u)
         soloist_status(u->sol, u->eng_err, sizeof u->eng_err);
         u->auto_failed = !u->paired; /* a paired one gets the Restart button */
         stop_engine(u);
-        u->text_dirty = 1;
         return;
     }
     if (u->paired && u->sol_was_paired && st == SOLOIST_PAIRING) {
@@ -1113,7 +948,6 @@ void poll_engine(Ui *u)
         (void)config_set_paired(&u->cfg, 0);
         device_stop(&u->dev);
         device_start(&u->dev, u->auth, NULL, u->cfg.device_name, 1);
-        u->text_dirty = 1;
     }
     if (!u->paired && st == SOLOIST_READY) {
         /* "running" without "waiting for login": a stored session came
@@ -1121,7 +955,6 @@ void poll_engine(Ui *u)
         device_stop(&u->dev);
         u->paired = u->sol_was_paired = 1;
         (void)config_set_paired(&u->cfg, 1);
-        u->text_dirty = 1;
     }
     if (!u->paired && u->dev.th) {
         if (u->dev.found) {
@@ -1129,19 +962,15 @@ void poll_engine(Ui *u)
             device_stop(&u->dev);
             u->paired = 1;
             (void)config_set_paired(&u->cfg, 1);
-            u->text_dirty = 1;
         } else if (u->dev.idle_out) {
             stop_engine(u); /* nobody can pick us: save the battery */
-            u->text_dirty = 1;
         } else {
             char other[SP_NAME_LEN];
             plat_mutex_lock(u->dev.mu);
             memcpy(other, u->dev.other, sizeof other);
             plat_mutex_unlock(u->dev.mu);
-            if (other[0] && strcmp(other, u->other_dev) != 0) {
+            if (other[0] && strcmp(other, u->other_dev) != 0)
                 memcpy(u->other_dev, other, sizeof u->other_dev);
-                u->text_dirty = 1;
-            }
         }
     } else if (u->paired && st == SOLOIST_READY && !u->transferred) {
         u->transferred = 1;
@@ -1187,7 +1016,7 @@ void pend_reapply(Ui *u)
 
 /* New snapshot: fields it confirms stop being pending; the rest of the
  * optimistic edits stay on top until PENDING_MS runs out. */
-void apply_snapshot(Ui *u, const PlaybackState *s, uint64_t now)
+static void apply_snapshot(Ui *u, const PlaybackState *s, uint64_t now)
 {
     Pending *p = &u->pend;
     if ((p->mask & PEND_PLAY) && s->is_playing == p->playing)
@@ -1206,13 +1035,6 @@ void apply_snapshot(Ui *u, const PlaybackState *s, uint64_t now)
         p->mask &= ~PEND_REPEAT;
     if ((p->mask & PEND_VOLUME) && s->volume == p->volume)
         p->mask &= ~PEND_VOLUME;
-    /* Only text-bearing fields re-fit text; playing tracks snapshot every
-     * second for the progress bar alone. */
-    const PlaybackState *o = &u->st;
-    if (s->active != o->active || strcmp(s->track.uri, o->track.uri) ||
-        strcmp(s->track.name, o->track.name) || strcmp(s->track.artists, o->track.artists) ||
-        strcmp(s->track.album, o->track.album) || strcmp(s->device_name, o->device_name))
-        u->text_dirty = 1;
     u->st = *s;
     pend_reapply(u);
 }
@@ -1228,7 +1050,6 @@ void resync(Ui *u)
 {
     u->pend.mask = 0;
     poller_snapshot(u->poller, &u->st, NULL);
-    u->text_dirty = 1;
 }
 
 /* --- the heart: is the playing track in your library? -------------------- */
@@ -1241,7 +1062,7 @@ int likeable(const PlaybackState *s)
 /* One check per new track; a click shows at once, and the library worker's
  * answer confirms it or puts it back. Returns 1 when it left the player: a
  * save the sign-in lacks the permission for asks for it. */
-int heart_sync(Ui *u)
+static int heart_sync(Ui *u)
 {
     LibWorker *w = &u->libw;
     const char *uri = likeable(&u->st) ? u->st.track.uri : "";
@@ -1274,31 +1095,8 @@ int heart_sync(Ui *u)
     return scope;
 }
 
-void refresh_player_text(Ui *u, float maxw, float status_w, float hint_w)
-{
-    const PlaybackState *s = &u->st;
-    if (s->active) {
-        float tw = likeable(s) ? maxw - heart_side(&u->m) - ROW_PAD : maxw; /* the heart */
-        gui_fit_text(px_of(u, FS_L), s->track.name[0] ? s->track.name : "Unknown title", tw,
-                     u->title, sizeof u->title);
-        gui_fit_text(px_of(u, FS_S), s->track.artists, maxw, u->artists, sizeof u->artists);
-        gui_fit_text(px_of(u, FS_S), s->track.album, maxw, u->album, sizeof u->album);
-    } else {
-        gui_fit_text(px_of(u, FS_L), "Nothing playing", maxw, u->title, sizeof u->title);
-        gui_fit_text(px_of(u, FS_S), "Press play, or pick a device with Devices.", maxw,
-                     u->artists, sizeof u->artists);
-        u->album[0] = 0;
-    }
-    sp_fmt_time(u->t_dur, sizeof u->t_dur, s->track.duration_ms);
-    u->pos_sec = -1;
-
-    gui_wrap_text(px_of(u, FS_S), u->msg_shown, status_w, 2, u->status, sizeof u->status);
-    gui_wrap_text(px_of(u, FS_S), u->hint, hint_w, 2, u->hint_fit, sizeof u->hint_fit);
-    u->text_dirty = 0;
-}
-
 /* The single most relevant status line; returns 1 if it is an error. */
-int status_message(Ui *u, char *out, size_t cap)
+static int status_message(Ui *u, char *out, size_t cap)
 {
     const PlaybackState *s = &u->st;
     if (u->cmd_err == SP_ERR_NODEVICE) {
@@ -1355,7 +1153,7 @@ int status_message(Ui *u, char *out, size_t cap)
 }
 
 /* Pull a new device list from the command worker; copies only on change. */
-void sync_devices(Ui *u)
+static void sync_devices(Ui *u)
 {
     plat_mutex_lock(u->cmd.mu);
     if (u->cmd.devs_seq != u->devs_seq) {
@@ -1365,54 +1163,176 @@ void sync_devices(Ui *u)
     plat_mutex_unlock(u->cmd.mu);
 }
 
-/* --- main loop: window_run calls frame once per frame -------------------- */
-/* At least as wide as the bottom bar needs (Metrics.min_w) and as tall as
- * the screen drawn last needs (Ui.need_h): grow the window if it is smaller.
- * A height measured in a window still too narrow (text wraps more there)
- * waits for the next frame, which the widening brings. */
-static void fit_window(Ui *u)
+void log_out(Ui *u)
 {
-    int mw = (int)ceilf(fmaxf(MIN_W, u->m.min_w));
-    int mh = u->w < mw ? (u->min_h ? u->min_h : MIN_H) : (int)ceilf(fmaxf(MIN_H, u->need_h));
-    if (mw == u->min_w && mh == u->min_h)
-        return;
-    u->min_w = mw;
-    u->min_h = mh;
-    window_set_min_size(mw, mh);
-    if (u->w < mw || u->h < mh)
-        window_set_size(u->w > mw ? u->w : mw, u->h > mh ? u->h : mh);
+    stop_session(u); /* Soloist first: logout deletes its pairing */
+    auth_store_logout(u->auth);
+    u->reinstalled = 0;
+    u->login_msg = NULL;
+    advance_signin(u);
 }
 
-/* Set when enter_app fails: frame() then draws nothing before the loop ends. */
+void set_text_size(Ui *u, int size)
+{
+    if (size < 0 || size >= CFG_FONT_SIZES || size == u->cfg.font_size)
+        return;
+    u->cfg.font_size = size; /* the update pass applies it */
+    u->size_unsaved = config_set_env_value(&u->cfg, "UI_FONT_SIZE", config_font_size_value(size)) != 0;
+}
+
+/* --- the update pass ----------------------------------------------------- */
+/* New art bytes: one texture per image, and the wallpaper and accent taken
+ * from it. The screens show the texture when art_gen changes; the old one
+ * goes at the end of the pass. */
+static void take_art(Ui *u)
+{
+    const unsigned char *data;
+    size_t len;
+    if (!u->art || !art_take(u->art, &data, &len, &u->art_seq))
+        return;
+    int jpg = len > 2 && data[0] == 0xFF && data[1] == 0xD8;
+    int png = len > 4 && !memcmp(data, "\x89PNG", 4);
+    drop_art(u);
+    if (!jpg && !png)
+        return; /* empty bytes: nothing playing */
+    u->art_tex = Rtexture_create((const char *)data, len);
+    theme_set_art(data, len);
+}
+
+/* The workers' news for the player: the snapshot, the commands' results,
+ * errors, the heart, Soloist, the status line and the pairing tip, the
+ * devices and the art. May leave the player (an expired session). */
+static void pull_player(Ui *u, uint64_t now)
+{
+    PlaybackState snap;
+
+    /* Only minimized counts as background: a visible window, focused or
+     * not, keeps its 1 Hz progress tick. */
+    int bg = window_is_minimized();
+    if (bg != u->background) {
+        u->background = bg;
+        poller_set_background(u->poller, bg);
+    }
+    u->dev.slow = bg;
+
+    if (poller_snapshot(u->poller, &snap, &u->seq)) {
+        apply_snapshot(u, &snap, now);
+        art_request(u->art, snap.track.art_url); /* no-op unless the URL changed */
+        if (snap.active)
+            note_other(u, snap.device_name);
+    }
+    if (u->pend.mask && now >= u->pend.until)
+        resync(u);
+
+    plat_mutex_lock(u->cmd.mu);
+    uint64_t cseq = u->cmd.err_seq, done_at = u->cmd.done_at;
+    int cerr = u->cmd.err, queued = u->cmd.done == CMD_QUEUE;
+    char played_on[SP_NAME_LEN], other[SP_NAME_LEN] = "";
+    memcpy(played_on, u->cmd.played_on, sizeof played_on);
+    int fresh = u->cmd.devs_seq != u->dev_seq_noted;
+    u->dev_seq_noted = u->cmd.devs_seq;
+    if (fresh) /* a fresh device list names another device? */
+        for (int i = 0; i < u->cmd.devs.ndev && !other[0]; i++)
+            if (u->cmd.devs.devs[i].id[0] && strcmp(u->cmd.devs.devs[i].name, u->cfg.device_name))
+                memcpy(other, u->cmd.devs.devs[i].name, sizeof other);
+    plat_mutex_unlock(u->cmd.mu);
+    note_other(u, other);
+    if (cseq != u->cmd_seq) {
+        u->cmd_seq = cseq;
+        u->cmd_err = cerr;
+        memcpy(u->played_on, played_on, sizeof u->played_on);
+        /* The worker wakes us PENDING_MS after its last command, which
+         * takes the note down again. */
+        u->note_until = queued && cerr == SP_OK ? done_at + PENDING_MS : 0;
+        if (cerr != SP_OK)
+            resync(u);
+    }
+    u->poll_err = poller_last_error(u->poller);
+    /* auth.c forgets a revoked refresh token; only a new sign-in helps. */
+    if ((u->poll_err == SP_ERR_AUTH || u->cmd_err == SP_ERR_AUTH) && !auth_store_logged_in(u->auth)) {
+        stop_session(u);
+        u->login_msg = "Session expired. Please sign in again.";
+        advance_signin(u);
+        return;
+    }
+    if (heart_sync(u))
+        return;
+    poll_engine(u);
+    plat_mutex_lock(u->cmd.mu);
+    u->cmd.local = local_ready(u);
+    plat_mutex_unlock(u->cmd.mu);
+
+    u->status_error = status_message(u, u->status, sizeof u->status);
+    /* The one pairing UI: a dismissible tip while an unpaired Soloist is
+     * discoverable. */
+    if (u->sol && !u->paired && !u->hint_hidden)
+        snprintf(u->hint, sizeof u->hint, "Tip: in Spotify on %s, choose '%s' to play on this computer.",
+                 u->other_dev[0] ? u->other_dev : "your phone or computer", u->cfg.device_name);
+    else
+        u->hint[0] = 0;
+    sync_devices(u);
+    take_art(u);
+}
+
+/* The sign-in thread finished: on to the player (or back to it, over which
+ * the sign-in was), or say why not. */
+static void pull_login(Ui *u)
+{
+    if (!u->login_th)
+        return;
+    plat_mutex_lock(u->mu);
+    int done = u->login_done, rc = u->login_rc;
+    plat_mutex_unlock(u->mu);
+    if (!done)
+        return;
+    int cancelled = u->login_cancel;
+    login_join(u);
+    if (rc == 0) {
+        u->login_msg = NULL;
+        u->consent_asked = 1; /* it got what Spotify grants */
+        if (u->reauth)
+            end_reauth(u, 1);
+        else
+            advance_signin(u);
+        return;
+    }
+    u->login_msg = cancelled ? "Sign-in cancelled." : auth_login_strerror(rc);
+}
+
+/* Once per loop iteration: what the workers brought goes into Ui, then each
+ * module shown pushes what changed into its widgets. */
+static void ui_update(Ui *u)
+{
+    theme_set_text_size(u->cfg.font_size); /* no-op unless it changed */
+    if (u->screen == SCR_LOGIN)
+        pull_login(u);
+    if (u->screen == SCR_PLAYER && u->poller)
+        pull_player(u, plat_now_ms());
+    shell_show(u->screen == SCR_PLAYER ? SHELL_PLAYER : SHELL_CARD);
+    if (u->screen == SCR_PLAYER) {
+        player_update(u);
+        sidebar_update(u);
+        /* the player shows art_tex now: the art before it can go */
+        if (Rtexture_is_valid(u->art_old))
+            Rtexture_destroy(u->art_old);
+        u->art_old = R_INVALID_ID;
+    } else {
+        signin_update(u);
+    }
+    settings_update(u);
+}
+
+/* --- main loop ----------------------------------------------------------- */
+/* Set when enter_app fails: the loop then ends without an update. */
 static int startup_failed;
 
-/* The window's draw callback: one frame of the active screen. window.c
- * brackets the frame with gui_begin_paint and gui_end_paint. */
-static void frame(void *user, float width, float height)
+static void frame(void *user, double dt)
 {
     Ui *u = user;
     if (startup_failed)
         return;
-    apply_metrics(u); /* remade only when the size setting changed */
-    int w = (int)width, h = (int)height;
-    if (w != u->w || h != u->h) {
-        u->w = w;
-        u->h = h;
-        u->text_dirty = 1;
-    }
-    switch (u->screen) {
-    case SCR_MOVE:   draw_move(u); break;
-    case SCR_SETUP:  draw_setup(u); break;
-    case SCR_LOGIN:  draw_login(u); break;
-    case SCR_KEY:    draw_key(u); break;
-    case SCR_PLAYER: draw_player(u); break;
-    }
-    fit_window(u);
-    /* Posted after the draw so the next frame shows the new state. */
-    if (u->redraw) {
-        u->redraw = 0;
-        window_wake();
-    }
+    shell_frame(dt);
+    ui_update(u);
 }
 
 /* Runs once when the window closes, or when window_quit ends the loop: every
@@ -1422,7 +1342,7 @@ static void close_cb(void *ud)
     Ui *u = ud;
     stop_session(u);
     login_join(u);
-    lib_reset(u);
+    lib_reset();
     auth_store_free(u->auth);
     (void)plat_quit_watch(NULL, NULL); /* no wake-ups once the window is gone */
     plat_mutex_free(u->mu);
@@ -1436,28 +1356,75 @@ static void quit_cb(void *ud)
     window_quit();
 }
 
+/* Settings (Cmd+, and the sidebar's gear) and Find (Cmd+F) belong to the
+ * modules; they are bound here, where the modules meet. */
+static void on_settings(Rid sender, const char *action, void *ud)
+{
+    (void)sender;
+    (void)action;
+    settings_open(ud);
+}
+
+static void on_find(Rid sender, const char *action, void *ud)
+{
+    (void)sender;
+    (void)action;
+    Ui *u = ud;
+    if (u->screen != SCR_PLAYER)
+        return;
+    shell_set_sidebar(1);
+    sidebar_find(u);
+}
+
+/* SMP_UI_PREVIEW=player|setup|key|move shows that screen without a
+ * session, nothing talking to Spotify: for working on the screens
+ * without signing in. */
+static int preview_screen(Ui *u)
+{
+    static const struct {
+        const char *name;
+        Screen screen;
+    } screens[] = { { "player", SCR_PLAYER }, { "setup", SCR_SETUP }, { "key", SCR_KEY }, { "move", SCR_MOVE } };
+    const char *want = getenv("SMP_UI_PREVIEW");
+    for (size_t i = 0; want && i < sizeof screens / sizeof screens[0]; i++) {
+        if (strcmp(want, screens[i].name) == 0) {
+            u->preview = 1;
+            set_screen(u, screens[i].screen);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int ui_run(const Config *cfg)
 {
     static Ui ui; /* large; only one window per process */
     Ui *u = &ui;
     memset(u, 0, sizeof *u);
     u->cfg = *cfg;
+    u->heart = -1;
+    u->art_tex = u->art_old = R_INVALID_ID;
     u->mu = plat_mutex_new();
     if (!u->mu)
         return 1;
 
-    /* A new window shows the art WIN_ART tall at the chosen text size. */
-    Metrics m0 = metrics_for(u->cfg.font_size);
-    if (window_open("Smalltify Player", WIN_W, (int)ceilf(player_reserve(&m0) + WIN_ART), MIN_W, MIN_H,
-                    frame, u) != 0) {
+    if (window_open("Smalltify Player", WIN_W, WIN_H, MIN_W, MIN_H) != 0) {
         plat_mutex_free(u->mu);
         return 1;
     }
+    theme_set_text_size(u->cfg.font_size);
+    shell_build();
+    player_build(u, shell_main_slot());
+    sidebar_build(u, shell_sidebar_slot());
+    signin_build(u, shell_card_slot());
+    Raction_bind(ACT_SETTINGS, on_settings, u);
+    Raction_bind(ACT_FIND, on_find, u);
     (void)plat_quit_watch(quit_cb, NULL); /* not fatal: signals then just kill us */
-    apply_metrics(u); /* the window's minimum size follows from it (fit_window) */
 
     int rc = 0;
-    if (u->cfg.read_only)
+    if (preview_screen(u))
+        rc = 0; /* no session: nothing to enter */
+    else if (u->cfg.read_only)
         set_screen(u, SCR_MOVE);
     else if (!u->cfg.client_id[0])
         set_screen(u, SCR_SETUP);
@@ -1467,6 +1434,6 @@ int ui_run(const Config *cfg)
         window_quit(); /* nothing to show: window_run returns and cleans up */
     }
 
-    window_run(close_cb, u);
+    window_run(frame, close_cb, u);
     return rc;
 }

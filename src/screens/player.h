@@ -1,19 +1,21 @@
-/* The player screen: the art, the track, the transport and the bottom bar,
- * with the Library, Devices and Settings panels over its area. Drawing
- * only; the logic it calls stays in ui.c. */
+/* player.h: the main area of the player screen: the album art, the track
+ * (title, artists, album) with the heart, the seek bar and its times, the
+ * transport, shuffle and repeat, the volume, the status line with the
+ * pairing tip, and toasts for transient notes ("Added to queue").
+ *
+ * Owner: the Player module (screens/player*.c). Its widgets are
+ * file-static there; what it does goes through ui.c (ui_internal.h). */
 #ifndef SMP_SCREENS_PLAYER_H
 #define SMP_SCREENS_PLAYER_H
 
 #include "ui_state.h"
 
-/* The heart's square at the end of the title's line. */
-float heart_side(const Metrics *m);
+/* Builds the player into parent (shell_main_slot()), once at startup, and
+ * binds ACT_PLAY_PAUSE, ACT_PREVIOUS, ACT_NEXT and ACT_LIKE (gui/shell.h). */
+void player_build(Ui *u, Rid parent);
 
-/* The player's height without the art: padding, the rows below the art,
- * the status lines and the bottom bar. */
-float player_reserve(const Metrics *m);
-
-/* The player screen: one frame. */
-void draw_player(Ui *u);
+/* Every update pass while the player page shows: pushes what changed in Ui
+ * (st, art_gen, heart, status, hint...) into the widgets. */
+void player_update(Ui *u);
 
 #endif /* SMP_SCREENS_PLAYER_H */
