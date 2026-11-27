@@ -447,9 +447,13 @@ static int arrange(void)
     if (w <= 0.0f || h <= 0.0f)
         return 0;
     Rwidget_get_rect(g.controls, &x, &y, &cw, &ch);
+    /* the controls' narrowest follows the text size; the window can come
+     * down to that, with no art (shell_set_main_min) */
+    float col_min = ceilf(COL_MIN * Raccessibility_get_text_scale());
+    shell_set_main_min(col_min + 24.0f, ceilf(ch) + 24.0f);
     float pad = clampf(fminf(w, h) * 0.035f, 12.0f, 28.0f);
     float aw = fmaxf(w - 2.0f * pad, 0.0f), ah = fmaxf(h - 2.0f * pad, 0.0f);
-    float side_w = clampf(aw * 0.38f, COL_MIN, SIDE_MAX);
+    float side_w = clampf(aw * 0.38f, col_min, fmaxf(SIDE_MAX, col_min));
     float stacked = fminf(fminf(aw, ah - ch - GAP_STACK), ART_MAX);
     float beside = fminf(fminf(ah, aw - side_w - GAP_SIDE), ART_MAX);
     int side = g.side == 1;
@@ -461,7 +465,7 @@ static int arrange(void)
         side = 0;
     float art = floorf(side ? beside : stacked);
     int shown = art >= ART_MIN;
-    float col = side ? floorf(side_w) : floorf(fminf(fmaxf(shown ? art : 0.0f, COL_MIN), aw));
+    float col = side ? floorf(side_w) : floorf(fminf(fmaxf(shown ? art : 0.0f, col_min), aw));
     return set_arrangement(side, shown, shown ? art : g.art_size, col);
 }
 

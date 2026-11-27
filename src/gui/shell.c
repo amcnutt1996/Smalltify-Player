@@ -53,6 +53,8 @@ static struct {
     int shown, sliding;
     float t, v, width, scale;
     float placed_t, placed_w; /* what place_sidebar set last */
+    float main_min_w, main_min_h; /* the player's smallest room (shell_set_main_min) */
+    int min_w, min_h;             /* what update_min set last */
 } g;
 
 /* ---- the sidebar's slide ---------------------------------------------------- */
@@ -78,13 +80,57 @@ static void place_sidebar(void)
         return;
     g.placed_t = t;
     g.placed_w = w;
-    float away = w + COMP_MARGIN + 64.0f, in = fminf(fmaxf(t, 0.0f), 1.0f);
+    float away = w + COMP_MARGIN + 64.0f;
     Rwidget_set_size(g.sidebar, w, -1.0f);
     Rslot_set_padding(g.sidebar, COMP_MARGIN - away * (1.0f - t), COMP_MARGIN, 0.0f, COMP_MARGIN);
     Rslot_set_padding(g.main, fmaxf((COMP_MARGIN + w) * t, 0.0f), 0.0f, 0.0f, 0.0f);
-    /* the traffic lights are over the sidebar, or over the title band (whose
-     * margin and gap come before the show button) */
-    Rwidget_set_size(g.lights, fmaxf(LIGHTS_W - COMP_MARGIN - COMP_GAP, 0.0f) * (1.0f - in), -1.0f);
+}
+
+/* Room the sidebar takes beside the main area. */
+static float sidebar_room(void)
+{
+    return g.width + COMP_MARGIN;
+}
+
+/* The window's minimum: the player's room, plus the sidebar while it is in;
+ * on the card page, the card. */
+static void update_min(void)
+{
+    int w, h;
+    if (g.page == SHELL_PLAYER) {
+        w = (int)ceilf(g.main_min_w + (g.shown ? sidebar_room() : 0.0f));
+        h = (int)ceilf(g.main_min_h + TITLE_H);
+    } else {
+        w = (int)ceilf(roundf(CARD_W * sqrtf(g.scale)) + 2.0f * COMP_MARGIN);
+        h = (int)ceilf(2.0f * TITLE_H + 240.0f);
+    }
+    if (w == g.min_w && h == g.min_h)
+        return;
+    g.min_w = w;
+    g.min_h = h;
+    window_set_min_size(w, h);
+}
+
+void shell_set_main_min(float w, float h)
+{
+    if (w == g.main_min_w && h == g.main_min_h)
+        return;
+    g.main_min_w = w;
+    g.main_min_h = h;
+    update_min();
+}
+
+/* Grows or shrinks the window by the sidebar, so the player keeps its room
+ * (not when the OS sized the window: maximized). */
+static void refit_window(int shown)
+{
+    Rid win = window_id();
+    if (Rwindow_is_maximized(win))
+        return;
+    int w = 0, h = 0;
+    Rwindow_get_size(win, &w, &h);
+    int room = (int)ceilf(sidebar_room());
+    Rwindow_set_size(win, shown ? w + room : (w - room > g.min_w ? w - room : g.min_w), h);
 }
 
 void shell_set_sidebar(int shown)
@@ -94,6 +140,12 @@ void shell_set_sidebar(int shown)
         return;
     g.shown = shown;
     shell_menu_set_text(SHELL_MENU_SIDEBAR, shown ? "Hide Sidebar" : "Show Sidebar");
+    /* growing: the new size before the larger minimum; shrinking: after */
+    if (shown)
+        refit_window(1);
+    update_min();
+    if (!shown)
+        refit_window(0);
     comp_set_visible(g.show, !shown);
     Rwidget_set_visibility(g.sidebar, R_VISIBLE);
     if (!Rget_animations_enabled()) {
@@ -181,7 +233,10 @@ static void build_player_page(Rid pages)
     g.main = comp_vbox(page, 0.0f);
     Rid band = title_band(g.main);
     Rslot_set_padding(band, COMP_MARGIN, 0.0f, COMP_MARGIN, 0.0f);
+    /* room for the traffic lights, always: the show button never goes under
+     * them, even while the sidebar slides */
     g.lights = Rwidget_add_child(band, Rwidget_create(R_WIDGET_SPACER));
+    Rwidget_set_size(g.lights, fmaxf(LIGHTS_W - COMP_MARGIN - COMP_GAP, 0.0f), -1.0f);
     g.show = comp_icon_button(band, ICON_SIDEBAR, ICON_BUTTON_MEDIUM, "Show Sidebar", on_show_clicked, NULL);
     Rslot_set_valign(g.show, R_VALIGN_CENTER);
     Rwidget_set_transition(g.show, R_TRANSITION_FADE, 0.0f);
@@ -287,6 +342,7 @@ void shell_show(ShellPage page)
         return;
     g.page = page;
     Rswitcher_set_index(g.pages, (int)page);
+    update_min();
     for (int i = 0; i < SHELL_MENU_COUNT; i++)
         shell_menu_set_enabled((ShellMenu)i, page == SHELL_PLAYER);
 }
@@ -365,6 +421,7 @@ void shell_frame(double dt)
         g.width = roundf(SIDEBAR_W * sqrtf(scale));
         Rwidget_set_size(g.card, roundf(CARD_W * sqrtf(scale)), -1.0f);
         place_sidebar();
+        update_min();
     }
     if (g.sliding)
         slide(dt);

@@ -21,8 +21,8 @@
 /* The window: landscape, and the smallest it can be made. */
 #define WIN_W 1000
 #define WIN_H 660
-#define MIN_W 720
-#define MIN_H 480
+#define MIN_W 360 /* until the shell sets the real one (shell_set_main_min) */
+#define MIN_H 320
 
 /* Optimistic edits survive contradicting snapshots this long: right after a
  * command Spotify often still reports the old state. */

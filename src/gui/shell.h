@@ -65,6 +65,11 @@ Rid shell_card_slot(void);
 void shell_set_sidebar(int shown);
 int shell_sidebar_shown(void);
 
+/* The smallest room the player's main area works in, below the title band.
+ * The window's minimum is that, plus the sidebar while it is in; showing
+ * or hiding the sidebar grows or shrinks the window by its width. */
+void shell_set_main_min(float w, float h);
+
 /* A short message rising at the bottom of the window for a few seconds. */
 void shell_toast(const char *text, int error);
 
