@@ -5,4 +5,6 @@ dist/
 data/
 .DS_Store
 build-release/
+build-linux/
+build-windows/
 .cache/

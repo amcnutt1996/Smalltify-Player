@@ -74,6 +74,10 @@ cp -pX "$src_app/Contents/Resources/AppIcon.icns" \
   "$src_app/Contents/Resources/MoltenVK-LICENSE.txt" \
   "$src_app/Contents/Resources/MoltenVK_icd.json" \
   "$src_app/Contents/Resources/.env" "$stage/Contents/Resources/"
+# Raven (Apache-2.0: license and NOTICE) and cJSON (MIT) are linked in.
+cp -pX "$build/_deps/raven-src/LICENSE" "$stage/Contents/Resources/Raven-LICENSE.txt"
+cp -pX "$build/_deps/raven-src/NOTICE" "$stage/Contents/Resources/Raven-NOTICE.txt"
+cp -pX "$root/third_party/cjson/LICENSE" "$stage/Contents/Resources/cJSON-LICENSE.txt"
 cp -pX "$src_app/Contents/Frameworks/libvulkan.1.dylib" \
   "$src_app/Contents/Frameworks/libMoltenVK.dylib" "$stage/Contents/Frameworks/"
 chmod u+w "$stage/Contents/Frameworks/libvulkan.1.dylib" "$stage/Contents/Frameworks/libMoltenVK.dylib"

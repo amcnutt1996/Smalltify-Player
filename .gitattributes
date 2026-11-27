@@ -1,0 +1,4 @@
+# LF in every checkout, Windows included (Git for Windows defaults to
+# core.autocrlf=true): bash scripts and Dockerfiles break on CR, and the
+# shipped .env must stay byte-identical to .env.example.
+* text=auto eol=lf
