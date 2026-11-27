@@ -5,9 +5,17 @@ A small, low-power Spotify player and remote for the desktop, written in plain C
 > **Platform status:** Smalltify Player has only been tested on **macOS** (13 Ventura or newer, Apple silicon). Windows x64 and Linux x64 builds are produced from the same code (see [Releasing](#releasing)), but they have not been run here, so how they behave at run time is untested.
 
 ## Screenshots
-| Now playing | Library | Devices | Settings |
+<img src="docs/screenshots/player.png" alt="Now playing in a wide window: the floating Library sidebar on the left, large album art in the middle, title, artist, progress, playback controls and volume on the right">
+
+| Library | Queue | Devices | Settings |
 |---|---|---|---|
-| <img src="docs/screenshots/player.png" width="200" alt="Now playing: album art, title, artist, progress, playback controls, volume"> | <img src="docs/screenshots/library.png" width="200" alt="Library: search, Liked Songs, playlists, albums, artists, podcasts, episodes, recently played, queue"> | <img src="docs/screenshots/devices.png" width="200" alt="Devices: Spotify Connect devices to play on"> | <img src="docs/screenshots/settings.png" width="200" alt="Settings: text size"> |
+| <img src="docs/screenshots/library.png" width="200" alt="Library: Liked Songs open, with Play Liked Songs and a track list beside the player"> | <img src="docs/screenshots/queue.png" width="200" alt="Queue: now playing and next up"> | <img src="docs/screenshots/devices.png" width="200" alt="Devices: this computer and other Spotify Connect devices to play on"> | <img src="docs/screenshots/settings.png" width="200" alt="Settings: text size, account, version"> |
+
+Activity Monitor on an Apple silicon Mac while the app runs:
+
+<img src="docs/screenshots/activity-cpu.png" width="600" alt="Activity Monitor CPU tab: Smalltify Player at 0.6% CPU, 3 idle wake-ups, 0.7% GPU">
+
+<img src="docs/screenshots/activity-memory.png" width="600" alt="Activity Monitor Memory tab: Smalltify Player at 509.6 MB">
 
 ## What it's for
 The official Spotify desktop app is a large Chromium-based app that uses a lot of memory and battery. Smalltify Player covers everyday listening with a fraction of the footprint:
