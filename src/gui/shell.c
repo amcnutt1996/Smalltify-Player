@@ -8,12 +8,14 @@
  *       Switcher                 pages
  *         Overlay                SHELL_PLAYER
  *           VBox                 main area, left padding = room the sidebar takes
- *             HBox               title band: traffic lights, show button, title slot
+ *             Border (tint)      title bar: muted, across the main area
+ *               HBox             traffic lights, show button, title slot
  *             VBox               main slot
- *           Border (glass)       sidebar, floating; slides by its left padding
+ *           Border (glass)       sidebar, flush with the window's top, left and
+ *                                bottom edges (it overhangs them); slides by its left padding
  *             VBox: HBox (top row: hide button), VBox (sidebar slot)
  *         Overlay                SHELL_CARD
- *           HBox                 title band
+ *           Border (tint)      title bar
  *           Border (glass)       card: ScrollBox > VBox (card slot)
  *       Toast
  */
@@ -30,18 +32,21 @@
 
 #ifdef __APPLE__
 #define TITLE_H      ((float)MAC_TITLE_H)
-#define LIGHTS_W     ((float)MAC_LIGHTS_W)
+#define LIGHTS_ROOM  ((float)MAC_LIGHTS_W + 20.0f) /* the traffic lights and a gap after them */
 #define MOD          R_MOD_SUPER
 #define SIDEBAR_MODS (R_MOD_SUPER | R_MOD_CTRL)
 #else
 #define TITLE_H      44.0f
-#define LIGHTS_W     0.0f
+#define LIGHTS_ROOM  0.0f
 #define MOD          R_MOD_CTRL
 #define SIDEBAR_MODS (R_MOD_CTRL | R_MOD_SHIFT)
 #endif
 
-#define SIDEBAR_W 280.0f /* at text scale 1; it grows with the square root of the scale */
-#define CARD_W    460.0f
+#define SIDEBAR_W    280.0f /* at text scale 1; it grows with the square root of the scale */
+#define SIDEBAR_OVER 40.0f  /* past the window's top, left and bottom edges: only its right edge shows its rim and shadow */
+#define CARD_W       460.0f
+/* the title bar: a little darker than the wallpaper, like Notes' toolbar */
+#define TITLE_TINT 0.0f, 0.0f, 0.0f, 0.16f
 
 static struct {
     Rid pages, main, lights, show, title_slot, main_slot;
@@ -71,8 +76,9 @@ static void spring_step(float *x, float *v, float target, float dt)
     *v = decay * ((b * wd - zeta * omega * d) * c - (d * wd + zeta * omega * b) * s);
 }
 
-/* The sidebar at t: its left edge goes from the margin to past the window's
- * left edge (its shadow too), and the main area's left edge follows. */
+/* The sidebar at t: its left edge goes from past the window's left edge
+ * (SIDEBAR_OVER) to past it by its whole width and shadow, and the main
+ * area's left edge follows its right edge. */
 static void place_sidebar(void)
 {
     float t = g.t, w = g.width;
@@ -80,16 +86,15 @@ static void place_sidebar(void)
         return;
     g.placed_t = t;
     g.placed_w = w;
-    float away = w + COMP_MARGIN + 64.0f;
-    Rwidget_set_size(g.sidebar, w, -1.0f);
-    Rslot_set_padding(g.sidebar, COMP_MARGIN - away * (1.0f - t), COMP_MARGIN, 0.0f, COMP_MARGIN);
-    Rslot_set_padding(g.main, fmaxf((COMP_MARGIN + w) * t, 0.0f), 0.0f, 0.0f, 0.0f);
+    Rwidget_set_size(g.sidebar, w + SIDEBAR_OVER, -1.0f);
+    Rslot_set_padding(g.sidebar, -SIDEBAR_OVER - (w + 64.0f) * (1.0f - t), -SIDEBAR_OVER, 0.0f, -SIDEBAR_OVER);
+    Rslot_set_padding(g.main, fmaxf(w * t, 0.0f), 0.0f, 0.0f, 0.0f);
 }
 
 /* Room the sidebar takes beside the main area. */
 static float sidebar_room(void)
 {
-    return g.width + COMP_MARGIN;
+    return g.width;
 }
 
 /* The window's minimum: the player's room, plus the sidebar while it is in;
@@ -217,11 +222,17 @@ static int on_title_event(Rid widget, const REvent *event, void *ud)
     return window_title_event(event);
 }
 
-/* A band across the top of a page that moves the window. */
+/* A muted bar across the top of a page that moves the window. Returns its
+ * HBox; the bar is its parent. */
 static Rid title_band(Rid parent)
 {
-    Rid band = comp_hbox(parent, COMP_GAP);
-    Rwidget_set_size(band, -1.0f, TITLE_H);
+    Rid bar = Rwidget_add_child(parent, Rwidget_create(R_WIDGET_BORDER));
+    /* flat: the look would make a Border a rounded pane of glass */
+    Rborder_set_material(bar, R_MATERIAL_SOLID);
+    Rborder_set_corner_radius(bar, 0.0f, 0.0f, 0.0f, 0.0f);
+    Rborder_set_background(bar, TITLE_TINT);
+    Rwidget_set_size(bar, -1.0f, TITLE_H);
+    Rid band = comp_hbox(bar, COMP_GAP);
     Rwidget_set_event_callback(band, on_title_event, NULL);
     return band;
 }
@@ -233,10 +244,10 @@ static void build_player_page(Rid pages)
     g.main = comp_vbox(page, 0.0f);
     Rid band = title_band(g.main);
     Rslot_set_padding(band, COMP_MARGIN, 0.0f, COMP_MARGIN, 0.0f);
-    /* room for the traffic lights, always: the show button never goes under
-     * them, even while the sidebar slides */
+    /* room for the traffic lights and a gap, always: the show button never
+     * goes under them, even while the sidebar slides */
     g.lights = Rwidget_add_child(band, Rwidget_create(R_WIDGET_SPACER));
-    Rwidget_set_size(g.lights, fmaxf(LIGHTS_W - COMP_MARGIN - COMP_GAP, 0.0f), -1.0f);
+    Rwidget_set_size(g.lights, fmaxf(LIGHTS_ROOM - COMP_MARGIN - COMP_GAP, 0.0f), -1.0f);
     g.show = comp_icon_button(band, ICON_SIDEBAR, ICON_BUTTON_MEDIUM, "Show Sidebar", on_show_clicked, NULL);
     Rslot_set_valign(g.show, R_VALIGN_CENTER);
     Rwidget_set_transition(g.show, R_TRANSITION_FADE, 0.0f);
@@ -250,11 +261,11 @@ static void build_player_page(Rid pages)
     Rid panel = comp_panel(page, PANEL_FROSTED, COMP_RADIUS, 0.0f);
     g.sidebar = Rwidget_get_parent(panel);
     Rslot_set_halign(g.sidebar, R_HALIGN_LEFT);
-    Rborder_set_padding(g.sidebar, 12.0f, 0.0f, 12.0f, 12.0f);
-    /* the top row lines up with the title band: the traffic lights sit on
-     * its left, the hide button on its right */
+    Rborder_set_padding(g.sidebar, SIDEBAR_OVER + 12.0f, SIDEBAR_OVER, 12.0f, SIDEBAR_OVER + 12.0f);
+    /* the top row is the title bar's height: the traffic lights sit on its
+     * left, the hide button on its right */
     Rid top = comp_hbox(panel, COMP_GAP);
-    Rwidget_set_size(top, -1.0f, TITLE_H - 2.0f * COMP_MARGIN);
+    Rwidget_set_size(top, -1.0f, TITLE_H);
     Rwidget_set_event_callback(top, on_title_event, NULL);
     comp_fill(top);
     Rid hide = comp_icon_button(top, ICON_SIDEBAR, ICON_BUTTON_MEDIUM, "Hide Sidebar", on_hide_clicked, NULL);
@@ -267,7 +278,7 @@ static void build_card_page(Rid pages)
 {
     Rid page = Rwidget_add_child(pages, Rwidget_create(R_WIDGET_OVERLAY));
     Rid band = title_band(page);
-    Rslot_set_valign(band, R_VALIGN_TOP);
+    Rslot_set_valign(Rwidget_get_parent(band), R_VALIGN_TOP);
     Rid panel = comp_panel(page, PANEL_FROSTED, 26.0f, 28.0f);
     g.card = Rwidget_get_parent(panel);
     Rslot_set_halign(g.card, R_HALIGN_CENTER);
