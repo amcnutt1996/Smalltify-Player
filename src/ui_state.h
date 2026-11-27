@@ -237,7 +237,7 @@ typedef struct {
     char          played_on[SP_NAME_LEN];
     char          status[320];  /* the one status line (status_message) */
     int           status_error; /* status is an error */
-    char          hint[320];    /* pairing tip; "" = none */
+    char          hint[384];    /* pairing tip; "" = none */
     uint64_t      note_until;   /* "Added to queue" shows until then */
 
     /* the heart by the title: is the playing track saved? */

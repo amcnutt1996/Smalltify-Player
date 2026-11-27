@@ -428,7 +428,7 @@ void signin_build(Ui *u, Rid parent)
 void signin_update(Ui *u)
 {
     Screen s = u->screen;
-    if (s >= PAGES)
+    if ((int)s >= PAGES)
         return;
     if (s != g.shown) {
         for (int i = 0; i < PAGES; i++)

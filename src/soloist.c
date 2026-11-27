@@ -379,7 +379,7 @@ static void reader_main(void *arg)
     /* EOF: it exited, or closed its output, which is as fatal. A natural
      * exit is reaped within moments; a stop in progress reaps it itself. */
     int code = plat_proc_wait(s->proc, 2000);
-    char last[STATUS_LEN], msg[STATUS_LEN + 32];
+    char last[STATUS_LEN], msg[STATUS_LEN + 48];
     soloist_status(s, last, sizeof last);
     if (code == EXIT_EXPIRED) {
         set(s, SOLOIST_EXPIRED, "Soloist build expired");

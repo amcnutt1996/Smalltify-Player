@@ -57,6 +57,7 @@ static void strip_last_component(char *path)
 #include <bcrypt.h>
 #include <sddl.h>
 #include <shellapi.h>
+#include <wchar.h> /* wmemcpy: not declared by windows.h */
 
 #ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
