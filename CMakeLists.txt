@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.20)
 if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
   set(CMAKE_OSX_DEPLOYMENT_TARGET 13.0 CACHE STRING "Minimum macOS version" FORCE)
 endif()
-project(smalltify_player VERSION 0.1.1 LANGUAGES C)
+project(smalltify_player VERSION 2.0.0 LANGUAGES C)
 if(APPLE)
   enable_language(OBJC) # src/gui/macos.m: the title bar and the application menu
 endif()
