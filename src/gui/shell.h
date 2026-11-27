@@ -2,14 +2,16 @@
  * shell.h: the frame of the application, the same on every screen. Over
  * the wallpaper (theme.c), two pages, one shown at a time:
  *
- *   SHELL_PLAYER  a floating glass sidebar on the left, which slides away
- *                 and back with a spring (View > Hide Sidebar), and the main
- *                 area, which grows into the room it leaves;
+ *   SHELL_PLAYER  a floating glass sidebar on the left, under the title
+ *                 bar, which slides away and back with a spring (View >
+ *                 Hide Sidebar), and the main area, which grows into the
+ *                 room it leaves;
  *   SHELL_CARD    one glass card in the middle (setup, sign-in, key, move).
  *
- * Plus the title band at the top of each page (it moves the window; on
- * macOS the traffic lights sit in it), the menu bar (the system's on
- * macOS) and the toast over everything. Screens build into the slots.
+ * Plus the muted title bar across the top of each page (it moves the
+ * window; on macOS the traffic lights sit in it), the menu bar (the
+ * system's on macOS) and the toast over everything. Screens build into the
+ * slots.
  *
  * Threading: UI thread only.
  */
@@ -51,21 +53,23 @@ void shell_show(ShellPage page);
 ShellPage shell_page(void);
 
 /* Where screens build (VBoxes, empty until then):
- *   sidebar  inside the glass sidebar, under its top row (the hide button);
- *   main     the main area, under the title band, the rest of the window;
- *   title    the end of the main area's title band, for a few small buttons;
+ *   tabs     the sidebar's top row, before its hide button;
+ *   sidebar  inside the glass sidebar, under its top row;
+ *   main     the main area, under the title bar, the rest of the window;
+ *   title    the end of the player page's title bar, for a few small buttons;
  *   card     inside the card, which scrolls when its content is too tall. */
+Rid shell_sidebar_tabs_slot(void);
 Rid shell_sidebar_slot(void);
 Rid shell_main_slot(void);
 Rid shell_title_slot(void);
 Rid shell_card_slot(void);
 
 /* Slides the sidebar away or back (a spring; at once with reduced motion).
- * While it is away, a button in the title band brings it back. */
+ * While it is away, a button under the title bar brings it back. */
 void shell_set_sidebar(int shown);
 int shell_sidebar_shown(void);
 
-/* The smallest room the player's main area works in, below the title band.
+/* The smallest room the player's main area works in, below the title bar.
  * The window's minimum is that, plus the sidebar while it is in; showing
  * or hiding the sidebar grows or shrinks the window by its width. */
 void shell_set_main_min(float w, float h);

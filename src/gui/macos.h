@@ -9,13 +9,11 @@
 #include <Raven.h>
 
 /* The title bar of the system, transparent over the content (which covers
- * the whole window) and taller, as in Music.app: the real traffic lights
- * sit inline at the top left, MAC_LIGHTS_W wide, centred in the top
- * MAC_TITLE_H of the window. Clicks in that band reach Raven: the content
- * moves the window itself (window_title_event). Call before the window
- * shows. */
-#define MAC_TITLE_H  52
-#define MAC_LIGHTS_W 76
+ * the whole window): the real traffic lights sit at the top left, centred
+ * in the top MAC_TITLE_H of the window. Clicks in that band reach Raven:
+ * the content moves the window itself (window_title_event). Call before
+ * the window shows. */
+#define MAC_TITLE_H  32
 void mac_window_setup(Rid window);
 
 /* 1 while the application is the one in front. Raven's window counts as

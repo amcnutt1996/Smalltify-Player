@@ -3,6 +3,7 @@
  * Manual reference counting, like Raven's own Cocoa code.
  */
 #import <Cocoa/Cocoa.h>
+#import <QuartzCore/QuartzCore.h>
 
 #include "macos.h"
 
@@ -19,17 +20,15 @@ void mac_window_setup(Rid window)
         return;
     NSWindow *w = (NSWindow *)native.display;
     /* The content covers the whole window; the title bar stays, see-through
-     * and without its title, so the traffic lights are the system's. */
+     * and without its title, so the traffic lights are the system's. With
+     * no toolbar the band is the plain title bar's height, MAC_TITLE_H. */
     w.styleMask |= NSWindowStyleMaskFullSizeContentView;
     w.titlebarAppearsTransparent = YES;
     w.titleVisibility = NSWindowTitleHidden;
     w.titlebarSeparatorStyle = NSTitlebarSeparatorStyleNone;
-    /* An empty unified toolbar makes the band MAC_TITLE_H tall and centres
-     * the traffic lights in it. */
-    NSToolbar *bar = [[NSToolbar alloc] initWithIdentifier:@"Smalltify"];
-    w.toolbar = bar;
-    [bar release];
-    w.toolbarStyle = NSWindowToolbarStyleUnified;
+    /* While the window resizes, the last frame stays where it was instead
+     * of being stretched to the new size until the next one is drawn. */
+    w.contentView.layer.contentsGravity = kCAGravityTopLeft;
 
     /* The loop sleeps: coming to the front or leaving it wakes it, so the
      * frame sees mac_app_active change (window.c parks the text focus). */

@@ -7,15 +7,14 @@
  *     Overlay
  *       Switcher                 pages
  *         Overlay                SHELL_PLAYER
- *           VBox                 main area, left padding = room the sidebar takes
- *             Border (tint)      title bar: muted, across the main area
- *               HBox             traffic lights, show button, title slot
+ *           Border (tint)        title bar, across the window: traffic lights, title slot
+ *           VBox                 main area under it, left padding = room the sidebar takes
  *             VBox               main slot
- *           Border (glass)       sidebar, flush with the window's top, left and
- *                                bottom edges (it overhangs them); slides by its left padding
- *             VBox: HBox (top row: hide button), VBox (sidebar slot)
+ *           Button               show sidebar: floats under the title bar while the sidebar is away
+ *           Border (glass)       sidebar, floating under the title bar; slides by its left padding
+ *             VBox: HBox (tabs slot, hide button), VBox (sidebar slot)
  *         Overlay                SHELL_CARD
- *           Border (tint)      title bar
+ *           Border (tint)        title bar
  *           Border (glass)       card: ScrollBox > VBox (card slot)
  *       Toast
  */
@@ -32,31 +31,33 @@
 
 #ifdef __APPLE__
 #define TITLE_H      ((float)MAC_TITLE_H)
-#define LIGHTS_ROOM  ((float)MAC_LIGHTS_W + 20.0f) /* the traffic lights and a gap after them */
 #define MOD          R_MOD_SUPER
 #define SIDEBAR_MODS (R_MOD_SUPER | R_MOD_CTRL)
 #else
-#define TITLE_H      44.0f
-#define LIGHTS_ROOM  0.0f
+#define TITLE_H      28.0f
 #define MOD          R_MOD_CTRL
 #define SIDEBAR_MODS (R_MOD_CTRL | R_MOD_SHIFT)
 #endif
 
-#define SIDEBAR_W    280.0f /* at text scale 1; it grows with the square root of the scale */
-#define SIDEBAR_OVER 40.0f  /* past the window's top, left and bottom edges: only its right edge shows its rim and shadow */
+/* at text scale 1, it grows with the square root of the scale: the
+ * Library / Devices tabs and the hide button beside them */
+#define SIDEBAR_W    322.0f
 #define CARD_W       460.0f
 /* the title bar: a little darker than the wallpaper, like Notes' toolbar */
 #define TITLE_TINT 0.0f, 0.0f, 0.0f, 0.16f
 
 static struct {
-    Rid pages, main, lights, show, title_slot, main_slot;
-    Rid sidebar, sidebar_slot, card, card_slot, toast;
+    Rid pages, main, show, title_slot, main_slot;
+    Rid sidebar, tabs_slot, sidebar_slot, card, card_slot, toast;
     Rid menu[SHELL_MENU_COUNT];
     ShellPage page;
     /* the sidebar: t is 1 when it is in, 0 when it is away; a spring
-     * pulls t to `shown` while it slides */
+     * pulls t to `shown` while it slides, and the window's width with it:
+     * base + grow * t (grow 0: the window keeps its size, maximized) */
     int shown, sliding;
     float t, v, width, scale;
+    float base, grow;
+    int sized_w;              /* what size_window set last */
     float placed_t, placed_w; /* what place_sidebar set last */
     float main_min_w, main_min_h; /* the player's smallest room (shell_set_main_min) */
     int min_w, min_h;             /* what update_min set last */
@@ -76,9 +77,9 @@ static void spring_step(float *x, float *v, float target, float dt)
     *v = decay * ((b * wd - zeta * omega * d) * c - (d * wd + zeta * omega * b) * s);
 }
 
-/* The sidebar at t: its left edge goes from past the window's left edge
- * (SIDEBAR_OVER) to past it by its whole width and shadow, and the main
- * area's left edge follows its right edge. */
+/* The sidebar at t: under the title bar, its left edge goes from the
+ * margin to past the window's left edge (its shadow too), and the main
+ * area's left edge follows. */
 static void place_sidebar(void)
 {
     float t = g.t, w = g.width;
@@ -86,24 +87,26 @@ static void place_sidebar(void)
         return;
     g.placed_t = t;
     g.placed_w = w;
-    Rwidget_set_size(g.sidebar, w + SIDEBAR_OVER, -1.0f);
-    Rslot_set_padding(g.sidebar, -SIDEBAR_OVER - (w + 64.0f) * (1.0f - t), -SIDEBAR_OVER, 0.0f, -SIDEBAR_OVER);
-    Rslot_set_padding(g.main, fmaxf(w * t, 0.0f), 0.0f, 0.0f, 0.0f);
+    float away = w + COMP_MARGIN + 64.0f;
+    Rwidget_set_size(g.sidebar, w, -1.0f);
+    Rslot_set_padding(g.sidebar, COMP_MARGIN - away * (1.0f - t), TITLE_H + COMP_MARGIN, 0.0f, COMP_MARGIN);
+    Rslot_set_padding(g.main, fmaxf((COMP_MARGIN + w) * t, 0.0f), TITLE_H, 0.0f, 0.0f);
 }
 
 /* Room the sidebar takes beside the main area. */
 static float sidebar_room(void)
 {
-    return g.width;
+    return g.width + COMP_MARGIN;
 }
 
-/* The window's minimum: the player's room, plus the sidebar while it is in;
- * on the card page, the card. */
+/* The window's minimum: the player's room, plus the sidebar once it is in
+ * (not while it slides: the window is still growing to it); on the card
+ * page, the card. */
 static void update_min(void)
 {
     int w, h;
     if (g.page == SHELL_PLAYER) {
-        w = (int)ceilf(g.main_min_w + (g.shown ? sidebar_room() : 0.0f));
+        w = (int)ceilf(g.main_min_w + (g.shown && !g.sliding ? sidebar_room() : 0.0f));
         h = (int)ceilf(g.main_min_h + TITLE_H);
     } else {
         w = (int)ceilf(roundf(CARD_W * sqrtf(g.scale)) + 2.0f * COMP_MARGIN);
@@ -125,17 +128,41 @@ void shell_set_main_min(float w, float h)
     update_min();
 }
 
-/* Grows or shrinks the window by the sidebar, so the player keeps its room
- * (not when the OS sized the window: maximized). */
-static void refit_window(int shown)
+/* Where the window's width goes as the sidebar slides, from the width it
+ * has now: it grows by the sidebar's room, or shrinks by it down to the
+ * player's minimum, so the player keeps its room and its width (not when
+ * the OS sized the window: maximized). */
+static void plan_window(int shown)
 {
     Rid win = window_id();
-    if (Rwindow_is_maximized(win))
-        return;
     int w = 0, h = 0;
     Rwindow_get_size(win, &w, &h);
-    int room = (int)ceilf(sidebar_room());
-    Rwindow_set_size(win, shown ? w + room : (w - room > g.min_w ? w - room : g.min_w), h);
+    g.sized_w = w;
+    if (Rwindow_is_maximized(win)) {
+        g.base = (float)w;
+        g.grow = 0.0f;
+    } else if (shown) {
+        g.base = (float)w;
+        g.grow = ceilf(sidebar_room());
+    } else {
+        g.base = fmaxf((float)w - ceilf(sidebar_room()), ceilf(g.main_min_w));
+        g.grow = fmaxf((float)w - g.base, 0.0f);
+    }
+}
+
+/* The window's width at t, set once per change. */
+static void size_window(void)
+{
+    if (g.grow <= 0.0f)
+        return;
+    int to = (int)lroundf(g.base + g.grow * g.t);
+    if (to == g.sized_w)
+        return;
+    g.sized_w = to;
+    Rid win = window_id();
+    int w = 0, h = 0;
+    Rwindow_get_size(win, &w, &h);
+    Rwindow_set_size(win, to, h);
 }
 
 void shell_set_sidebar(int shown)
@@ -145,17 +172,16 @@ void shell_set_sidebar(int shown)
         return;
     g.shown = shown;
     shell_menu_set_text(SHELL_MENU_SIDEBAR, shown ? "Hide Sidebar" : "Show Sidebar");
-    /* growing: the new size before the larger minimum; shrinking: after */
-    if (shown)
-        refit_window(1);
-    update_min();
-    if (!shown)
-        refit_window(0);
+    /* turned back while it slides: the window goes back the way it came */
+    if (!g.sliding)
+        plan_window(shown);
     comp_set_visible(g.show, !shown);
     Rwidget_set_visibility(g.sidebar, R_VISIBLE);
     if (!Rget_animations_enabled()) {
         g.t = (float)shown;
         g.v = 0.0f;
+        size_window(); /* growing: the new size before the larger minimum */
+        update_min();
         place_sidebar();
         if (!shown)
             Rwidget_set_visibility(g.sidebar, R_HIDDEN);
@@ -165,6 +191,7 @@ void shell_set_sidebar(int shown)
         g.sliding = 1;
         window_animating(+1);
     }
+    update_min(); /* the smaller one while it slides */
 }
 
 int shell_sidebar_shown(void)
@@ -188,6 +215,9 @@ static void slide(double dt)
         if (!g.shown)
             Rwidget_set_visibility(g.sidebar, R_HIDDEN);
     }
+    size_window();
+    if (!g.sliding)
+        update_min(); /* in: the minimum takes the sidebar's room again */
     place_sidebar();
 }
 
@@ -215,6 +245,14 @@ static void on_hide_clicked(Rid button, void *ud)
 
 /* ---- building ------------------------------------------------------------------ */
 
+/* The show / hide button: a medium icon button with a larger icon. */
+static Rid sidebar_button(Rid parent, const char *tip, RButtonClickedCallback cb)
+{
+    Rid button = comp_icon_button(parent, ICON_SIDEBAR, ICON_BUTTON_MEDIUM, tip, cb, NULL);
+    Rwidget_set_size(Rwidget_get_child(button, 0), 25.0f, 25.0f);
+    return button;
+}
+
 static int on_title_event(Rid widget, const REvent *event, void *ud)
 {
     (void)widget;
@@ -241,34 +279,34 @@ static void build_player_page(Rid pages)
 {
     Rid page = Rwidget_add_child(pages, Rwidget_create(R_WIDGET_OVERLAY));
 
-    g.main = comp_vbox(page, 0.0f);
-    Rid band = title_band(g.main);
+    Rid band = title_band(page);
+    Rslot_set_valign(Rwidget_get_parent(band), R_VALIGN_TOP);
     Rslot_set_padding(band, COMP_MARGIN, 0.0f, COMP_MARGIN, 0.0f);
-    /* room for the traffic lights and a gap, always: the show button never
-     * goes under them, even while the sidebar slides */
-    g.lights = Rwidget_add_child(band, Rwidget_create(R_WIDGET_SPACER));
-    Rwidget_set_size(g.lights, fmaxf(LIGHTS_ROOM - COMP_MARGIN - COMP_GAP, 0.0f), -1.0f);
-    g.show = comp_icon_button(band, ICON_SIDEBAR, ICON_BUTTON_MEDIUM, "Show Sidebar", on_show_clicked, NULL);
-    Rslot_set_valign(g.show, R_VALIGN_CENTER);
-    Rwidget_set_transition(g.show, R_TRANSITION_FADE, 0.0f);
-    comp_set_visible(g.show, 0);
     comp_fill(band);
     g.title_slot = comp_hbox(band, COMP_GAP);
     Rslot_set_valign(g.title_slot, R_VALIGN_CENTER);
+    g.main = comp_vbox(page, 0.0f);
     g.main_slot = comp_vbox(g.main, COMP_GAP);
     Rslot_set_fill(g.main_slot, 1.0f);
 
-    Rid panel = comp_panel(page, PANEL_FROSTED, COMP_RADIUS, 0.0f);
+    /* under the title bar at the window's left, while the sidebar is away;
+     * the sidebar slides in over it */
+    g.show = sidebar_button(page, "Show Sidebar", on_show_clicked);
+    Rslot_set_halign(g.show, R_HALIGN_LEFT);
+    Rslot_set_valign(g.show, R_VALIGN_TOP);
+    Rslot_set_padding(g.show, 12.0f, TITLE_H + COMP_GAP, 0.0f, 0.0f);
+    Rwidget_set_transition(g.show, R_TRANSITION_FADE, 0.0f);
+    comp_set_visible(g.show, 0);
+
+    Rid panel = comp_panel(page, PANEL_FROSTED, COMP_RADIUS, 12.0f);
     g.sidebar = Rwidget_get_parent(panel);
     Rslot_set_halign(g.sidebar, R_HALIGN_LEFT);
-    Rborder_set_padding(g.sidebar, SIDEBAR_OVER + 12.0f, SIDEBAR_OVER, 12.0f, SIDEBAR_OVER + 12.0f);
-    /* the top row is the title bar's height: the traffic lights sit on its
-     * left, the hide button on its right */
+    /* the top row: the tabs (tabs slot), then the hide button */
     Rid top = comp_hbox(panel, COMP_GAP);
-    Rwidget_set_size(top, -1.0f, TITLE_H);
-    Rwidget_set_event_callback(top, on_title_event, NULL);
-    comp_fill(top);
-    Rid hide = comp_icon_button(top, ICON_SIDEBAR, ICON_BUTTON_MEDIUM, "Hide Sidebar", on_hide_clicked, NULL);
+    g.tabs_slot = comp_vbox(top, 0.0f);
+    Rslot_set_fill(g.tabs_slot, 1.0f);
+    Rslot_set_valign(g.tabs_slot, R_VALIGN_CENTER);
+    Rid hide = sidebar_button(top, "Hide Sidebar", on_hide_clicked);
     Rslot_set_valign(hide, R_VALIGN_CENTER);
     g.sidebar_slot = comp_vbox(panel, COMP_GAP);
     Rslot_set_fill(g.sidebar_slot, 1.0f);
@@ -361,6 +399,11 @@ void shell_show(ShellPage page)
 ShellPage shell_page(void)
 {
     return g.page;
+}
+
+Rid shell_sidebar_tabs_slot(void)
+{
+    return g.tabs_slot;
 }
 
 Rid shell_sidebar_slot(void)

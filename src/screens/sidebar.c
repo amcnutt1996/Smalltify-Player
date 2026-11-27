@@ -124,7 +124,7 @@ void sidebar_build(Ui *u, Rid parent)
     static const char *const tabs[TABS] = { "Library", "Devices" };
     g.u = u;
     g.tab = TAB_LIBRARY;
-    g.tabs = comp_segmented(parent, tabs, TABS, TAB_LIBRARY, on_tab, NULL);
+    g.tabs = comp_segmented(shell_sidebar_tabs_slot(), tabs, TABS, TAB_LIBRARY, on_tab, NULL);
     g.pages = Rwidget_add_child(parent, Rwidget_create(R_WIDGET_SWITCHER));
     Rslot_set_fill(g.pages, 1.0f);
     Rslot_set_padding(g.pages, 0.0f, 6.0f, 0.0f, 0.0f);
